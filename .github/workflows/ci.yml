@@ -47,6 +47,9 @@ jobs:
       - name: Run ESLint
         run: npm run lint
 
+      - name: Generate Expo types
+        run: npx expo customize tsconfig.json
+
       - name: Run TypeScript typecheck
         run: npm run typecheck
 
