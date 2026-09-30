@@ -6,15 +6,15 @@ import { FlatList, Pressable, StyleSheet, View } from "react-native";
 import {
   CategoryFilter,
   type ScheduleCategoryFilter,
-} from "@/components/category-filter";
-import { Header } from "@/components/header";
-import { ScheduleCard } from "@/components/schedule-card";
+} from "@/components/schedule-list/category-filter";
+import { Header } from "@/components/navigation/header";
+import { ScheduleCard } from "@/components/schedule-list/schedule-card";
 import {
   ScheduleListState,
   type ScheduleListViewState,
-} from "@/components/schedule-list-state";
-import { ThemedText } from "@/components/themed-text";
-import { ThemedView } from "@/components/themed-view";
+} from "@/components/schedule-list/schedule-list-state";
+import { ThemedText } from "@/components/ui/themed-text";
+import { ThemedView } from "@/components/ui/themed-view";
 import { BottomTabInset, Spacing } from "@/constants/theme";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useTheme } from "@/hooks/use-theme";

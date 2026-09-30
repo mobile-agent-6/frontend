@@ -1,4 +1,4 @@
-import { TabBar } from "@/components/tab-bar";
+import { TabBar } from "@/components/navigation/tab-bar";
 
 export default function TabLayout() {
   return <TabBar />;
