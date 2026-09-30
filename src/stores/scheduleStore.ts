@@ -1,5 +1,6 @@
 import { create } from "zustand";
 
+import { MOCK_SCHEDULES } from "@/services/mock/schedules";
 import type { Schedule } from "@/types/schedule";
 
 export type ScheduleStore = {
@@ -11,7 +12,7 @@ export type ScheduleStore = {
 };
 
 export const useScheduleStore = create<ScheduleStore>((set) => ({
-  schedules: [],
+  schedules: MOCK_SCHEDULES,
 
   addSchedule: (schedule) =>
     set((state) => ({
