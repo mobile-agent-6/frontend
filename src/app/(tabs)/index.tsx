@@ -1,7 +1,9 @@
 import { Link } from "expo-router";
 import { StyleSheet, View } from "react-native";
 
+import { Header } from "@/components/header";
 import { ScreenPlaceholder } from "@/components/screen-placeholder";
+import { ThemedView } from "@/components/themed-view";
 import { Spacing } from "@/constants/theme";
 import { useTheme } from "@/hooks/use-theme";
 
@@ -11,34 +13,41 @@ export default function ScheduleListScreen() {
   const theme = useTheme();
 
   return (
-    <ScreenPlaceholder title="일정 목록">
-      <View style={styles.links}>
-        <Link
-          href="/schedule/create"
-          style={[styles.link, { color: theme.primary }]}
-        >
-          일정 추가
-        </Link>
+    <ThemedView style={styles.screen}>
+      <Header title="일정 목록" />
 
-        <Link
-          href={{
-            pathname: "/schedule/[id]",
-            params: { id: PLACEHOLDER_SCHEDULE_ID },
-          }}
-          style={[styles.link, { color: theme.primary }]}
-        >
-          일정 수정
-        </Link>
+      <ScreenPlaceholder title="일정 목록">
+        <View style={styles.links}>
+          <Link
+            href="/schedule/create"
+            style={[styles.link, { color: theme.primary }]}
+          >
+            일정 추가
+          </Link>
 
-        <Link href="/settings" style={[styles.link, { color: theme.primary }]}>
-          설정
-        </Link>
-      </View>
-    </ScreenPlaceholder>
+          <Link
+            href={{
+              pathname: "/schedule/[id]",
+              params: { id: PLACEHOLDER_SCHEDULE_ID },
+            }}
+            style={[styles.link, { color: theme.primary }]}
+          >
+            일정 수정
+          </Link>
+
+          <Link href="/settings" style={[styles.link, { color: theme.primary }]}>
+            설정
+          </Link>
+        </View>
+      </ScreenPlaceholder>
+    </ThemedView>
   );
 }
 
 const styles = StyleSheet.create({
+  screen: {
+    flex: 1,
+  },
   links: {
     alignItems: "center",
     gap: Spacing.two,
