@@ -1,5 +1,5 @@
-import { ScreenPlaceholder } from "@/components/screen-placeholder";
+import { ScheduleCreateForm } from "@/components/schedule-create/schedule-create-form";
 
 export default function ScheduleCreateScreen() {
-  return <ScreenPlaceholder title="일정 추가" />;
+  return <ScheduleCreateForm />;
 }

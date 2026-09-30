@@ -1,0 +1,349 @@
+import { DateTimePicker } from "@expo/ui/community/datetime-picker";
+import * as Crypto from "expo-crypto";
+import { useRouter } from "expo-router";
+import { useState } from "react";
+import {
+  Keyboard,
+  KeyboardAvoidingView,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  TextInput,
+  View,
+} from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
+
+import { ScheduleCategorySelector } from "@/components/schedule-create/schedule-category-selector";
+import { ScheduleDateField } from "@/components/schedule-create/schedule-date-field";
+import { ScheduleNotificationToggle } from "@/components/schedule-create/schedule-notification-toggle";
+import { ScheduleTimeField } from "@/components/schedule-create/schedule-time-field";
+import { ThemedText } from "@/components/themed-text";
+import { ThemedView } from "@/components/themed-view";
+import { Spacing } from "@/constants/theme";
+import { useColorScheme } from "@/hooks/use-color-scheme";
+import { useTheme } from "@/hooks/use-theme";
+import { useScheduleStore } from "@/stores/scheduleStore";
+import type { Schedule, ScheduleCategory } from "@/types/schedule";
+
+export function ScheduleCreateForm() {
+  const theme = useTheme();
+  const colorScheme = useColorScheme();
+  const router = useRouter();
+  const addSchedule = useScheduleStore((state) => state.addSchedule);
+  const [title, setTitle] = useState("");
+  const [date, setDate] = useState<string | null>(null);
+  const [time, setTime] = useState<string | null>(null);
+  const [notificationEnabled, setNotificationEnabled] = useState(true);
+  const [category, setCategory] = useState<ScheduleCategory | null>(null);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [activePicker, setActivePicker] = useState<"date" | "time" | null>(
+    null,
+  );
+  const [pickerValue, setPickerValue] = useState(() => new Date());
+
+  const canSave =
+    title.trim().length > 0 &&
+    date !== null &&
+    time !== null &&
+    category !== null;
+  const fieldBackground =
+    colorScheme === "dark" ? theme.backgroundElement : theme.background;
+  const screenBackground =
+    colorScheme === "dark" ? theme.background : "#FCF9F7";
+
+  const openDatePicker = () => {
+    Keyboard.dismiss();
+    setPickerValue(createDatePickerValue(date));
+    setActivePicker((current) => (current === "date" ? null : "date"));
+  };
+
+  const openTimePicker = () => {
+    Keyboard.dismiss();
+    setPickerValue(createTimePickerValue(time));
+    setActivePicker((current) => (current === "time" ? null : "time"));
+  };
+
+  const handleDateChange = (selectedDate: Date) => {
+    setPickerValue(selectedDate);
+    setDate(formatLocalDate(selectedDate));
+
+    if (Platform.OS === "android") {
+      setActivePicker(null);
+    }
+  };
+
+  const handleTimeChange = (selectedTime: Date) => {
+    setPickerValue(selectedTime);
+    setTime(formatLocalTime(selectedTime));
+
+    if (Platform.OS === "android") {
+      setActivePicker(null);
+    }
+  };
+
+  const handleSave = () => {
+    const trimmedTitle = title.trim();
+
+    if (!trimmedTitle || date === null || time === null || category === null) {
+      setFormError("필수 항목을 모두 입력해 주세요.");
+      return;
+    }
+
+    setFormError(null);
+
+    const newSchedule: Schedule = {
+      id: Crypto.randomUUID(),
+      title: trimmedTitle,
+      date,
+      time,
+      category,
+      completed: false,
+      notificationEnabled,
+    };
+
+    addSchedule(newSchedule);
+    router.back();
+  };
+
+  return (
+    <ThemedView style={[styles.screen, { backgroundColor: screenBackground }]}>
+      <KeyboardAvoidingView
+        behavior={Platform.OS === "ios" ? "padding" : undefined}
+        style={styles.keyboardAvoidingView}
+      >
+        <ScrollView
+          contentContainerStyle={styles.content}
+          keyboardDismissMode="interactive"
+          keyboardShouldPersistTaps="handled"
+          showsVerticalScrollIndicator={false}
+        >
+          <View style={styles.fieldGroup}>
+            <ThemedText style={styles.label}>제목</ThemedText>
+            <TextInput
+              accessibilityLabel="일정 제목"
+              onChangeText={setTitle}
+              placeholder="일정 제목을 입력하세요"
+              placeholderTextColor={theme.textSecondary}
+              style={[
+                styles.textInput,
+                {
+                  backgroundColor: fieldBackground,
+                  color: theme.text,
+                },
+              ]}
+              value={title}
+            />
+          </View>
+
+          <View style={styles.fieldGroup}>
+            <ScheduleDateField
+              backgroundColor={fieldBackground}
+              date={date}
+              expanded={activePicker === "date"}
+              onPress={openDatePicker}
+            />
+            {activePicker === "date" ? (
+              <DateTimePicker
+                accentColor={theme.primary}
+                display={Platform.OS === "ios" ? "spinner" : "default"}
+                mode="date"
+                onDismiss={() => setActivePicker(null)}
+                onValueChange={(_, selectedDate) =>
+                  handleDateChange(selectedDate)
+                }
+                presentation="dialog"
+                style={Platform.OS === "ios" ? styles.picker : undefined}
+                themeVariant={colorScheme === "dark" ? "dark" : "light"}
+                value={pickerValue}
+              />
+            ) : null}
+          </View>
+
+          <View style={styles.fieldGroup}>
+            <ScheduleTimeField
+              backgroundColor={fieldBackground}
+              expanded={activePicker === "time"}
+              onPress={openTimePicker}
+              time={time}
+            />
+            {activePicker === "time" ? (
+              <DateTimePicker
+                accentColor={theme.primary}
+                display={Platform.OS === "ios" ? "spinner" : "default"}
+                is24Hour
+                mode="time"
+                onDismiss={() => setActivePicker(null)}
+                onValueChange={(_, selectedTime) =>
+                  handleTimeChange(selectedTime)
+                }
+                presentation="dialog"
+                style={Platform.OS === "ios" ? styles.picker : undefined}
+                themeVariant={colorScheme === "dark" ? "dark" : "light"}
+                value={pickerValue}
+              />
+            ) : null}
+          </View>
+
+          <ScheduleNotificationToggle
+            backgroundColor={fieldBackground}
+            notificationEnabled={notificationEnabled}
+            onValueChange={setNotificationEnabled}
+          />
+
+          <ScheduleCategorySelector
+            category={category}
+            onSelectCategory={setCategory}
+          />
+
+          {formError ? (
+            <View accessibilityRole="alert" style={styles.formError}>
+              <ThemedText
+                type="small"
+                style={[styles.formErrorText, { color: theme.primary }]}
+              >
+                {formError}
+              </ThemedText>
+            </View>
+          ) : null}
+        </ScrollView>
+
+        <SafeAreaView
+          edges={["bottom"]}
+          style={[
+            styles.footer,
+            {
+              backgroundColor: fieldBackground,
+              borderTopColor: theme.backgroundElement,
+            },
+          ]}
+        >
+          <Pressable
+            accessibilityRole="button"
+            accessibilityState={{ disabled: !canSave }}
+            disabled={!canSave}
+            onPress={handleSave}
+            style={({ pressed }) => [
+              styles.saveButton,
+              { backgroundColor: theme.primary },
+              !canSave && styles.saveButtonDisabled,
+              pressed && canSave && styles.pressed,
+            ]}
+          >
+            <ThemedText
+              style={[
+                styles.saveButtonText,
+                { color: theme.primaryForeground },
+              ]}
+            >
+              저장
+            </ThemedText>
+          </Pressable>
+        </SafeAreaView>
+      </KeyboardAvoidingView>
+    </ThemedView>
+  );
+}
+
+function createDatePickerValue(date: string | null) {
+  const value = new Date();
+
+  if (date) {
+    const [year, month, day] = date.split("-").map(Number);
+    value.setFullYear(year, month - 1, day);
+  }
+
+  return value;
+}
+
+function createTimePickerValue(time: string | null) {
+  const value = new Date();
+
+  if (time) {
+    const [hour, minute] = time.split(":").map(Number);
+    value.setHours(hour, minute, 0, 0);
+  }
+
+  return value;
+}
+
+function formatLocalDate(value: Date) {
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, "0");
+  const day = String(value.getDate()).padStart(2, "0");
+
+  return `${year}-${month}-${day}`;
+}
+
+function formatLocalTime(value: Date) {
+  const hour = String(value.getHours()).padStart(2, "0");
+  const minute = String(value.getMinutes()).padStart(2, "0");
+
+  return `${hour}:${minute}`;
+}
+
+const styles = StyleSheet.create({
+  screen: {
+    flex: 1,
+  },
+  keyboardAvoidingView: {
+    flex: 1,
+  },
+  content: {
+    gap: 28,
+    paddingHorizontal: Spacing.four,
+    paddingTop: Spacing.four,
+    paddingBottom: Spacing.five,
+  },
+  fieldGroup: {
+    gap: Spacing.two,
+  },
+  label: {
+    fontSize: 16,
+    lineHeight: 24,
+    fontWeight: "700",
+  },
+  textInput: {
+    minHeight: 56,
+    borderRadius: 16,
+    paddingHorizontal: Spacing.three,
+    fontSize: 16,
+    lineHeight: 24,
+    fontWeight: "500",
+  },
+  picker: {
+    minHeight: 180,
+  },
+  formError: {
+    borderRadius: 12,
+    paddingHorizontal: Spacing.three,
+    paddingVertical: Spacing.two,
+  },
+  formErrorText: {
+    fontWeight: "600",
+    textAlign: "center",
+  },
+  pressed: {
+    opacity: 0.7,
+  },
+  footer: {
+    flexShrink: 0,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: Spacing.four,
+    paddingTop: Spacing.three,
+  },
+  saveButton: {
+    minHeight: 56,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 16,
+  },
+  saveButtonDisabled: {
+    opacity: 0.4,
+  },
+  saveButtonText: {
+    fontSize: 16,
+    lineHeight: 24,
+    fontWeight: "700",
+  },
+});
