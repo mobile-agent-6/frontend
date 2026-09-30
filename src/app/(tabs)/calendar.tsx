@@ -1,8 +1,8 @@
 import { StyleSheet } from "react-native";
 
-import { Header } from "@/components/header";
-import { ScreenPlaceholder } from "@/components/screen-placeholder";
-import { ThemedView } from "@/components/themed-view";
+import { Header } from "@/components/navigation/header";
+import { ScreenPlaceholder } from "@/components/ui/screen-placeholder";
+import { ThemedView } from "@/components/ui/themed-view";
 
 export default function CalendarScreen() {
   return (

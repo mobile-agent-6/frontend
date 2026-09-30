@@ -6,7 +6,6 @@ import {
   Keyboard,
   KeyboardAvoidingView,
   Platform,
-  Pressable,
   ScrollView,
   StyleSheet,
   TextInput,
@@ -18,8 +17,9 @@ import { ScheduleCategorySelector } from "@/components/schedule-create/schedule-
 import { ScheduleDateField } from "@/components/schedule-create/schedule-date-field";
 import { ScheduleNotificationToggle } from "@/components/schedule-create/schedule-notification-toggle";
 import { ScheduleTimeField } from "@/components/schedule-create/schedule-time-field";
-import { ThemedText } from "@/components/themed-text";
-import { ThemedView } from "@/components/themed-view";
+import { Button } from "@/components/ui/button";
+import { ThemedText } from "@/components/ui/themed-text";
+import { ThemedView } from "@/components/ui/themed-view";
 import { Spacing } from "@/constants/theme";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useTheme } from "@/hooks/use-theme";
@@ -218,27 +218,11 @@ export function ScheduleCreateForm() {
             },
           ]}
         >
-          <Pressable
-            accessibilityRole="button"
-            accessibilityState={{ disabled: !canSave }}
-            disabled={!canSave}
+          <Button
+            label="저장"
             onPress={handleSave}
-            style={({ pressed }) => [
-              styles.saveButton,
-              { backgroundColor: theme.primary },
-              !canSave && styles.saveButtonDisabled,
-              pressed && canSave && styles.pressed,
-            ]}
-          >
-            <ThemedText
-              style={[
-                styles.saveButtonText,
-                { color: theme.primaryForeground },
-              ]}
-            >
-              저장
-            </ThemedText>
-          </Pressable>
+            disabled={!canSave}
+          />
         </SafeAreaView>
       </KeyboardAvoidingView>
     </ThemedView>
@@ -323,27 +307,10 @@ const styles = StyleSheet.create({
     fontWeight: "600",
     textAlign: "center",
   },
-  pressed: {
-    opacity: 0.7,
-  },
   footer: {
     flexShrink: 0,
     borderTopWidth: StyleSheet.hairlineWidth,
     paddingHorizontal: Spacing.four,
     paddingTop: Spacing.three,
-  },
-  saveButton: {
-    minHeight: 56,
-    alignItems: "center",
-    justifyContent: "center",
-    borderRadius: 16,
-  },
-  saveButtonDisabled: {
-    opacity: 0.4,
-  },
-  saveButtonText: {
-    fontSize: 16,
-    lineHeight: 24,
-    fontWeight: "700",
   },
 });
