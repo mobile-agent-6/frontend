@@ -9,6 +9,10 @@ import {
 } from "@/components/category-filter";
 import { Header } from "@/components/header";
 import { ScheduleCard } from "@/components/schedule-card";
+import {
+  ScheduleListState,
+  type ScheduleListViewState,
+} from "@/components/schedule-list-state";
 import { ThemedText } from "@/components/themed-text";
 import { ThemedView } from "@/components/themed-view";
 import { BottomTabInset, Spacing } from "@/constants/theme";
@@ -24,6 +28,8 @@ export default function ScheduleListScreen() {
   const toggleCompleted = useScheduleStore((state) => state.toggleCompleted);
   const [selectedCategory, setSelectedCategory] =
     useState<ScheduleCategoryFilter>("전체");
+  const [requestState] =
+    useState<Exclude<ScheduleListViewState, "empty">>("success");
 
   const visibleSchedules = useMemo(
     () =>
@@ -34,6 +40,12 @@ export default function ScheduleListScreen() {
           ),
     [schedules, selectedCategory],
   );
+
+  const viewState: ScheduleListViewState =
+    requestState === "success" && visibleSchedules.length === 0
+      ? "empty"
+      : requestState;
+  const displayedSchedules = viewState === "success" ? visibleSchedules : [];
 
   return (
     <ThemedView
@@ -53,20 +65,18 @@ export default function ScheduleListScreen() {
       />
 
       <FlatList
-        data={visibleSchedules}
+        data={displayedSchedules}
         style={styles.list}
         keyExtractor={(schedule) => schedule.id}
         contentContainerStyle={[
           styles.listContent,
-          visibleSchedules.length === 0 && styles.emptyListContent,
+          viewState !== "success" && styles.emptyListContent,
         ]}
         ItemSeparatorComponent={ScheduleSeparator}
         ListEmptyComponent={
-          <ThemedText type="small" themeColor="textSecondary">
-            {selectedCategory === "전체"
-              ? "등록된 일정이 없어요."
-              : "해당 카테고리의 일정이 없어요."}
-          </ThemedText>
+          viewState === "success" ? null : (
+            <ScheduleListState state={viewState} />
+          )
         }
         renderItem={({ item }) => (
           <ScheduleCard
