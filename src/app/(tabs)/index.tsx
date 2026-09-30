@@ -127,7 +127,7 @@ const styles = StyleSheet.create({
   listContent: {
     paddingHorizontal: Spacing.three,
     paddingTop: Spacing.one,
-    paddingBottom: BottomTabInset + 80,
+    paddingBottom: 96,
   },
   emptyListContent: {
     flexGrow: 1,
