@@ -1,4 +1,5 @@
 import { DateTimePicker } from "@expo/ui/community/datetime-picker";
+import { useRouter } from "expo-router";
 import { useState } from "react";
 import {
   Keyboard,
@@ -15,11 +16,13 @@ import { ScheduleCategorySelector } from "@/components/schedule-create/schedule-
 import { ScheduleDateField } from "@/components/schedule-create/schedule-date-field";
 import { ScheduleNotificationToggle } from "@/components/schedule-create/schedule-notification-toggle";
 import { ScheduleTimeField } from "@/components/schedule-create/schedule-time-field";
+import { Button } from "@/components/ui/button";
 import { ThemedText } from "@/components/ui/themed-text";
 import { ThemedView } from "@/components/ui/themed-view";
 import { Spacing } from "@/constants/theme";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useTheme } from "@/hooks/use-theme";
+import { useScheduleStore } from "@/stores/scheduleStore";
 import type { Schedule, ScheduleCategory } from "@/types/schedule";
 import {
   createDatePickerValue,
@@ -35,6 +38,15 @@ type ScheduleEditFormProps = {
 export function ScheduleEditForm({ schedule }: ScheduleEditFormProps) {
   const theme = useTheme();
   const colorScheme = useColorScheme();
+  const router = useRouter();
+  const updateSchedule = useScheduleStore((state) => state.updateSchedule);
+  const [original] = useState(() => ({
+    title: schedule.title.trim(),
+    date: schedule.date,
+    time: schedule.time,
+    category: schedule.category,
+    notificationEnabled: schedule.notificationEnabled,
+  }));
   const [title, setTitle] = useState(schedule.title);
   const [date, setDate] = useState(schedule.date);
   const [time, setTime] = useState(schedule.time);
@@ -46,6 +58,38 @@ export function ScheduleEditForm({ schedule }: ScheduleEditFormProps) {
     null,
   );
   const [pickerValue, setPickerValue] = useState(() => new Date());
+  const [formError, setFormError] = useState<string | null>(null);
+
+  const trimmedTitle = title.trim();
+  const isValid =
+    trimmedTitle.length > 0 && Boolean(date) && Boolean(time) && Boolean(category);
+  const updates: Partial<
+    Pick<Schedule, "title" | "date" | "time" | "category" | "notificationEnabled">
+  > = {};
+
+  if (trimmedTitle !== original.title) updates.title = trimmedTitle;
+  if (date !== original.date) updates.date = date;
+  if (time !== original.time) updates.time = time;
+  if (category !== original.category) updates.category = category;
+  if (notificationEnabled !== original.notificationEnabled) {
+    updates.notificationEnabled = notificationEnabled;
+  }
+
+  const isDirty = Object.keys(updates).length > 0;
+
+  const handleSave = () => {
+    if (!isValid) {
+      setFormError("필수 항목을 모두 입력해 주세요.");
+      return;
+    }
+
+    setFormError(null);
+
+    if (!isDirty) return;
+
+    updateSchedule(schedule.id, updates);
+    router.back();
+  };
 
   const fieldBackground =
     colorScheme === "dark" ? theme.backgroundElement : theme.background;
@@ -67,6 +111,7 @@ export function ScheduleEditForm({ schedule }: ScheduleEditFormProps) {
   const handleDateChange = (selectedDate: Date) => {
     setPickerValue(selectedDate);
     setDate(formatLocalDate(selectedDate));
+    setFormError(null);
 
     if (Platform.OS === "android") {
       setActivePicker(null);
@@ -76,6 +121,7 @@ export function ScheduleEditForm({ schedule }: ScheduleEditFormProps) {
   const handleTimeChange = (selectedTime: Date) => {
     setPickerValue(selectedTime);
     setTime(formatLocalTime(selectedTime));
+    setFormError(null);
 
     if (Platform.OS === "android") {
       setActivePicker(null);
@@ -99,7 +145,10 @@ export function ScheduleEditForm({ schedule }: ScheduleEditFormProps) {
               <ThemedText style={styles.label}>제목</ThemedText>
               <TextInput
                 accessibilityLabel="일정 제목"
-                onChangeText={setTitle}
+                onChangeText={(value) => {
+                  setTitle(value);
+                  setFormError(null);
+                }}
                 placeholder="일정 제목을 입력하세요"
                 placeholderTextColor={theme.textSecondary}
                 style={[
@@ -165,14 +214,46 @@ export function ScheduleEditForm({ schedule }: ScheduleEditFormProps) {
             <ScheduleNotificationToggle
               backgroundColor={fieldBackground}
               notificationEnabled={notificationEnabled}
-              onValueChange={setNotificationEnabled}
+              onValueChange={(value) => {
+                setNotificationEnabled(value);
+                setFormError(null);
+              }}
             />
 
             <ScheduleCategorySelector
               category={category}
-              onSelectCategory={setCategory}
+              onSelectCategory={(value) => {
+                setCategory(value);
+                setFormError(null);
+              }}
             />
+
+            {formError ? (
+              <View accessibilityRole="alert" style={styles.formError}>
+                <ThemedText
+                  type="small"
+                  style={[styles.formErrorText, { color: theme.primary }]}
+                >
+                  {formError}
+                </ThemedText>
+              </View>
+            ) : null}
           </ScrollView>
+
+          <View
+            style={[
+              styles.footer,
+              {
+                backgroundColor: screenBackground,
+              },
+            ]}
+          >
+            <Button
+              label="수정 완료"
+              onPress={handleSave}
+              disabled={!isDirty || !isValid}
+            />
+          </View>
         </KeyboardAvoidingView>
       </SafeAreaView>
     </ThemedView>
@@ -214,5 +295,20 @@ const styles = StyleSheet.create({
   },
   picker: {
     minHeight: 180,
+  },
+  formError: {
+    borderRadius: 12,
+    paddingHorizontal: Spacing.three,
+    paddingVertical: Spacing.two,
+  },
+  formErrorText: {
+    fontWeight: "600",
+    textAlign: "center",
+  },
+  footer: {
+    flexShrink: 0,
+    paddingHorizontal: Spacing.four,
+    paddingTop: Spacing.three,
+    paddingBottom: Spacing.three,
   },
 });
