@@ -16,6 +16,7 @@ type ScheduleCardProps = {
   schedule: Schedule;
   onPress: () => void;
   onToggleCompleted: () => void;
+  showDate?: boolean;
 };
 
 function formatScheduleDate(date: string) {
@@ -30,6 +31,7 @@ export function ScheduleCard({
   schedule,
   onPress,
   onToggleCompleted,
+  showDate = true,
 }: ScheduleCardProps) {
   const theme = useTheme();
   const colorScheme = useColorScheme();
@@ -117,7 +119,8 @@ export function ScheduleCard({
               },
             ]}
           >
-            {formatScheduleDate(schedule.date)}{"  "}{schedule.time}
+            {showDate ? `${formatScheduleDate(schedule.date)}  ` : null}
+            {schedule.time}
           </ThemedText>
 
           {schedule.notificationEnabled ? (
