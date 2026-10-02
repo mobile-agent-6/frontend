@@ -18,18 +18,12 @@ type ScheduleCardProps = {
   onToggleCompleted: () => void;
 };
 
-function formatScheduleTime(time: string) {
-  const [hourText, minute] = time.split(":");
-  const hour = Number(hourText);
+function formatScheduleDate(date: string) {
+  const [year, month, day] = date.split("-").map(Number);
+  const localDate = new Date(year, month - 1, day);
+  const weekday = ["일", "월", "화", "수", "목", "금", "토"][localDate.getDay()];
 
-  if (!Number.isInteger(hour) || minute === undefined) {
-    return time;
-  }
-
-  const period = hour < 12 ? "오전" : "오후";
-  const displayHour = hour % 12 || 12;
-
-  return `${period} ${displayHour}:${minute}`;
+  return `${month}월 ${day}일 (${weekday})`;
 }
 
 export function ScheduleCard({
@@ -123,7 +117,7 @@ export function ScheduleCard({
               },
             ]}
           >
-            {formatScheduleTime(schedule.time)}
+            {formatScheduleDate(schedule.date)}{"  "}{schedule.time}
           </ThemedText>
 
           {schedule.notificationEnabled ? (
@@ -211,12 +205,14 @@ const styles = StyleSheet.create({
     height: 1,
   },
   metadata: {
-    height: 20,
+    minHeight: 20,
     flexDirection: "row",
+    flexWrap: "wrap",
     alignItems: "center",
     gap: Spacing.one,
   },
   time: {
+    flexShrink: 1,
     fontSize: 14,
     lineHeight: 20,
   },
