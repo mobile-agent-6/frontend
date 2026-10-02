@@ -63,7 +63,17 @@ export default function CalendarScreen() {
         </ThemedText>
 
         <View style={styles.scheduleList}>
-          {selectedSchedules.map((schedule) => (
+          {selectedSchedules.length === 0 ? (
+            <View style={styles.emptyState}>
+              <ThemedText
+                type="small"
+                themeColor="textSecondary"
+                style={styles.emptyText}
+              >
+                이 날에는 일정이 없어요
+              </ThemedText>
+            </View>
+          ) : selectedSchedules.map((schedule) => (
             <ScheduleCard
               key={schedule.id}
               schedule={schedule}
@@ -100,5 +110,14 @@ const styles = StyleSheet.create({
   scheduleList: {
     marginTop: Spacing.two,
     gap: 12,
+  },
+  emptyState: {
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: Spacing.five,
+    paddingHorizontal: Spacing.three,
+  },
+  emptyText: {
+    textAlign: "center",
   },
 });
