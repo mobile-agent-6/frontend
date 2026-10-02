@@ -32,12 +32,18 @@ export default function ScheduleListScreen() {
     useState<Exclude<ScheduleListViewState, "empty">>("success");
 
   const visibleSchedules = useMemo(
-    () =>
-      selectedCategory === "전체"
-        ? schedules
-        : schedules.filter(
-            (schedule) => schedule.category === selectedCategory,
-          ),
+    () => {
+      const filteredSchedules =
+        selectedCategory === "전체"
+          ? [...schedules]
+          : schedules.filter(
+              (schedule) => schedule.category === selectedCategory,
+            );
+
+      return filteredSchedules.sort(
+        (a, b) => a.date.localeCompare(b.date) || a.time.localeCompare(b.time),
+      );
+    },
     [schedules, selectedCategory],
   );
 
