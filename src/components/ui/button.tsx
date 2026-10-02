@@ -7,10 +7,24 @@ type ButtonProps = {
   label: string;
   onPress: () => void;
   disabled?: boolean;
+  variant?: "primary" | "secondary" | "destructive";
 };
 
-export function Button({ label, onPress, disabled = false }: ButtonProps) {
+export function Button({
+  label,
+  onPress,
+  disabled = false,
+  variant = "primary",
+}: ButtonProps) {
   const theme = useTheme();
+  const backgroundColor =
+    variant === "secondary"
+      ? theme.backgroundElement
+      : variant === "destructive"
+        ? theme.destructive
+        : theme.primary;
+  const textColor =
+    variant === "secondary" ? theme.text : theme.primaryForeground;
 
   return (
     <Pressable
@@ -20,12 +34,12 @@ export function Button({ label, onPress, disabled = false }: ButtonProps) {
       onPress={onPress}
       style={({ pressed }) => [
         styles.button,
-        { backgroundColor: theme.primary },
+        { backgroundColor },
         disabled && styles.disabled,
         pressed && !disabled && styles.pressed,
       ]}
     >
-      <ThemedText style={[styles.text, { color: theme.primaryForeground }]}>
+      <ThemedText style={[styles.text, { color: textColor }]}>
         {label}
       </ThemedText>
     </Pressable>
