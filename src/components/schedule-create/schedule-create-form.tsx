@@ -25,6 +25,12 @@ import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useTheme } from "@/hooks/use-theme";
 import { useScheduleStore } from "@/stores/scheduleStore";
 import type { Schedule, ScheduleCategory } from "@/types/schedule";
+import {
+  createDatePickerValue,
+  createTimePickerValue,
+  formatLocalDate,
+  formatLocalTime,
+} from "@/utils/schedule-date-time";
 
 export function ScheduleCreateForm() {
   const theme = useTheme();
@@ -227,43 +233,6 @@ export function ScheduleCreateForm() {
       </KeyboardAvoidingView>
     </ThemedView>
   );
-}
-
-function createDatePickerValue(date: string | null) {
-  const value = new Date();
-
-  if (date) {
-    const [year, month, day] = date.split("-").map(Number);
-    value.setFullYear(year, month - 1, day);
-  }
-
-  return value;
-}
-
-function createTimePickerValue(time: string | null) {
-  const value = new Date();
-
-  if (time) {
-    const [hour, minute] = time.split(":").map(Number);
-    value.setHours(hour, minute, 0, 0);
-  }
-
-  return value;
-}
-
-function formatLocalDate(value: Date) {
-  const year = value.getFullYear();
-  const month = String(value.getMonth() + 1).padStart(2, "0");
-  const day = String(value.getDate()).padStart(2, "0");
-
-  return `${year}-${month}-${day}`;
-}
-
-function formatLocalTime(value: Date) {
-  const hour = String(value.getHours()).padStart(2, "0");
-  const minute = String(value.getMinutes()).padStart(2, "0");
-
-  return `${hour}:${minute}`;
 }
 
 const styles = StyleSheet.create({
