@@ -11,10 +11,7 @@ import { Header } from "@/components/navigation/header";
 import { ThemedView } from "@/components/ui/themed-view";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useTheme } from "@/hooks/use-theme";
-import {
-  getMockAssistantSchedules,
-  getMockAssistantText,
-} from "@/services/mock/assistant";
+import { runMockAssistantScenario } from "@/services/mock/assistant";
 import type { AssistantStatus } from "@/types/assistant";
 
 // processing UI를 보여주기 위한 Mock 지연이며, 실제 API timeout이 아니다.
@@ -27,16 +24,18 @@ export default function AssistantScreen() {
   const [inputText, setInputText] = useState("");
   const [status, setStatus] = useState<AssistantStatus>("idle");
   const sendLockedRef = useRef(false);
+  const pendingInputRef = useRef("");
 
   useEffect(() => {
     if (status !== "processing") return;
 
     const timer = setTimeout(() => {
+      const result = runMockAssistantScenario(pendingInputRef.current);
       const response: ConversationMessage = {
         id: Crypto.randomUUID(),
         role: "assistant",
-        text: getMockAssistantText(),
-        schedules: getMockAssistantSchedules(),
+        text: result.text,
+        schedules: result.schedules,
       };
       setMessages((current) => [...current, response]);
       setStatus("idle");
@@ -50,6 +49,7 @@ export default function AssistantScreen() {
     const text = inputText.trim();
     if (!text || sendLockedRef.current) return;
     sendLockedRef.current = true;
+    pendingInputRef.current = text;
 
     const message: ConversationMessage = {
       id: Crypto.randomUUID(),

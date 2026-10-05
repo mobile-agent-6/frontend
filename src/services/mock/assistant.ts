@@ -1,20 +1,42 @@
+import * as Crypto from "expo-crypto";
+
+import { useScheduleStore } from "@/stores/scheduleStore";
 import type { Schedule } from "@/types/schedule";
+import { formatLocalDate } from "@/utils/schedule-date-time";
 
-// 결과 카드 UI 확인용 fixture이며 실제 일정 저장소에는 추가하지 않는다.
-const PREVIEW_SCHEDULE: Schedule = {
-  id: "assistant-card-preview",
-  title: "팀 회의",
-  date: "2026-10-06",
-  time: "15:00",
-  category: "회의",
-  completed: false,
-  notificationEnabled: false,
-};
+// 지정된 입력 문장만 실행하는 개발용 Mock이며 자연어를 해석하지 않는다.
+export function runMockAssistantScenario(input: string) {
+  switch (input) {
+    case "내일 오후 3시 팀 회의 추가해 줘": {
+      const tomorrow = new Date();
+      tomorrow.setDate(tomorrow.getDate() + 1);
 
-export function getMockAssistantText(): string {
-  return "메시지를 받았어요. 아래는 화면 확인용 예시 일정이에요.";
-}
+      const schedule: Schedule = {
+        id: Crypto.randomUUID(),
+        title: "팀 회의",
+        date: formatLocalDate(tomorrow),
+        time: "15:00",
+        category: "회의",
+        completed: false,
+        notificationEnabled: true,
+      };
+      useScheduleStore.getState().addSchedule(schedule);
 
-export function getMockAssistantSchedules(): Schedule[] {
-  return [{ ...PREVIEW_SCHEDULE }];
+      return { text: "네, 일정을 추가했어요.", schedules: [schedule] };
+    }
+    case "일정 보여줘": {
+      const schedules = [...useScheduleStore.getState().schedules];
+      const text =
+        schedules.length === 0
+          ? "등록된 일정이 없어요."
+          : `등록된 일정은 ${schedules.length}개예요.`;
+
+      return { text, schedules };
+    }
+    default:
+      return {
+        text: "메시지를 받았어요. 지금은 텍스트 대화 흐름을 확인하는 단계예요.",
+        schedules: [],
+      };
+  }
 }
