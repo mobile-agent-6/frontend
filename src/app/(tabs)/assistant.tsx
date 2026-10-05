@@ -13,6 +13,7 @@ import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useTheme } from "@/hooks/use-theme";
 import {
   resolveMockDeleteConfirmation,
+  createMockDeleteConfirmation,
   runMockAssistantScenario,
   type MockAssistantPending,
 } from "@/services/mock/assistant";
@@ -31,6 +32,7 @@ export default function AssistantScreen() {
   const pendingInputRef = useRef("");
   const pendingMockRef = useRef<MockAssistantPending>(null);
   const resolvedConfirmationIdsRef = useRef(new Set<string>());
+  const resolvedCandidateIdsRef = useRef(new Set<string>());
 
   useEffect(() => {
     if (status !== "processing") return;
@@ -70,6 +72,39 @@ export default function AssistantScreen() {
     setMessages((current) => [...current, message]);
     setInputText("");
     setStatus("processing");
+  };
+
+  const handleCandidateSelection = (messageId: string, scheduleId: string) => {
+    if (resolvedCandidateIdsRef.current.has(messageId)) return;
+    const message = messages.find((item) => item.id === messageId);
+    if (
+      message?.role !== "assistant" ||
+      message.interaction?.type !== "candidate-selection" ||
+      message.interaction.resolved ||
+      !message.interaction.candidates.some(
+        (candidate) => candidate.scheduleId === scheduleId,
+      )
+    ) {
+      return;
+    }
+
+    // 후보 선택은 한 번만 처리하고 최신 일정으로 삭제 확인을 만든다.
+    resolvedCandidateIdsRef.current.add(messageId);
+    const result = createMockDeleteConfirmation(scheduleId);
+    const response: ConversationMessage = {
+      id: Crypto.randomUUID(),
+      role: "assistant",
+      text: result.text,
+      interaction: result.interaction,
+    };
+    setMessages((current) => [
+      ...current.map((item) =>
+        item.id === messageId && item.role === "assistant" && item.interaction
+          ? { ...item, interaction: { ...item.interaction, resolved: true } }
+          : item,
+      ),
+      response,
+    ]);
   };
 
   const handleDeleteConfirmation = (messageId: string, confirmed: boolean) => {
@@ -123,6 +158,7 @@ export default function AssistantScreen() {
           messages={messages}
           isProcessing={status === "processing"}
           onDeleteConfirmation={handleDeleteConfirmation}
+          onCandidateSelection={handleCandidateSelection}
         />
         <MessageInput
           value={inputText}

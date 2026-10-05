@@ -11,3 +11,14 @@ export type AssistantDeleteConfirmation = {
   scheduleId: string;
   resolved: boolean;
 };
+
+// 고정 후보를 표시하는 화면용 데이터이며 실제 AI 후보 판단 계약과는 별개다.
+export type AssistantCandidateSelection = {
+  type: "candidate-selection";
+  candidates: readonly { scheduleId: string; label: string }[];
+  resolved: boolean;
+};
+
+export type AssistantInteraction =
+  | AssistantDeleteConfirmation
+  | AssistantCandidateSelection;

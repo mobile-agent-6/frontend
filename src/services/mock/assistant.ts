@@ -1,7 +1,7 @@
 import * as Crypto from "expo-crypto";
 
 import { useScheduleStore } from "@/stores/scheduleStore";
-import type { AssistantDeleteConfirmation } from "@/types/assistant";
+import type { AssistantInteraction } from "@/types/assistant";
 import type { Schedule } from "@/types/schedule";
 import {
   createDatePickerValue,
@@ -81,7 +81,7 @@ function addMockTeamMeeting() {
   return { text: "네, 일정을 추가했어요.", schedules: [schedule] };
 }
 
-function formatDeleteConfirmation(schedule: Schedule) {
+function formatScheduleDateTime(schedule: Schedule) {
   const date = createDatePickerValue(schedule.date);
   const time = createTimePickerValue(schedule.time);
   const hour = time.getHours();
@@ -89,27 +89,58 @@ function formatDeleteConfirmation(schedule: Schedule) {
   const period = hour < 12 ? "오전" : "오후";
   const minuteText = minute === 0 ? "" : ` ${minute}분`;
 
-  return `${date.getMonth() + 1}월 ${date.getDate()}일 ${period} ${hour % 12 || 12}시${minuteText} ${schedule.title}을 삭제할까요?`;
+  return `${date.getMonth() + 1}월 ${date.getDate()}일 ${period} ${hour % 12 || 12}시${minuteText}`;
+}
+
+export function createMockDeleteConfirmation(scheduleId: string): {
+  text: string;
+  schedules: Schedule[];
+  interaction?: AssistantInteraction;
+} {
+  const target = useScheduleStore
+    .getState()
+    .schedules.find((schedule) => schedule.id === scheduleId);
+  if (!target) return { text: "일정을 찾지 못했어요.", schedules: [] };
+
+  return {
+    text: `${formatScheduleDateTime(target)} ${target.title}을 삭제할까요?`,
+    schedules: [],
+    interaction: {
+      type: "delete-confirmation",
+      scheduleId,
+      resolved: false,
+    },
+  };
 }
 
 function runStandaloneMockScenario(input: string): {
   text: string;
   schedules: Schedule[];
-  interaction?: AssistantDeleteConfirmation;
+  interaction?: AssistantInteraction;
 } {
   switch (input) {
-    case "치과 예약 삭제해 줘": {
-      const target = useScheduleStore
-        .getState()
-        .schedules.find((schedule) => schedule.id === DENTAL_TARGET_ID);
-      if (!target) return { text: "일정을 찾지 못했어요.", schedules: [] };
-
+    case "치과 예약 삭제해 줘":
+      return createMockDeleteConfirmation(DENTAL_TARGET_ID);
+    case "재고 일정 삭제해 줘": {
+      const schedules = useScheduleStore.getState().schedules;
+      const candidates = [INVENTORY_TARGET_ID, COMPLETED_INVENTORY_TARGET_ID]
+        .map((id) => schedules.find((schedule) => schedule.id === id))
+        .filter((schedule): schedule is Schedule => schedule !== undefined);
+      if (candidates.length === 0) {
+        return { text: "일정을 찾지 못했어요.", schedules: [] };
+      }
+      if (candidates.length === 1) {
+        return createMockDeleteConfirmation(candidates[0].id);
+      }
       return {
-        text: formatDeleteConfirmation(target),
+        text: "어느 일정을 삭제할까요?",
         schedules: [],
         interaction: {
-          type: "delete-confirmation",
-          scheduleId: DENTAL_TARGET_ID,
+          type: "candidate-selection",
+          candidates: candidates.map((schedule) => ({
+            scheduleId: schedule.id,
+            label: `${schedule.title} · ${formatScheduleDateTime(schedule)}`,
+          })),
           resolved: false,
         },
       };

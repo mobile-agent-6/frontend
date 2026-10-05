@@ -5,14 +5,18 @@ import { ThemedText } from "@/components/ui/themed-text";
 import { ThemedView } from "@/components/ui/themed-view";
 import { Spacing } from "@/constants/theme";
 import { useTheme } from "@/hooks/use-theme";
-import type { AssistantDeleteConfirmation } from "@/types/assistant";
+import type {
+  AssistantCandidateSelection,
+  AssistantInteraction,
+} from "@/types/assistant";
 import type { Schedule } from "@/types/schedule";
 
 type AssistantMessageProps = {
   text: string;
   schedules?: readonly Schedule[];
-  interaction?: AssistantDeleteConfirmation;
+  interaction?: AssistantInteraction;
   onDeleteConfirmation?: (confirmed: boolean) => void;
+  onCandidateSelection?: (scheduleId: string) => void;
 };
 
 export function AssistantMessage({
@@ -20,6 +24,7 @@ export function AssistantMessage({
   schedules,
   interaction,
   onDeleteConfirmation,
+  onCandidateSelection,
 }: AssistantMessageProps) {
   const theme = useTheme();
   const confirmationDisabled = interaction?.resolved || !onDeleteConfirmation;
@@ -39,6 +44,7 @@ export function AssistantMessage({
               disabled={confirmationDisabled}
               onPress={() => onDeleteConfirmation?.(confirmed)}
               style={[
+                styles.buttonBase,
                 styles.action,
                 {
                   backgroundColor: confirmed
@@ -57,24 +63,73 @@ export function AssistantMessage({
           ))}
         </View>
       )}
+      {interaction?.type === "candidate-selection" && (
+        <CandidateSelectionInteraction
+          interaction={interaction}
+          onSelect={onCandidateSelection}
+        />
+      )}
     </ThemedView>
   );
 }
 
+function CandidateSelectionInteraction({
+  interaction,
+  onSelect,
+}: {
+  interaction: AssistantCandidateSelection;
+  onSelect?: (scheduleId: string) => void;
+}) {
+  const theme = useTheme();
+  const disabled = interaction.resolved || !onSelect;
+  return (
+    <View style={styles.candidates}>
+      {interaction.candidates.map((candidate) => (
+        <Pressable
+          key={candidate.scheduleId}
+          accessibilityRole="button"
+          accessibilityState={{ disabled }}
+          disabled={disabled}
+          onPress={() => onSelect?.(candidate.scheduleId)}
+          style={[
+            styles.buttonBase,
+            styles.candidate,
+            { backgroundColor: theme.primaryForeground },
+            disabled && styles.disabled,
+          ]}
+        >
+          <ThemedText themeColor="primary">
+            {candidate.label}
+          </ThemedText>
+        </Pressable>
+      ))}
+    </View>
+  );
+}
+
 const styles = StyleSheet.create({
+  candidates: {
+    alignSelf: "stretch",
+    gap: Spacing.two,
+  },
+  candidate: {
+    paddingVertical: Spacing.two,
+  },
   actions: {
     alignSelf: "stretch",
     flexDirection: "row",
     gap: Spacing.two,
   },
-  action: {
-    flex: 1,
+  buttonBase: {
     minHeight: 44,
-    minWidth: 64,
-    alignItems: "center",
     justifyContent: "center",
     paddingHorizontal: Spacing.three,
     borderRadius: 12,
+  },
+  action: {
+    flex: 1,
+    minWidth: 64,
+    alignItems: "center",
   },
   disabled: {
     opacity: 0.5,
