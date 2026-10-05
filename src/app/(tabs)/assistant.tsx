@@ -1,20 +1,185 @@
-import { StyleSheet } from "react-native";
+import * as Crypto from "expo-crypto";
+import { useEffect, useRef, useState } from "react";
+import { KeyboardAvoidingView, Platform, StyleSheet } from "react-native";
 
+import {
+  ConversationList,
+  type ConversationMessage,
+  type ConversationListHandle,
+} from "@/components/assistant/conversation-list";
+import { MessageInput } from "@/components/assistant/message-input";
 import { Header } from "@/components/navigation/header";
-import { ScreenPlaceholder } from "@/components/ui/screen-placeholder";
 import { ThemedView } from "@/components/ui/themed-view";
+import { useColorScheme } from "@/hooks/use-color-scheme";
+import { useTheme } from "@/hooks/use-theme";
+import {
+  resolveMockDeleteConfirmation,
+  createMockDeleteConfirmation,
+  runMockAssistantScenario,
+  type MockAssistantPending,
+} from "@/services/mock/assistant";
+import type { AssistantStatus } from "@/types/assistant";
+
+// processing UI를 보여주기 위한 Mock 지연이며, 실제 API timeout이 아니다.
+const MOCK_PROCESSING_DELAY_MS = 700;
 
 export default function AssistantScreen() {
+  const theme = useTheme();
+  const colorScheme = useColorScheme();
+  const [messages, setMessages] = useState<ConversationMessage[]>([]);
+  const [inputText, setInputText] = useState("");
+  const [status, setStatus] = useState<AssistantStatus>("idle");
+  const sendLockedRef = useRef(false);
+  const pendingInputRef = useRef("");
+  const pendingMockRef = useRef<MockAssistantPending>(null);
+  const resolvedConfirmationIdsRef = useRef(new Set<string>());
+  const resolvedCandidateIdsRef = useRef(new Set<string>());
+  const conversationListRef = useRef<ConversationListHandle>(null);
+
+  useEffect(() => {
+    if (status !== "processing") return;
+
+    const timer = setTimeout(() => {
+      const result = runMockAssistantScenario(
+        pendingInputRef.current,
+        pendingMockRef.current,
+      );
+      const response: ConversationMessage = {
+        id: Crypto.randomUUID(),
+        role: "assistant",
+        text: result.text,
+        schedules: result.schedules,
+        interaction: "interaction" in result ? result.interaction : undefined,
+      };
+      setMessages((current) => [...current, response]);
+      pendingMockRef.current = result.pending;
+      setStatus(result.status);
+      sendLockedRef.current = false;
+    }, MOCK_PROCESSING_DELAY_MS);
+
+    return () => clearTimeout(timer);
+  }, [status]);
+
+  const handleSend = () => {
+    const text = inputText.trim();
+    if (!text || sendLockedRef.current) return;
+    sendLockedRef.current = true;
+    pendingInputRef.current = text;
+
+    const message: ConversationMessage = {
+      id: Crypto.randomUUID(),
+      role: "user",
+      text,
+    };
+    setMessages((current) => [...current, message]);
+    setInputText("");
+    setStatus("processing");
+  };
+
+  const handleCandidateSelection = (messageId: string, scheduleId: string) => {
+    if (resolvedCandidateIdsRef.current.has(messageId)) return;
+    const message = messages.find((item) => item.id === messageId);
+    if (
+      message?.role !== "assistant" ||
+      message.interaction?.type !== "candidate-selection" ||
+      message.interaction.resolved ||
+      !message.interaction.candidates.some(
+        (candidate) => candidate.scheduleId === scheduleId,
+      )
+    ) {
+      return;
+    }
+
+    // 후보 선택은 한 번만 처리하고 최신 일정으로 삭제 확인을 만든다.
+    resolvedCandidateIdsRef.current.add(messageId);
+    const result = createMockDeleteConfirmation(scheduleId);
+    const response: ConversationMessage = {
+      id: Crypto.randomUUID(),
+      role: "assistant",
+      text: result.text,
+      interaction: result.interaction,
+    };
+    setMessages((current) => [
+      ...current.map((item) =>
+        item.id === messageId && item.role === "assistant" && item.interaction
+          ? { ...item, interaction: { ...item.interaction, resolved: true } }
+          : item,
+      ),
+      response,
+    ]);
+  };
+
+  const handleDeleteConfirmation = (messageId: string, confirmed: boolean) => {
+    if (resolvedConfirmationIdsRef.current.has(messageId)) return;
+    const message = messages.find((item) => item.id === messageId);
+    if (
+      message?.role !== "assistant" ||
+      message.interaction?.type !== "delete-confirmation" ||
+      message.interaction.resolved
+    ) {
+      return;
+    }
+
+    // 다시 렌더링되기 전 연속 클릭도 같은 확인을 두 번 처리하지 않도록 막는다.
+    resolvedConfirmationIdsRef.current.add(messageId);
+    const result = resolveMockDeleteConfirmation(
+      message.interaction.scheduleId,
+      confirmed,
+    );
+    const response: ConversationMessage = {
+      id: Crypto.randomUUID(),
+      role: "assistant",
+      text: result.text,
+    };
+    setMessages((current) => [
+      ...current.map((item) =>
+        item.id === messageId && item.role === "assistant" && item.interaction
+          ? { ...item, interaction: { ...item.interaction, resolved: true } }
+          : item,
+      ),
+      response,
+    ]);
+  };
+
   return (
-    <ThemedView style={styles.screen}>
+    <ThemedView
+      style={[
+        styles.screen,
+        {
+          backgroundColor:
+            colorScheme === "dark" ? theme.background : "#FCF9F7",
+        },
+      ]}
+    >
       <Header title="일정 비서" />
-      <ScreenPlaceholder title="일정 비서" />
+      <KeyboardAvoidingView
+        behavior={Platform.OS === "ios" ? "padding" : undefined}
+        style={styles.content}
+      >
+        <ConversationList
+          ref={conversationListRef}
+          messages={messages}
+          isProcessing={status === "processing"}
+          onDeleteConfirmation={handleDeleteConfirmation}
+          onCandidateSelection={handleCandidateSelection}
+        />
+        <MessageInput
+          onFocus={() => conversationListRef.current?.prepareForKeyboard()}
+          value={inputText}
+          onChangeText={setInputText}
+          onSend={handleSend}
+          disabled={status === "processing"}
+        />
+      </KeyboardAvoidingView>
     </ThemedView>
   );
 }
 
 const styles = StyleSheet.create({
   screen: {
+    flex: 1,
+  },
+  content: {
     flex: 1,
   },
 });
