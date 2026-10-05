@@ -1,3 +1,4 @@
+import { useRef } from "react";
 import { FlatList, StyleSheet, View } from "react-native";
 
 import { AssistantMessage } from "@/components/assistant/assistant-message";
@@ -17,13 +18,27 @@ type ConversationListProps = {
 };
 
 export function ConversationList({ messages }: ConversationListProps) {
+  const listRef = useRef<FlatList<ConversationMessage>>(null);
+
+  const scrollToLatest = (animated: boolean) => {
+    if (messages.length > 0) {
+      listRef.current?.scrollToEnd({ animated });
+    }
+  };
+
   return (
     <FlatList
+      ref={listRef}
       data={messages}
       style={styles.list}
       contentContainerStyle={styles.content}
       keyExtractor={(message) => message.id}
       ItemSeparatorComponent={MessageSeparator}
+      ListFooterComponent={<View style={styles.footer} />}
+      onContentSizeChange={() => scrollToLatest(true)}
+      onLayout={() => scrollToLatest(false)}
+      keyboardDismissMode="interactive"
+      keyboardShouldPersistTaps="handled"
       renderItem={({ item }) =>
         item.role === "user" ? (
           <UserMessage text={item.text} />
@@ -55,7 +70,6 @@ const styles = StyleSheet.create({
     flexGrow: 1,
     paddingHorizontal: Spacing.three,
     paddingTop: Spacing.four,
-    paddingBottom: Spacing.five,
   },
   userBubble: {
     alignSelf: "flex-end",
@@ -66,5 +80,8 @@ const styles = StyleSheet.create({
   },
   separator: {
     height: Spacing.three,
+  },
+  footer: {
+    height: Spacing.five,
   },
 });

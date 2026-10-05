@@ -225,7 +225,7 @@ const styles = StyleSheet.create({
   container: {
     flexShrink: 0,
     alignItems: "center",
-    paddingTop: Spacing.two,
+    paddingTop: 12,
   },
   navigationBar: {
     height: 76,
