@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useImperativeHandle, useRef, type Ref } from "react";
-import { FlatList, Keyboard, StyleSheet, View } from "react-native";
+import { FlatList, Keyboard, StyleSheet, TextInput, View } from "react-native";
 
 import { AssistantMessage } from "@/components/assistant/assistant-message";
 import { ThemedText } from "@/components/ui/themed-text";
 import { ThemedView } from "@/components/ui/themed-view";
 import { Spacing } from "@/constants/theme";
+import { useTheme } from "@/hooks/use-theme";
 import type { AssistantInteraction } from "@/types/assistant";
 import type { Schedule } from "@/types/schedule";
 
@@ -218,9 +219,18 @@ export function ConversationList({
 }
 
 function UserMessage({ text }: { text: string }) {
+  const theme = useTheme();
   return (
     <ThemedView type="backgroundElement" style={styles.userBubble}>
-      <ThemedText>{text}</ThemedText>
+      <TextInput
+        readOnly
+        multiline
+        value={text}
+        scrollEnabled={false}
+        showSoftInputOnFocus={false}
+        underlineColorAndroid="transparent"
+        style={[styles.messageText, { color: theme.text }]}
+      />
     </ThemedView>
   );
 }
@@ -230,6 +240,15 @@ function MessageSeparator() {
 }
 
 const styles = StyleSheet.create({
+  messageText: {
+    fontSize: 16,
+    lineHeight: 24,
+    fontWeight: 500,
+    padding: 0,
+    borderWidth: 0,
+    backgroundColor: "transparent",
+    textAlignVertical: "top",
+  },
   list: {
     flex: 1,
   },
