@@ -9,6 +9,7 @@ export type MockAssistantPending =
   | "awaiting-team-meeting-time"
   | "awaiting-team-meeting-title"
   | "awaiting-team-meeting-date"
+  | "awaiting-team-meeting-title-and-time"
   | null;
 
 // MOCK_SCHEDULES에 실제 존재하는 ID를 고정 대상으로 사용한다.
@@ -19,6 +20,7 @@ const COMPLETED_INVENTORY_TARGET_ID = "10000000-0000-4000-8000-000000000004";
 const DENTAL_TARGET_ID = "10000000-0000-4000-8000-000000000005";
 const MANAGER_MEETING_TARGET_ID = "10000000-0000-4000-8000-000000000007";
 const DELIVERY_TARGET_ID = "10000000-0000-4000-8000-000000000008";
+const RETURN_SHIPMENT_TARGET_ID = "10000000-0000-4000-8000-000000000006";
 
 function updateMockSchedule(
   id: string,
@@ -114,6 +116,15 @@ function runStandaloneMockScenario(input: string) {
         "치과 예약 날짜를 내일로 변경했어요.",
       );
     }
+    case "반품 택배 발송을 내일 오후 4시로 바꾸고 카테고리를 개인으로 변경해 줘": {
+      const tomorrow = new Date();
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      return updateMockSchedule(
+        RETURN_SHIPMENT_TARGET_ID,
+        { date: formatLocalDate(tomorrow), time: "16:00", category: "개인" },
+        "반품 택배 발송을 내일 오후 4시, 개인 카테고리로 변경했어요.",
+      );
+    }
     case "택배 수령 카테고리를 개인으로 바꿔 줘":
       return updateMockSchedule(
         DELIVERY_TARGET_ID,
@@ -151,6 +162,27 @@ export function runMockAssistantScenario(
   input: string,
   pending: MockAssistantPending = null,
 ) {
+  if (input === "내일 일정 추가해 줘") {
+    return {
+      text: "어떤 일정으로 추가할까요?",
+      schedules: [],
+      status: "need-more-info" as const,
+      pending: "awaiting-team-meeting-title-and-time" as const,
+    };
+  }
+
+  if (
+    pending === "awaiting-team-meeting-title-and-time" &&
+    input === "팀 회의"
+  ) {
+    return {
+      text: "몇 시로 할까요?",
+      schedules: [],
+      status: "need-more-info" as const,
+      pending: "awaiting-team-meeting-time" as const,
+    };
+  }
+
   if (input === "내일 팀 회의 추가해 줘") {
     return {
       text: "몇 시로 할까요?",
