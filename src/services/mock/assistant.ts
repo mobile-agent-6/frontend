@@ -4,6 +4,13 @@ import { useScheduleStore } from "@/stores/scheduleStore";
 import type { Schedule } from "@/types/schedule";
 import { formatLocalDate } from "@/utils/schedule-date-time";
 
+// 후속 입력을 구분하는 Mock 전용 상태이며 AI conversation context가 아니다.
+export type MockAssistantPending =
+  | "awaiting-team-meeting-time"
+  | "awaiting-team-meeting-title"
+  | "awaiting-team-meeting-date"
+  | null;
+
 // MOCK_SCHEDULES에 실제 존재하는 ID를 고정 대상으로 사용한다.
 const MEETING_TARGET_ID = "10000000-0000-4000-8000-000000000002";
 const INVENTORY_TARGET_ID = "10000000-0000-4000-8000-000000000001";
@@ -49,26 +56,28 @@ function updateMockSchedule(
   return { text, schedules: [updated] };
 }
 
-// 지정된 입력 문장만 실행하는 개발용 Mock이며 자연어를 해석하지 않는다.
-export function runMockAssistantScenario(input: string) {
+function addMockTeamMeeting() {
+  const tomorrow = new Date();
+  tomorrow.setDate(tomorrow.getDate() + 1);
+
+  const schedule: Schedule = {
+    id: Crypto.randomUUID(),
+    title: "팀 회의",
+    date: formatLocalDate(tomorrow),
+    time: "15:00",
+    category: "회의",
+    completed: false,
+    notificationEnabled: true,
+  };
+  useScheduleStore.getState().addSchedule(schedule);
+
+  return { text: "네, 일정을 추가했어요.", schedules: [schedule] };
+}
+
+function runStandaloneMockScenario(input: string) {
   switch (input) {
-    case "내일 오후 3시 팀 회의 추가해 줘": {
-      const tomorrow = new Date();
-      tomorrow.setDate(tomorrow.getDate() + 1);
-
-      const schedule: Schedule = {
-        id: Crypto.randomUUID(),
-        title: "팀 회의",
-        date: formatLocalDate(tomorrow),
-        time: "15:00",
-        category: "회의",
-        completed: false,
-        notificationEnabled: true,
-      };
-      useScheduleStore.getState().addSchedule(schedule);
-
-      return { text: "네, 일정을 추가했어요.", schedules: [schedule] };
-    }
+    case "내일 오후 3시 팀 회의 추가해 줘":
+      return addMockTeamMeeting();
     case "일정 보여줘": {
       const schedules = [...useScheduleStore.getState().schedules];
       const text =
@@ -135,4 +144,56 @@ export function runMockAssistantScenario(input: string) {
         schedules: [],
       };
   }
+}
+
+// 지정된 입력 문장만 실행하는 개발용 Mock이며 자연어를 해석하지 않는다.
+export function runMockAssistantScenario(
+  input: string,
+  pending: MockAssistantPending = null,
+) {
+  if (input === "내일 팀 회의 추가해 줘") {
+    return {
+      text: "몇 시로 할까요?",
+      schedules: [],
+      status: "need-more-info" as const,
+      pending: "awaiting-team-meeting-time" as const,
+    };
+  }
+
+  if (input === "내일 오후 3시에 일정 추가해 줘") {
+    return {
+      text: "어떤 일정으로 추가할까요?",
+      schedules: [],
+      status: "need-more-info" as const,
+      pending: "awaiting-team-meeting-title" as const,
+    };
+  }
+
+  if (input === "오후 3시 팀 회의 추가해 줘") {
+    return {
+      text: "언제로 추가할까요?",
+      schedules: [],
+      status: "need-more-info" as const,
+      pending: "awaiting-team-meeting-date" as const,
+    };
+  }
+
+  const matchesFollowUp =
+    (pending === "awaiting-team-meeting-time" && input === "오후 3시") ||
+    (pending === "awaiting-team-meeting-title" && input === "팀 회의") ||
+    (pending === "awaiting-team-meeting-date" && input === "내일");
+
+  if (matchesFollowUp) {
+    return {
+      ...addMockTeamMeeting(),
+      status: "idle" as const,
+      pending: null,
+    };
+  }
+
+  return {
+    ...runStandaloneMockScenario(input),
+    status: pending === null ? ("idle" as const) : ("need-more-info" as const),
+    pending,
+  };
 }

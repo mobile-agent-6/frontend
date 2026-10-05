@@ -11,7 +11,10 @@ import { Header } from "@/components/navigation/header";
 import { ThemedView } from "@/components/ui/themed-view";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useTheme } from "@/hooks/use-theme";
-import { runMockAssistantScenario } from "@/services/mock/assistant";
+import {
+  runMockAssistantScenario,
+  type MockAssistantPending,
+} from "@/services/mock/assistant";
 import type { AssistantStatus } from "@/types/assistant";
 
 // processing UI를 보여주기 위한 Mock 지연이며, 실제 API timeout이 아니다.
@@ -25,12 +28,16 @@ export default function AssistantScreen() {
   const [status, setStatus] = useState<AssistantStatus>("idle");
   const sendLockedRef = useRef(false);
   const pendingInputRef = useRef("");
+  const pendingMockRef = useRef<MockAssistantPending>(null);
 
   useEffect(() => {
     if (status !== "processing") return;
 
     const timer = setTimeout(() => {
-      const result = runMockAssistantScenario(pendingInputRef.current);
+      const result = runMockAssistantScenario(
+        pendingInputRef.current,
+        pendingMockRef.current,
+      );
       const response: ConversationMessage = {
         id: Crypto.randomUUID(),
         role: "assistant",
@@ -38,7 +45,8 @@ export default function AssistantScreen() {
         schedules: result.schedules,
       };
       setMessages((current) => [...current, response]);
-      setStatus("idle");
+      pendingMockRef.current = result.pending;
+      setStatus(result.status);
       sendLockedRef.current = false;
     }, MOCK_PROCESSING_DELAY_MS);
 
