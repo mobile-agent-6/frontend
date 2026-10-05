@@ -10,11 +10,18 @@ type MessageInputProps = {
   value: string;
   onChangeText: (text: string) => void;
   onSend: () => void;
+  disabled?: boolean;
 };
 
-export function MessageInput({ value, onChangeText, onSend }: MessageInputProps) {
+export function MessageInput({
+  value,
+  onChangeText,
+  onSend,
+  disabled = false,
+}: MessageInputProps) {
   const theme = useTheme();
   const canSend = value.trim().length > 0;
+  const sendDisabled = disabled || !canSend;
 
   return (
     <ThemedView
@@ -25,7 +32,9 @@ export function MessageInput({ value, onChangeText, onSend }: MessageInputProps)
           accessibilityLabel="일정 비서 메시지"
           value={value}
           onChangeText={onChangeText}
-          onSubmitEditing={onSend}
+          onSubmitEditing={disabled ? undefined : onSend}
+          editable={!disabled}
+          accessibilityState={{ disabled }}
           returnKeyType="send"
           submitBehavior="submit"
           style={[
@@ -53,14 +62,14 @@ export function MessageInput({ value, onChangeText, onSend }: MessageInputProps)
       <Pressable
         accessibilityLabel={canSend ? "메시지 전송" : "음성 입력 (준비 중)"}
         accessibilityRole="button"
-        accessibilityState={{ disabled: !canSend }}
-        disabled={!canSend}
+        accessibilityState={{ disabled: sendDisabled }}
+        disabled={sendDisabled}
         onPress={onSend}
         style={({ pressed }) => [
           styles.button,
           { backgroundColor: theme.primary },
-          !canSend && styles.disabled,
-          pressed && canSend && styles.pressed,
+          sendDisabled && styles.disabled,
+          pressed && !sendDisabled && styles.pressed,
         ]}
       >
         <SymbolView

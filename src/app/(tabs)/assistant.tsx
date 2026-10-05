@@ -1,5 +1,5 @@
 import * as Crypto from "expo-crypto";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { KeyboardAvoidingView, Platform, StyleSheet } from "react-native";
 
 import {
@@ -11,16 +11,41 @@ import { Header } from "@/components/navigation/header";
 import { ThemedView } from "@/components/ui/themed-view";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useTheme } from "@/hooks/use-theme";
+import { getMockAssistantText } from "@/services/mock/assistant";
+import type { AssistantStatus } from "@/types/assistant";
+
+// processing UI를 보여주기 위한 Mock 지연이며, 실제 API timeout이 아니다.
+const MOCK_PROCESSING_DELAY_MS = 700;
 
 export default function AssistantScreen() {
   const theme = useTheme();
   const colorScheme = useColorScheme();
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
   const [inputText, setInputText] = useState("");
+  const [status, setStatus] = useState<AssistantStatus>("idle");
+  const sendLockedRef = useRef(false);
+
+  useEffect(() => {
+    if (status !== "processing") return;
+
+    const timer = setTimeout(() => {
+      const response: ConversationMessage = {
+        id: Crypto.randomUUID(),
+        role: "assistant",
+        text: getMockAssistantText(),
+      };
+      setMessages((current) => [...current, response]);
+      setStatus("idle");
+      sendLockedRef.current = false;
+    }, MOCK_PROCESSING_DELAY_MS);
+
+    return () => clearTimeout(timer);
+  }, [status]);
 
   const handleSend = () => {
     const text = inputText.trim();
-    if (!text) return;
+    if (!text || sendLockedRef.current) return;
+    sendLockedRef.current = true;
 
     const message: ConversationMessage = {
       id: Crypto.randomUUID(),
@@ -29,6 +54,7 @@ export default function AssistantScreen() {
     };
     setMessages((current) => [...current, message]);
     setInputText("");
+    setStatus("processing");
   };
 
   return (
@@ -46,11 +72,15 @@ export default function AssistantScreen() {
         behavior={Platform.OS === "ios" ? "padding" : undefined}
         style={styles.content}
       >
-        <ConversationList messages={messages} />
+        <ConversationList
+          messages={messages}
+          isProcessing={status === "processing"}
+        />
         <MessageInput
           value={inputText}
           onChangeText={setInputText}
           onSend={handleSend}
+          disabled={status === "processing"}
         />
       </KeyboardAvoidingView>
     </ThemedView>

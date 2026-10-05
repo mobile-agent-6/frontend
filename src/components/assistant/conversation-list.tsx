@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useEffect, useRef } from "react";
 import { FlatList, StyleSheet, View } from "react-native";
 
 import { AssistantMessage } from "@/components/assistant/assistant-message";
@@ -15,16 +15,29 @@ export type ConversationMessage = {
 
 type ConversationListProps = {
   messages: readonly ConversationMessage[];
+  isProcessing?: boolean;
 };
 
-export function ConversationList({ messages }: ConversationListProps) {
+export function ConversationList({
+  messages,
+  isProcessing = false,
+}: ConversationListProps) {
   const listRef = useRef<FlatList<ConversationMessage>>(null);
+  const messageCount = messages.length;
+  const previousMessageCountRef = useRef(messageCount);
 
-  const scrollToLatest = (animated: boolean) => {
-    if (messages.length > 0) {
-      listRef.current?.scrollToEnd({ animated });
-    }
-  };
+  useEffect(() => {
+    const hasNewMessage = messageCount > previousMessageCountRef.current;
+    previousMessageCountRef.current = messageCount;
+    if (!hasNewMessage) return;
+
+    // 메시지와 processing 영역이 렌더링된 다음 하단으로 이동한다.
+    const frame = requestAnimationFrame(() => {
+      listRef.current?.scrollToEnd({ animated: true });
+    });
+
+    return () => cancelAnimationFrame(frame);
+  }, [messageCount]);
 
   return (
     <FlatList
@@ -34,9 +47,18 @@ export function ConversationList({ messages }: ConversationListProps) {
       contentContainerStyle={styles.content}
       keyExtractor={(message) => message.id}
       ItemSeparatorComponent={MessageSeparator}
-      ListFooterComponent={<View style={styles.footer} />}
-      onContentSizeChange={() => scrollToLatest(true)}
-      onLayout={() => scrollToLatest(false)}
+      ListFooterComponent={
+        <View>
+          {isProcessing && (
+            <View style={styles.processing} accessibilityLiveRegion="polite">
+              <ThemedText themeColor="textSecondary">
+                일정을 확인하고 있어요...
+              </ThemedText>
+            </View>
+          )}
+          <View style={styles.footer} />
+        </View>
+      }
       keyboardDismissMode="interactive"
       keyboardShouldPersistTaps="handled"
       renderItem={({ item }) =>
@@ -83,5 +105,9 @@ const styles = StyleSheet.create({
   },
   footer: {
     height: Spacing.five,
+  },
+  processing: {
+    marginTop: Spacing.three,
+    alignSelf: "flex-start",
   },
 });
