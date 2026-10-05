@@ -11,7 +11,10 @@ import { Header } from "@/components/navigation/header";
 import { ThemedView } from "@/components/ui/themed-view";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useTheme } from "@/hooks/use-theme";
-import { getMockAssistantText } from "@/services/mock/assistant";
+import {
+  getMockAssistantSchedules,
+  getMockAssistantText,
+} from "@/services/mock/assistant";
 import type { AssistantStatus } from "@/types/assistant";
 
 // processing UI를 보여주기 위한 Mock 지연이며, 실제 API timeout이 아니다.
@@ -33,6 +36,7 @@ export default function AssistantScreen() {
         id: Crypto.randomUUID(),
         role: "assistant",
         text: getMockAssistantText(),
+        schedules: getMockAssistantSchedules(),
       };
       setMessages((current) => [...current, response]);
       setStatus("idle");
