@@ -5,6 +5,7 @@ import { KeyboardAvoidingView, Platform, StyleSheet } from "react-native";
 import {
   ConversationList,
   type ConversationMessage,
+  type ConversationListHandle,
 } from "@/components/assistant/conversation-list";
 import { MessageInput } from "@/components/assistant/message-input";
 import { Header } from "@/components/navigation/header";
@@ -33,6 +34,7 @@ export default function AssistantScreen() {
   const pendingMockRef = useRef<MockAssistantPending>(null);
   const resolvedConfirmationIdsRef = useRef(new Set<string>());
   const resolvedCandidateIdsRef = useRef(new Set<string>());
+  const conversationListRef = useRef<ConversationListHandle>(null);
 
   useEffect(() => {
     if (status !== "processing") return;
@@ -155,12 +157,14 @@ export default function AssistantScreen() {
         style={styles.content}
       >
         <ConversationList
+          ref={conversationListRef}
           messages={messages}
           isProcessing={status === "processing"}
           onDeleteConfirmation={handleDeleteConfirmation}
           onCandidateSelection={handleCandidateSelection}
         />
         <MessageInput
+          onFocus={() => conversationListRef.current?.prepareForKeyboard()}
           value={inputText}
           onChangeText={setInputText}
           onSend={handleSend}

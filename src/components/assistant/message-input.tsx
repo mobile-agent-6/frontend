@@ -10,6 +10,7 @@ type MessageInputProps = {
   value: string;
   onChangeText: (text: string) => void;
   onSend: () => void;
+  onFocus?: () => void;
   disabled?: boolean;
 };
 
@@ -17,6 +18,7 @@ export function MessageInput({
   value,
   onChangeText,
   onSend,
+  onFocus,
   disabled = false,
 }: MessageInputProps) {
   const theme = useTheme();
@@ -29,6 +31,7 @@ export function MessageInput({
     >
       <View style={styles.inputContainer}>
         <TextInput
+          onFocus={onFocus}
           accessibilityLabel="일정 비서 메시지"
           value={value}
           onChangeText={onChangeText}
