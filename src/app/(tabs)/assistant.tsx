@@ -12,6 +12,7 @@ import { ThemedView } from "@/components/ui/themed-view";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useTheme } from "@/hooks/use-theme";
 import {
+  resolveMockDeleteConfirmation,
   runMockAssistantScenario,
   type MockAssistantPending,
 } from "@/services/mock/assistant";
@@ -29,6 +30,7 @@ export default function AssistantScreen() {
   const sendLockedRef = useRef(false);
   const pendingInputRef = useRef("");
   const pendingMockRef = useRef<MockAssistantPending>(null);
+  const resolvedConfirmationIdsRef = useRef(new Set<string>());
 
   useEffect(() => {
     if (status !== "processing") return;
@@ -43,6 +45,7 @@ export default function AssistantScreen() {
         role: "assistant",
         text: result.text,
         schedules: result.schedules,
+        interaction: "interaction" in result ? result.interaction : undefined,
       };
       setMessages((current) => [...current, response]);
       pendingMockRef.current = result.pending;
@@ -69,6 +72,38 @@ export default function AssistantScreen() {
     setStatus("processing");
   };
 
+  const handleDeleteConfirmation = (messageId: string, confirmed: boolean) => {
+    if (resolvedConfirmationIdsRef.current.has(messageId)) return;
+    const message = messages.find((item) => item.id === messageId);
+    if (
+      message?.role !== "assistant" ||
+      message.interaction?.type !== "delete-confirmation" ||
+      message.interaction.resolved
+    ) {
+      return;
+    }
+
+    // 다시 렌더링되기 전 연속 클릭도 같은 확인을 두 번 처리하지 않도록 막는다.
+    resolvedConfirmationIdsRef.current.add(messageId);
+    const result = resolveMockDeleteConfirmation(
+      message.interaction.scheduleId,
+      confirmed,
+    );
+    const response: ConversationMessage = {
+      id: Crypto.randomUUID(),
+      role: "assistant",
+      text: result.text,
+    };
+    setMessages((current) => [
+      ...current.map((item) =>
+        item.id === messageId && item.role === "assistant" && item.interaction
+          ? { ...item, interaction: { ...item.interaction, resolved: true } }
+          : item,
+      ),
+      response,
+    ]);
+  };
+
   return (
     <ThemedView
       style={[
@@ -87,6 +122,7 @@ export default function AssistantScreen() {
         <ConversationList
           messages={messages}
           isProcessing={status === "processing"}
+          onDeleteConfirmation={handleDeleteConfirmation}
         />
         <MessageInput
           value={inputText}

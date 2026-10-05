@@ -5,6 +5,7 @@ import { AssistantMessage } from "@/components/assistant/assistant-message";
 import { ThemedText } from "@/components/ui/themed-text";
 import { ThemedView } from "@/components/ui/themed-view";
 import { Spacing } from "@/constants/theme";
+import type { AssistantDeleteConfirmation } from "@/types/assistant";
 import type { Schedule } from "@/types/schedule";
 
 // 화면 표시용 메시지 데이터이며, 향후 Assistant API 계약과는 별개다.
@@ -13,17 +14,23 @@ export type ConversationMessage = {
   text: string;
 } & (
   | { role: "user" }
-  | { role: "assistant"; schedules?: readonly Schedule[] }
+  | {
+      role: "assistant";
+      schedules?: readonly Schedule[];
+      interaction?: AssistantDeleteConfirmation;
+    }
 );
 
 type ConversationListProps = {
   messages: readonly ConversationMessage[];
   isProcessing?: boolean;
+  onDeleteConfirmation?: (messageId: string, confirmed: boolean) => void;
 };
 
 export function ConversationList({
   messages,
   isProcessing = false,
+  onDeleteConfirmation,
 }: ConversationListProps) {
   const listRef = useRef<FlatList<ConversationMessage>>(null);
   const messageCount = messages.length;
@@ -68,7 +75,16 @@ export function ConversationList({
         item.role === "user" ? (
           <UserMessage text={item.text} />
         ) : (
-          <AssistantMessage text={item.text} schedules={item.schedules} />
+          <AssistantMessage
+            text={item.text}
+            schedules={item.schedules}
+            interaction={item.interaction}
+            onDeleteConfirmation={
+              onDeleteConfirmation
+                ? (confirmed) => onDeleteConfirmation(item.id, confirmed)
+                : undefined
+            }
+          />
         )
       }
     />
