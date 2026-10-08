@@ -1,17 +1,17 @@
-export type ScheduleCategory = "재고" | "반품" | "회의" | "개인" | "기타";
+export type ScheduleCategory = "입고" | "재고" | "출고" | "반품" | "기타";
 
 export type ScheduleApiCategory =
+  | "INBOUND"
   | "INVENTORY"
+  | "OUTBOUND"
   | "RETURN"
-  | "MEETING"
-  | "PERSONAL"
   | "OTHER";
 
 export const SCHEDULE_CATEGORIES: ScheduleCategory[] = [
+  "입고",
   "재고",
+  "출고",
   "반품",
-  "회의",
-  "개인",
   "기타",
 ];
 
