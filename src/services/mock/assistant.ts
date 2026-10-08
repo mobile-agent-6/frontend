@@ -22,9 +22,9 @@ const MEETING_TARGET_ID = "10000000-0000-4000-8000-000000000002";
 const INVENTORY_TARGET_ID = "10000000-0000-4000-8000-000000000001";
 const RETURN_TARGET_ID = "10000000-0000-4000-8000-000000000003";
 const COMPLETED_INVENTORY_TARGET_ID = "10000000-0000-4000-8000-000000000004";
-const DENTAL_TARGET_ID = "10000000-0000-4000-8000-000000000005";
-const MANAGER_MEETING_TARGET_ID = "10000000-0000-4000-8000-000000000007";
-const DELIVERY_TARGET_ID = "10000000-0000-4000-8000-000000000008";
+const SAFETY_INSPECTION_TARGET_ID = "10000000-0000-4000-8000-000000000005";
+const OUTBOUND_PREPARATION_TARGET_ID = "10000000-0000-4000-8000-000000000007";
+const INBOUND_QUANTITY_TARGET_ID = "10000000-0000-4000-8000-000000000008";
 const RETURN_SHIPMENT_TARGET_ID = "10000000-0000-4000-8000-000000000006";
 
 function updateMockSchedule(
@@ -72,7 +72,7 @@ function addMockTeamMeeting() {
     title: "팀 회의",
     date: formatLocalDate(tomorrow),
     time: "15:00",
-    category: "회의",
+    category: "기타",
     completed: false,
     notificationEnabled: true,
   };
@@ -119,8 +119,8 @@ function runStandaloneMockScenario(input: string): {
   interaction?: AssistantInteraction;
 } {
   switch (input) {
-    case "치과 예약 삭제해 줘":
-      return createMockDeleteConfirmation(DENTAL_TARGET_ID);
+    case "작업장 안전 점검 삭제해 줘":
+      return createMockDeleteConfirmation(SAFETY_INSPECTION_TARGET_ID);
     case "재고 일정 삭제해 줘": {
       const schedules = useScheduleStore.getState().schedules;
       const candidates = [INVENTORY_TARGET_ID, COMPLETED_INVENTORY_TARGET_ID]
@@ -174,41 +174,41 @@ function runStandaloneMockScenario(input: string): {
         { title: "반품 상품 최종 검수" },
         "일정 제목을 반품 상품 최종 검수로 변경했어요.",
       );
-    case "치과 예약을 내일로 옮겨 줘": {
+    case "작업장 안전 점검을 내일로 옮겨 줘": {
       const tomorrow = new Date();
       tomorrow.setDate(tomorrow.getDate() + 1);
       return updateMockSchedule(
-        DENTAL_TARGET_ID,
+        SAFETY_INSPECTION_TARGET_ID,
         { date: formatLocalDate(tomorrow) },
-        "치과 예약 날짜를 내일로 변경했어요.",
+        "작업장 안전 점검 날짜를 내일로 변경했어요.",
       );
     }
-    case "반품 택배 발송을 내일 오후 4시로 바꾸고 카테고리를 개인으로 변경해 줘": {
+    case "반품 택배 발송을 내일 오후 4시로 바꾸고 카테고리를 출고로 변경해 줘": {
       const tomorrow = new Date();
       tomorrow.setDate(tomorrow.getDate() + 1);
       return updateMockSchedule(
         RETURN_SHIPMENT_TARGET_ID,
-        { date: formatLocalDate(tomorrow), time: "16:00", category: "개인" },
-        "반품 택배 발송을 내일 오후 4시, 개인 카테고리로 변경했어요.",
+        { date: formatLocalDate(tomorrow), time: "16:00", category: "출고" },
+        "반품 택배 발송을 내일 오후 4시, 출고 카테고리로 변경했어요.",
       );
     }
-    case "택배 수령 카테고리를 개인으로 바꿔 줘":
+    case "입고 상품 수량 확인 카테고리를 기타로 바꿔 줘":
       return updateMockSchedule(
-        DELIVERY_TARGET_ID,
-        { category: "개인" },
-        "택배 수령 카테고리를 개인으로 변경했어요.",
+        INBOUND_QUANTITY_TARGET_ID,
+        { category: "기타" },
+        "입고 상품 수량 확인 카테고리를 기타로 변경했어요.",
       );
-    case "점장 미팅 알림 꺼 줘":
+    case "출고 상품 준비 알림 꺼 줘":
       return updateMockSchedule(
-        MANAGER_MEETING_TARGET_ID,
+        OUTBOUND_PREPARATION_TARGET_ID,
         { notificationEnabled: false },
-        "점장 미팅 알림을 껐어요.",
+        "출고 상품 준비 알림을 껐어요.",
       );
-    case "점장 미팅 알림 켜 줘":
+    case "출고 상품 준비 알림 켜 줘":
       return updateMockSchedule(
-        MANAGER_MEETING_TARGET_ID,
+        OUTBOUND_PREPARATION_TARGET_ID,
         { notificationEnabled: true },
-        "점장 미팅 알림을 켰어요.",
+        "출고 상품 준비 알림을 켰어요.",
       );
     case "B구역 재고 정리를 미완료로 바꿔 줘":
       return updateMockSchedule(
