@@ -12,7 +12,10 @@ import {
   SettingsConnectionStatus,
 } from "@/components/settings/settings-connection-status";
 import { SettingsIpCard } from "@/components/settings/settings-ip-card";
-import { SettingsSaveFooter } from "@/components/settings/settings-save-footer";
+import {
+  SettingsSaveFooter,
+  type SettingsSaveFeedback,
+} from "@/components/settings/settings-save-footer";
 import { ConfirmationModal } from "@/components/ui/confirmation-modal";
 import { ThemedView } from "@/components/ui/themed-view";
 import { Spacing } from "@/constants/theme";
@@ -23,7 +26,7 @@ import {
   reverifyMockSettingsConnection,
   syncMockSettingsTime,
 } from "@/services/mock/settings";
-import { readSavedPiIp } from "@/services/storage/settings";
+import { readSavedPiIp, writeSavedPiIp } from "@/services/storage/settings";
 
 type Verification = {
   status:
@@ -52,12 +55,6 @@ const initialVerification: Verification = {
   error: null,
 };
 
-// 저장 동작은 후속 단계에서 연결한다. 비활성 Button의 필수 prop용이다.
-const handleDisabledAction = () => {};
-
-// 저장 실행 기능을 연결할 때 제거할 임시 제한이다. canSave 판정과 분리한다.
-const isSaveImplemented = false;
-
 export function SettingsScreen() {
   const theme = useTheme();
   const colorScheme = useColorScheme();
@@ -67,9 +64,12 @@ export function SettingsScreen() {
     useState<"loading" | "ready" | "failed">("loading");
   const [verification, setVerification] =
     useState<Verification>(initialVerification);
-  const [saveStatus] = useState<"idle" | "saving">("idle");
+  const [saveStatus, setSaveStatus] = useState<"idle" | "saving">("idle");
 
   const [isSyncModalOpen, setIsSyncModalOpen] = useState(false);
+  const [saveFeedback, setSaveFeedback] = useState<SettingsSaveFeedback | null>(null);
+  const feedbackTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const activeSave = useRef<number | null>(null);
   const syncModalIp = useRef<string | null>(null);
 
   const currentInputRef = useRef(inputIp);
@@ -101,6 +101,8 @@ export function SettingsScreen() {
       requestSequence.current += 1;
       activeRequest.current = null;
       syncModalIp.current = null;
+      activeSave.current = null;
+      if (feedbackTimer.current !== null) clearTimeout(feedbackTimer.current);
     };
   }, []);
 
@@ -139,11 +141,21 @@ export function SettingsScreen() {
     !isProcessing;
   const canCheckConnection = hasIpInput && !isProcessing && !hasCurrentResult;
 
+  const clearSaveFeedback = () => {
+    if (feedbackTimer.current !== null) {
+      clearTimeout(feedbackTimer.current);
+      feedbackTimer.current = null;
+    }
+    setSaveFeedback(null);
+  };
+
   const handleIpChange = (value: string) => {
+    if (activeSave.current !== null) return;
     const previousValue = currentInputRef.current;
     currentInputRef.current = value;
     setInputIp(value);
     if (value !== previousValue) {
+      clearSaveFeedback();
       requestSequence.current += 1;
       activeRequest.current = null;
       setVerification(initialVerification);
@@ -304,6 +316,55 @@ export function SettingsScreen() {
       if (activeRequest.current === requestId) activeRequest.current = null;
     }
   };
+  // 이전 렌더의 이벤트가 IP 재수정 후 과거 검증을 저장하지 않도록 확인한다.
+  const renderedSequence = requestSequence.current;
+  const handleSave = async () => {
+    const ip = currentInputRef.current.trim();
+    if (
+      !canSave ||
+      ip !== verification.ip ||
+      renderedSequence !== requestSequence.current ||
+      activeRequest.current !== null ||
+      activeSave.current !== null
+    ) return;
+
+    const requestId = ++requestSequence.current;
+    activeRequest.current = requestId;
+    activeSave.current = requestId;
+    clearSaveFeedback();
+    setSaveStatus("saving");
+
+    const isCurrentRequest = () =>
+      activeSave.current === requestId &&
+      activeRequest.current === requestId &&
+      requestSequence.current === requestId &&
+      currentInputRef.current.trim() === ip;
+
+    try {
+      await writeSavedPiIp(ip);
+      if (!isCurrentRequest()) return;
+      setSavedIp(ip);
+      setSaveFeedback({ status: "success", message: "설정이 저장되었습니다." });
+      feedbackTimer.current = setTimeout(() => {
+        feedbackTimer.current = null;
+        setSaveFeedback(null);
+      }, 3000);
+    } catch {
+      if (isCurrentRequest()) {
+        setSaveFeedback({
+          status: "error",
+          message: "설정을 저장하지 못했습니다. 다시 저장해 주세요.",
+        });
+      }
+    } finally {
+      if (isCurrentRequest()) {
+        activeSave.current = null;
+        activeRequest.current = null;
+        setSaveStatus("idle");
+      }
+    }
+  };
+
   const screenBackground =
     colorScheme === "dark" ? theme.background : "#FCF9F7";
   const fieldBackground =
@@ -380,8 +441,10 @@ export function SettingsScreen() {
 
         <SettingsSaveFooter
           fieldBackground={fieldBackground}
-          disabled={!isSaveImplemented || !canSave}
-          onSavePress={handleDisabledAction}
+          disabled={!canSave}
+          isSaving={saveStatus === "saving"}
+          feedback={saveFeedback}
+          onSavePress={handleSave}
         />
       </KeyboardAvoidingView>
       <ConfirmationModal
