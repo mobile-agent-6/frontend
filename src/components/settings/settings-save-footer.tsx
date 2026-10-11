@@ -17,6 +17,7 @@ type SettingsSaveFooterProps = {
   isSaving: boolean;
   feedback: SettingsSaveFeedback | null;
   onSavePress: () => void;
+  onFeedbackHeightChange: (height: number) => void;
 };
 
 export function SettingsSaveFooter({
@@ -25,6 +26,7 @@ export function SettingsSaveFooter({
   isSaving,
   feedback,
   onSavePress,
+  onFeedbackHeightChange,
 }: SettingsSaveFooterProps) {
   const theme = useTheme();
   return (
@@ -33,13 +35,12 @@ export function SettingsSaveFooter({
       <View pointerEvents="none" style={styles.feedbackAnchor}>
         {feedback && (
           <View
+            onLayout={(event) => onFeedbackHeightChange(event.nativeEvent.layout.height)}
             style={[
               styles.feedback,
               {
                 backgroundColor:
                   feedback.status === "success" ? "#EAF7F1" : fieldBackground,
-                borderColor:
-                  feedback.status === "success" ? "#D1FAE5" : theme.destructive,
               },
             ]}
           >
@@ -92,7 +93,6 @@ const styles = StyleSheet.create({
     left: Spacing.four,
     right: Spacing.four,
     padding: Spacing.three,
-    borderWidth: 1,
     borderRadius: 16,
   },
   feedbackText: {

@@ -146,7 +146,7 @@ const styles = StyleSheet.create({
   textInput: {
     flex: 1,
     minWidth: 0,
-    height: 24,
+    minHeight: 24,
     paddingVertical: 0,
     fontSize: 16,
     // iOS 단일 행 placeholder는 네이티브 폰트의 줄 높이를 사용한다.

@@ -68,6 +68,7 @@ export function SettingsScreen() {
 
   const [isSyncModalOpen, setIsSyncModalOpen] = useState(false);
   const [saveFeedback, setSaveFeedback] = useState<SettingsSaveFeedback | null>(null);
+  const [feedbackHeight, setFeedbackHeight] = useState(0);
   const feedbackTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeSave = useRef<number | null>(null);
   const syncModalIp = useRef<string | null>(null);
@@ -403,8 +404,13 @@ export function SettingsScreen() {
         style={styles.keyboardAvoidingView}
       >
         <ScrollView
-          contentContainerStyle={styles.content}
-          keyboardDismissMode="interactive"
+          contentContainerStyle={[
+            styles.content,
+            saveFeedback !== null && {
+              paddingBottom: Spacing.five + feedbackHeight + Spacing.two,
+            },
+          ]}
+          keyboardDismissMode={Platform.OS === "ios" ? "interactive" : "on-drag"}
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator={false}
         >
@@ -470,6 +476,7 @@ export function SettingsScreen() {
           disabled={!canSave}
           isSaving={saveStatus === "saving"}
           feedback={saveFeedback}
+          onFeedbackHeightChange={setFeedbackHeight}
           onSavePress={handleSave}
         />
       </KeyboardAvoidingView>
