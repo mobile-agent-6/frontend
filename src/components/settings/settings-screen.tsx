@@ -17,6 +17,26 @@ import { Spacing } from "@/constants/theme";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useTheme } from "@/hooks/use-theme";
 
+type Verification = {
+  status:
+    | "unverified"
+    | "checking"
+    | "syncing"
+    | "connected"
+    | "time-sync-required"
+    | "failed";
+  ip: string | null;
+  timeDifferenceSeconds: number | null;
+  syncAdjusted: boolean | null;
+};
+
+const initialVerification: Verification = {
+  status: "unverified",
+  ip: null,
+  timeDifferenceSeconds: null,
+  syncAdjusted: null,
+};
+
 // 연결 확인과 저장 동작은 후속 단계에서 연결한다. 비활성 Button의 필수 prop용이다.
 const handleDisabledAction = () => {};
 
@@ -24,7 +44,35 @@ export function SettingsScreen() {
   const theme = useTheme();
   const colorScheme = useColorScheme();
   const [inputIp, setInputIp] = useState("");
-  const hasIpInput = inputIp.trim().length > 0;
+  // 저장값 변경과 저장 실행은 후속 단계에서 연결한다.
+  const [savedIp] = useState<string | null>(null);
+  const [verification, setVerification] =
+    useState<Verification>(initialVerification);
+  const [saveStatus] = useState<"idle" | "saving">("idle");
+
+  const normalizedIp = inputIp.trim();
+  const hasIpInput = normalizedIp.length > 0;
+  const isProcessing =
+    verification.status === "checking" ||
+    verification.status === "syncing" ||
+    saveStatus === "saving";
+  // connected는 연결 확인과 최종 시간 검증을 통과한 상태다.
+  const canSave =
+    hasIpInput &&
+    verification.ip === normalizedIp &&
+    verification.status === "connected" &&
+    verification.timeDifferenceSeconds !== null &&
+    Math.abs(verification.timeDifferenceSeconds) <= 60 &&
+    normalizedIp !== savedIp &&
+    !isProcessing;
+
+  const handleIpChange = (value: string) => {
+    setInputIp(value);
+    if (value !== inputIp) {
+      // 대상 IP·시간 차이·동기화 결과를 함께 폐기하고 저장값은 유지한다.
+      setVerification(initialVerification);
+    }
+  };
   const screenBackground =
     colorScheme === "dark" ? theme.background : "#FCF9F7";
   const fieldBackground =
@@ -81,7 +129,7 @@ export function SettingsScreen() {
                 keyboardType={
                   Platform.OS === "ios" ? "numbers-and-punctuation" : "decimal-pad"
                 }
-                onChangeText={setInputIp}
+                onChangeText={handleIpChange}
                 spellCheck={false}
                 placeholder="192.168.0.1"
                 placeholderTextColor={theme.textSecondary}
@@ -116,7 +164,7 @@ export function SettingsScreen() {
             },
           ]}
         >
-          <Button label="저장" disabled onPress={handleDisabledAction} />
+          <Button label="저장" disabled={!canSave} onPress={handleDisabledAction} />
         </SafeAreaView>
       </KeyboardAvoidingView>
     </ThemedView>
