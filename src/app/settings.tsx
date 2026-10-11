@@ -1,5 +1,5 @@
-import { ScreenPlaceholder } from "@/components/ui/screen-placeholder";
+import { SettingsScreen } from "@/components/settings/settings-screen";
 
-export default function SettingsScreen() {
-  return <ScreenPlaceholder title="설정" />;
+export default function SettingsRoute() {
+  return <SettingsScreen />;
 }
