@@ -23,6 +23,7 @@ import {
   reverifyMockSettingsConnection,
   syncMockSettingsTime,
 } from "@/services/mock/settings";
+import { readSavedPiIp } from "@/services/storage/settings";
 
 type Verification = {
   status:
@@ -61,8 +62,9 @@ export function SettingsScreen() {
   const theme = useTheme();
   const colorScheme = useColorScheme();
   const [inputIp, setInputIp] = useState("");
-  // 저장값 변경과 저장 실행은 후속 단계에서 연결한다.
-  const [savedIp] = useState<string | null>(null);
+  const [savedIp, setSavedIp] = useState<string | null>(null);
+  const [restoreStatus, setRestoreStatus] =
+    useState<"loading" | "ready" | "failed">("loading");
   const [verification, setVerification] =
     useState<Verification>(initialVerification);
   const [saveStatus] = useState<"idle" | "saving">("idle");
@@ -75,7 +77,27 @@ export function SettingsScreen() {
   const activeRequest = useRef<number | null>(null);
 
   useEffect(() => {
+    let cancelled = false;
+    const initialSequence = requestSequence.current;
+
+    readSavedPiIp()
+      .then((ip) => {
+        if (cancelled) return;
+        setSavedIp(ip);
+        // 늦게 전달된 입력 이벤트가 있다면 입력·검증 상태를 덮어쓰지 않는다.
+        if (requestSequence.current === initialSequence) {
+          currentInputRef.current = ip ?? "";
+          setInputIp(ip ?? "");
+          setVerification(initialVerification);
+        }
+        setRestoreStatus("ready");
+      })
+      .catch(() => {
+        if (!cancelled) setRestoreStatus("failed");
+      });
+
     return () => {
+      cancelled = true;
       requestSequence.current += 1;
       activeRequest.current = null;
       syncModalIp.current = null;
@@ -87,6 +109,7 @@ export function SettingsScreen() {
   const isSyncProcessing =
     verification.status === "syncing" || verification.status === "rechecking";
   const isProcessing =
+    restoreStatus === "loading" ||
     verification.status === "checking" ||
     isSyncProcessing ||
     isSyncModalOpen ||
@@ -318,13 +341,20 @@ export function SettingsScreen() {
               <SettingsConnectionFeedback
                 isChecking={verification.status === "checking"}
                 processingMessage={
-                  verification.status === "syncing"
-                    ? "Pi 시간을 맞추고 있습니다."
-                    : verification.status === "rechecking"
-                      ? "연결과 시간을 다시 확인하고 있습니다."
-                      : null
+                  restoreStatus === "loading"
+                    ? "저장된 Pi IP를 불러오고 있습니다."
+                    : verification.status === "syncing"
+                      ? "Pi 시간을 맞추고 있습니다."
+                      : verification.status === "rechecking"
+                        ? "연결과 시간을 다시 확인하고 있습니다."
+                        : null
                 }
-                error={verification.error}
+                error={
+                  verification.error ??
+                  (restoreStatus === "failed"
+                    ? "저장된 Pi IP를 불러오지 못했습니다. 주소를 직접 입력해 연결을 확인하세요."
+                    : null)
+                }
               />
             }
           />
