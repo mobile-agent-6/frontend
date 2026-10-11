@@ -1,17 +1,18 @@
-import { SymbolView } from "expo-symbols";
 import { useEffect, useRef, useState } from "react";
 import {
   KeyboardAvoidingView,
   Platform,
   ScrollView,
   StyleSheet,
-  TextInput,
-  View,
 } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
 
-import { Button } from "@/components/ui/button";
-import { ThemedText } from "@/components/ui/themed-text";
+import {
+  SettingsConnectionBadge,
+  SettingsConnectionFeedback,
+  SettingsConnectionStatus,
+} from "@/components/settings/settings-connection-status";
+import { SettingsIpCard } from "@/components/settings/settings-ip-card";
+import { SettingsSaveFooter } from "@/components/settings/settings-save-footer";
 import { ThemedView } from "@/components/ui/themed-view";
 import { Spacing } from "@/constants/theme";
 import { useColorScheme } from "@/hooks/use-color-scheme";
@@ -46,12 +47,6 @@ const initialVerification: Verification = {
 
 // 시간 맞추기와 저장 동작은 후속 단계에서 연결한다. 비활성 Button의 필수 prop용이다.
 const handleDisabledAction = () => {};
-
-function formatMockTime(timestamp: number) {
-  const date = new Date(timestamp);
-  const pad = (value: number) => String(value).padStart(2, "0");
-  return `${date.getFullYear()}.${pad(date.getMonth() + 1)}.${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
-}
 
 // 저장 실행 기능을 연결할 때 제거할 임시 제한이다. canSave 판정과 분리한다.
 const isSaveImplemented = false;
@@ -179,196 +174,48 @@ export function SettingsScreen() {
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator={false}
         >
-          <View style={styles.addressSection}>
-            <View style={styles.labelRow}>
-              <ThemedText style={styles.label}>서버 주소 (Pi IP)</ThemedText>
-              {hasCurrentResult && (
-                <View
-                  accessibilityLiveRegion="polite"
-                  style={[
-                    styles.badge,
-                    { backgroundColor: isTimeMismatch ? "#FEF3C7" : "#D1FAE5" },
-                  ]}
-                >
-                  <View
-                    style={[
-                      styles.badgeDot,
-                      { backgroundColor: isTimeMismatch ? "#F59E0B" : "#10B981" },
-                    ]}
-                  />
-                  <ThemedText
-                    style={[
-                      styles.badgeText,
-                      { color: isTimeMismatch ? "#B45309" : "#047857" },
-                    ]}
-                  >
-                    {isTimeMismatch ? "시간 동기화 필요" : "연결됨"}
-                  </ThemedText>
-                </View>
-              )}
-            </View>
-
-            <View
-              style={[
-                styles.addressField,
-                { backgroundColor: fieldBackground },
-              ]}
-            >
-              <View
-                accessible={false}
-                accessibilityElementsHidden
-                importantForAccessibility="no-hide-descendants"
-              >
-                <SymbolView
-                  name={{ ios: "server.rack", android: "dns", web: "dns" }}
-                  size={24}
-                  tintColor={theme.primary}
-                  fallback={
-                    <ThemedText style={{ color: theme.primary }}>▤</ThemedText>
-                  }
-                />
-              </View>
-              <TextInput
-                accessibilityLabel="서버 주소 (Pi IP)"
-                accessibilityHint={
-                  hasCurrentResult
-                    ? isTimeMismatch
-                      ? "시간 동기화가 필요한 주소입니다."
-                      : "연결 확인을 완료한 주소입니다."
-                    : hasIpInput
-                      ? "아직 연결을 확인하지 않은 주소입니다."
-                      : "Pi IP를 입력하세요."
-                }
-                editable={!isProcessing}
-                accessibilityState={{ disabled: isProcessing }}
-                autoCapitalize="none"
-                autoComplete="off"
-                autoCorrect={false}
-                keyboardType={
-                  Platform.OS === "ios" ? "numbers-and-punctuation" : "decimal-pad"
-                }
-                onChangeText={handleIpChange}
-                spellCheck={false}
-                placeholder="192.168.0.1"
-                placeholderTextColor={theme.textSecondary}
-                style={[styles.textInput, { color: theme.text }]}
-                value={inputIp}
+          <SettingsIpCard
+            inputIp={inputIp}
+            hasIpInput={hasIpInput}
+            hasCurrentResult={hasCurrentResult}
+            isTimeMismatch={isTimeMismatch}
+            isProcessing={isProcessing}
+            isChecking={verification.status === "checking"}
+            canCheckConnection={canCheckConnection}
+            fieldBackground={fieldBackground}
+            onIpChange={handleIpChange}
+            onCheckConnection={handleCheckConnection}
+            connectionBadge={
+              hasCurrentResult && (
+                <SettingsConnectionBadge isTimeMismatch={isTimeMismatch} />
+              )
+            }
+            connectionFeedback={
+              <SettingsConnectionFeedback
+                isChecking={verification.status === "checking"}
+                error={verification.status === "failed" ? verification.error : null}
               />
-            </View>
-
-            {!hasCurrentResult && (
-              <Button
-                label={
-                  verification.status === "checking"
-                    ? "연결 확인 중…"
-                    : "연결 확인"
-                }
-                disabled={!canCheckConnection}
-                onPress={handleCheckConnection}
-              />
-            )}
-            {verification.status === "checking" && (
-              <ThemedText
-                type="small"
-                themeColor="textSecondary"
-                accessibilityLiveRegion="polite"
-              >
-                Pi 연결을 확인하고 있습니다.
-              </ThemedText>
-            )}
-            {verification.status === "failed" && (
-              <ThemedText
-                type="small"
-                themeColor="destructive"
-                accessibilityRole="alert"
-              >
-                {verification.error}
-              </ThemedText>
-            )}
-
-            <ThemedText
-              type="small"
-              themeColor="textSecondary"
-              style={styles.description}
-            >
-              Orange Pi 핫스팟에 연결한 뒤 Pi IP를 입력하세요
-            </ThemedText>
-          </View>
+            }
+          />
 
           {hasCurrentResult &&
             verification.piTime !== null &&
             verification.phoneTime !== null && (
-            <View style={styles.timeSection}>
-              <View style={styles.timeHeading}>
-                <SymbolView
-                  name={{ ios: "clock", android: "schedule", web: "schedule" }}
-                  size={20}
-                  tintColor={theme.primary}
-                />
-                <ThemedText style={styles.label}>Pi 시각 확인</ThemedText>
-              </View>
-              <View
-                style={[styles.timeCard, { backgroundColor: fieldBackground }]}
-              >
-                <View
-                  style={[
-                    styles.timeRow,
-                    {
-                      borderBottomWidth: StyleSheet.hairlineWidth,
-                      borderBottomColor: theme.backgroundElement,
-                    },
-                  ]}
-                >
-                  <ThemedText type="small" themeColor="textSecondary">
-                    Pi 시간
-                  </ThemedText>
-                  <ThemedText style={styles.timeValue}>
-                    {formatMockTime(verification.piTime)}
-                  </ThemedText>
-                </View>
-                <View style={styles.timeRow}>
-                  <ThemedText type="small" themeColor="textSecondary">
-                    휴대폰 시간
-                  </ThemedText>
-                  <ThemedText style={styles.timeValue}>
-                    {formatMockTime(verification.phoneTime)}
-                  </ThemedText>
-                </View>
-              </View>
-              {isTimeMismatch && (
-                <View
-                  style={[styles.syncNotice, { backgroundColor: theme.primaryMuted }]}
-                >
-                  <ThemedText type="small" style={{ color: theme.primary }}>
-                    Pi와 휴대폰 시간이 일치하지 않습니다.
-                  </ThemedText>
-                  <Button
-                    label="Pi 시간 맞추기"
-                    disabled
-                    onPress={handleDisabledAction}
-                  />
-                </View>
-              )}
-            </View>
-          )}
+              <SettingsConnectionStatus
+                piTime={verification.piTime}
+                phoneTime={verification.phoneTime}
+                isTimeMismatch={isTimeMismatch}
+                fieldBackground={fieldBackground}
+                onSyncPress={handleDisabledAction}
+              />
+            )}
         </ScrollView>
 
-        <SafeAreaView
-          edges={["bottom"]}
-          style={[
-            styles.footer,
-            {
-              backgroundColor: fieldBackground,
-              borderTopColor: theme.backgroundElement,
-            },
-          ]}
-        >
-          <Button
-            label="저장"
-            disabled={!isSaveImplemented || !canSave}
-            onPress={handleDisabledAction}
-          />
-        </SafeAreaView>
+        <SettingsSaveFooter
+          fieldBackground={fieldBackground}
+          disabled={!isSaveImplemented || !canSave}
+          onSavePress={handleDisabledAction}
+        />
       </KeyboardAvoidingView>
     </ThemedView>
   );
@@ -386,106 +233,5 @@ const styles = StyleSheet.create({
     paddingHorizontal: Spacing.four,
     paddingTop: Spacing.four,
     paddingBottom: Spacing.five,
-  },
-  addressSection: {
-    gap: Spacing.two,
-  },
-  labelRow: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: Spacing.two,
-    marginBottom: Spacing.one,
-  },
-  label: {
-    fontSize: 16,
-    lineHeight: 24,
-    fontWeight: "700",
-    flexShrink: 1,
-  },
-  addressField: {
-    minHeight: 56,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: Spacing.three,
-    borderRadius: 16,
-    paddingHorizontal: Spacing.three,
-    paddingVertical: Spacing.two,
-  },
-  textInput: {
-    flex: 1,
-    minWidth: 0,
-    height: 24,
-    paddingVertical: 0,
-    fontSize: 16,
-    // iOS 단일 행 placeholder는 네이티브 폰트의 줄 높이를 사용한다.
-    lineHeight: Platform.OS === "android" ? 24 : undefined,
-    fontWeight: "500",
-    includeFontPadding: false,
-    textAlignVertical: "center",
-  },
-  description: {
-    marginTop: Spacing.one,
-  },
-  badge: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: Spacing.one,
-    borderRadius: 999,
-    paddingHorizontal: 10,
-    paddingVertical: Spacing.one,
-    flexShrink: 1,
-  },
-  badgeDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-  },
-  badgeText: {
-    fontSize: 12,
-    lineHeight: 18,
-    fontWeight: "500",
-    flexShrink: 1,
-  },
-  timeSection: {
-    marginTop: Spacing.five,
-    gap: Spacing.three,
-  },
-  timeHeading: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: Spacing.two,
-  },
-  timeCard: {
-    borderRadius: 16,
-    overflow: "hidden",
-  },
-  timeRow: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    justifyContent: "space-between",
-    alignItems: "center",
-    gap: Spacing.two,
-    paddingHorizontal: Spacing.three,
-    paddingVertical: 14,
-  },
-  timeValue: {
-    fontSize: 14,
-    lineHeight: 20,
-    fontWeight: "600",
-    fontVariant: ["tabular-nums"],
-  },
-  syncNotice: {
-    borderRadius: 16,
-    padding: Spacing.three,
-    gap: Spacing.three,
-  },
-  footer: {
-    flexShrink: 0,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    paddingHorizontal: Spacing.four,
-    paddingTop: Spacing.three,
-    paddingBottom: Spacing.two,
   },
 });
