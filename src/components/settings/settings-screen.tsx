@@ -13,17 +13,23 @@ import {
 } from "@/components/settings/settings-connection-status";
 import { SettingsIpCard } from "@/components/settings/settings-ip-card";
 import { SettingsSaveFooter } from "@/components/settings/settings-save-footer";
+import { ConfirmationModal } from "@/components/ui/confirmation-modal";
 import { ThemedView } from "@/components/ui/themed-view";
 import { Spacing } from "@/constants/theme";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useTheme } from "@/hooks/use-theme";
-import { checkMockSettingsConnection } from "@/services/mock/settings";
+import {
+  checkMockSettingsConnection,
+  reverifyMockSettingsConnection,
+  syncMockSettingsTime,
+} from "@/services/mock/settings";
 
 type Verification = {
   status:
     | "unverified"
     | "checking"
     | "syncing"
+    | "rechecking"
     | "connected"
     | "time-sync-required"
     | "failed";
@@ -45,7 +51,7 @@ const initialVerification: Verification = {
   error: null,
 };
 
-// 시간 맞추기와 저장 동작은 후속 단계에서 연결한다. 비활성 Button의 필수 prop용이다.
+// 저장 동작은 후속 단계에서 연결한다. 비활성 Button의 필수 prop용이다.
 const handleDisabledAction = () => {};
 
 // 저장 실행 기능을 연결할 때 제거할 임시 제한이다. canSave 판정과 분리한다.
@@ -61,6 +67,9 @@ export function SettingsScreen() {
     useState<Verification>(initialVerification);
   const [saveStatus] = useState<"idle" | "saving">("idle");
 
+  const [isSyncModalOpen, setIsSyncModalOpen] = useState(false);
+  const syncModalIp = useRef<string | null>(null);
+
   const currentInputRef = useRef(inputIp);
   const requestSequence = useRef(0);
   const activeRequest = useRef<number | null>(null);
@@ -69,14 +78,18 @@ export function SettingsScreen() {
     return () => {
       requestSequence.current += 1;
       activeRequest.current = null;
+      syncModalIp.current = null;
     };
   }, []);
 
   const normalizedIp = inputIp.trim();
   const hasIpInput = normalizedIp.length > 0;
+  const isSyncProcessing =
+    verification.status === "syncing" || verification.status === "rechecking";
   const isProcessing =
     verification.status === "checking" ||
-    verification.status === "syncing" ||
+    isSyncProcessing ||
+    isSyncModalOpen ||
     saveStatus === "saving";
   // connected는 연결 확인과 최종 시간 검증을 통과한 상태다.
   const canSave =
@@ -91,9 +104,16 @@ export function SettingsScreen() {
   const hasCurrentResult =
     verification.ip === normalizedIp &&
     (verification.status === "connected" ||
-      verification.status === "time-sync-required");
+      verification.status === "time-sync-required" ||
+      isSyncProcessing);
   const isTimeMismatch =
-    hasCurrentResult && verification.status === "time-sync-required";
+    hasCurrentResult &&
+    (verification.status === "time-sync-required" || isSyncProcessing);
+  const canSync =
+    verification.status === "time-sync-required" &&
+    verification.ip === normalizedIp &&
+    hasIpInput &&
+    !isProcessing;
   const canCheckConnection = hasIpInput && !isProcessing && !hasCurrentResult;
 
   const handleIpChange = (value: string) => {
@@ -104,6 +124,8 @@ export function SettingsScreen() {
       requestSequence.current += 1;
       activeRequest.current = null;
       setVerification(initialVerification);
+      syncModalIp.current = null;
+      setIsSyncModalOpen(false);
     }
   };
 
@@ -157,6 +179,108 @@ export function SettingsScreen() {
       if (activeRequest.current === requestId) activeRequest.current = null;
     }
   };
+
+  const handleOpenSyncModal = () => {
+    if (
+      !canSync ||
+      activeRequest.current !== null ||
+      syncModalIp.current !== null
+    ) return;
+    syncModalIp.current = currentInputRef.current.trim();
+    setIsSyncModalOpen(true);
+  };
+
+  const handleCancelSync = () => {
+    syncModalIp.current = null;
+    setIsSyncModalOpen(false);
+  };
+
+  const handleConfirmSync = async () => {
+    const ip = syncModalIp.current;
+    if (
+      !ip ||
+      ip !== currentInputRef.current.trim() ||
+      verification.status !== "time-sync-required" ||
+      verification.ip !== ip ||
+      activeRequest.current !== null
+    ) return;
+
+    // 동의는 한 번만 소비하고 확인 시점의 최신 휴대폰 시각을 읽는다.
+    syncModalIp.current = null;
+    setIsSyncModalOpen(false);
+    const currentTime = Date.now();
+    const requestId = ++requestSequence.current;
+    activeRequest.current = requestId;
+    const previousVerification = verification;
+    setVerification({
+      ...verification,
+      status: "syncing",
+      syncAdjusted: null,
+      error: null,
+    });
+
+    const isCurrentRequest = () =>
+      activeRequest.current === requestId &&
+      requestSequence.current === requestId &&
+      currentInputRef.current.trim() === ip;
+    let adjusted: boolean | null = null;
+    try {
+      const syncResult = await syncMockSettingsTime(ip, currentTime);
+      if (!isCurrentRequest() || syncResult.ip !== ip) return;
+      if (syncResult.outcome === "failed") {
+        setVerification({
+          ...previousVerification,
+          syncAdjusted: null,
+          error: syncResult.message,
+        });
+        return;
+      }
+      adjusted = syncResult.adjusted;
+      setVerification({
+        ...previousVerification,
+        status: "rechecking",
+        syncAdjusted: adjusted,
+        error: null,
+      });
+      const result = await reverifyMockSettingsConnection(syncResult);
+      if (!isCurrentRequest() || result.ip !== ip) return;
+      if (result.outcome === "failed") {
+        setVerification({
+          ...initialVerification,
+          status: "failed",
+          ip,
+          syncAdjusted: adjusted,
+          error: result.message,
+        });
+        return;
+      }
+      const isWithinThreshold = Math.abs(result.timeDifferenceSeconds) <= 60;
+      setVerification({
+        ...initialVerification,
+        status: isWithinThreshold ? "connected" : "time-sync-required",
+        ip,
+        syncAdjusted: adjusted,
+        piTime: result.piTime,
+        phoneTime: result.phoneTime,
+        timeDifferenceSeconds: result.timeDifferenceSeconds,
+        error: isWithinThreshold
+          ? null
+          : "재검증 후에도 시간 차이가 60초를 초과합니다.",
+      });
+    } catch {
+      if (isCurrentRequest()) {
+        setVerification({
+          ...initialVerification,
+          status: "failed",
+          ip,
+          syncAdjusted: adjusted,
+          error: "시간 맞추기 또는 재검증에 실패했습니다. 다시 연결 확인을 해주세요.",
+        });
+      }
+    } finally {
+      if (activeRequest.current === requestId) activeRequest.current = null;
+    }
+  };
   const screenBackground =
     colorScheme === "dark" ? theme.background : "#FCF9F7";
   const fieldBackground =
@@ -193,7 +317,14 @@ export function SettingsScreen() {
             connectionFeedback={
               <SettingsConnectionFeedback
                 isChecking={verification.status === "checking"}
-                error={verification.status === "failed" ? verification.error : null}
+                processingMessage={
+                  verification.status === "syncing"
+                    ? "Pi 시간을 맞추고 있습니다."
+                    : verification.status === "rechecking"
+                      ? "연결과 시간을 다시 확인하고 있습니다."
+                      : null
+                }
+                error={verification.error}
               />
             }
           />
@@ -206,7 +337,13 @@ export function SettingsScreen() {
                 phoneTime={verification.phoneTime}
                 isTimeMismatch={isTimeMismatch}
                 fieldBackground={fieldBackground}
-                onSyncPress={handleDisabledAction}
+                canSync={canSync}
+                syncAdjusted={
+                  verification.status === "connected"
+                    ? verification.syncAdjusted
+                    : null
+                }
+                onSyncPress={handleOpenSyncModal}
               />
             )}
         </ScrollView>
@@ -217,6 +354,14 @@ export function SettingsScreen() {
           onSavePress={handleDisabledAction}
         />
       </KeyboardAvoidingView>
+      <ConfirmationModal
+        visible={isSyncModalOpen}
+        message="Pi 시간을 휴대폰 시간으로 맞출까요?"
+        cancelLabel="취소"
+        confirmLabel="시간 맞추기"
+        onCancel={handleCancelSync}
+        onConfirm={handleConfirmSync}
+      />
     </ThemedView>
   );
 }

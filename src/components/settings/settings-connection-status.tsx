@@ -41,22 +41,24 @@ export function SettingsConnectionBadge({
 
 type SettingsConnectionFeedbackProps = {
   isChecking: boolean;
+  processingMessage: string | null;
   error: string | null;
 };
 
 export function SettingsConnectionFeedback({
   isChecking,
+  processingMessage,
   error,
 }: SettingsConnectionFeedbackProps) {
   return (
     <>
-      {isChecking && (
+      {(isChecking || processingMessage !== null) && (
         <ThemedText
           type="small"
           themeColor="textSecondary"
           accessibilityLiveRegion="polite"
         >
-          Pi 연결을 확인하고 있습니다.
+          {processingMessage ?? "Pi 연결을 확인하고 있습니다."}
         </ThemedText>
       )}
       {error !== null && (
@@ -77,6 +79,8 @@ type SettingsConnectionStatusProps = {
   phoneTime: number;
   isTimeMismatch: boolean;
   fieldBackground: string;
+  canSync: boolean;
+  syncAdjusted: boolean | null;
   onSyncPress: () => void;
 };
 
@@ -92,6 +96,8 @@ export function SettingsConnectionStatus({
   phoneTime,
   isTimeMismatch,
   fieldBackground,
+  canSync,
+  syncAdjusted,
   onSyncPress,
 }: SettingsConnectionStatusProps) {
   const theme = useTheme();
@@ -142,9 +148,23 @@ export function SettingsConnectionStatus({
           </ThemedText>
           <Button
             label="Pi 시간 맞추기"
-            disabled
+            disabled={!canSync}
             onPress={onSyncPress}
           />
+        </View>
+      )}
+      {!isTimeMismatch && syncAdjusted !== null && (
+        <View style={[styles.syncSuccess, { backgroundColor: "#ECFDF5" }]}>
+          <SymbolView
+            name={{ ios: "checkmark", android: "check", web: "check" }}
+            size={16}
+            tintColor="#047857"
+          />
+          <ThemedText type="small" style={styles.syncSuccessText}>
+            {syncAdjusted
+              ? "Pi 시간이 동기화되었습니다."
+              : "시각 변경 없이 시간 검증을 통과했습니다."}
+          </ThemedText>
         </View>
       )}
     </View>
@@ -205,6 +225,18 @@ const styles = StyleSheet.create({
     lineHeight: 20,
     fontWeight: "600",
     fontVariant: ["tabular-nums"],
+  },
+  syncSuccess: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: Spacing.two,
+    borderRadius: 16,
+    paddingHorizontal: Spacing.three,
+    paddingVertical: 14,
+  },
+  syncSuccessText: {
+    color: "#047857",
+    flexShrink: 1,
   },
   syncNotice: {
     borderRadius: 16,
