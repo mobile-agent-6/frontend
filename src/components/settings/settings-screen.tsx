@@ -1,4 +1,5 @@
 import { SymbolView } from "expo-symbols";
+import { useState } from "react";
 import {
   KeyboardAvoidingView,
   Platform,
@@ -16,12 +17,14 @@ import { Spacing } from "@/constants/theme";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useTheme } from "@/hooks/use-theme";
 
-// Step 1은 정적인 레이아웃만 제공한다. 비활성 Button의 필수 prop용이다.
+// 연결 확인과 저장 동작은 후속 단계에서 연결한다. 비활성 Button의 필수 prop용이다.
 const handleDisabledAction = () => {};
 
 export function SettingsScreen() {
   const theme = useTheme();
   const colorScheme = useColorScheme();
+  const [inputIp, setInputIp] = useState("");
+  const hasIpInput = inputIp.trim().length > 0;
   const screenBackground =
     colorScheme === "dark" ? theme.background : "#FCF9F7";
   const fieldBackground =
@@ -67,13 +70,23 @@ export function SettingsScreen() {
               </View>
               <TextInput
                 accessibilityLabel="서버 주소 (Pi IP)"
-                accessibilityState={{ disabled: true }}
-                editable={false}
-                caretHidden
+                accessibilityHint={
+                  hasIpInput
+                    ? "아직 연결을 확인하지 않은 주소입니다."
+                    : "Pi IP를 입력하세요."
+                }
+                autoCapitalize="none"
+                autoComplete="off"
+                autoCorrect={false}
+                keyboardType={
+                  Platform.OS === "ios" ? "numbers-and-punctuation" : "decimal-pad"
+                }
+                onChangeText={setInputIp}
+                spellCheck={false}
                 placeholder="192.168.0.1"
                 placeholderTextColor={theme.textSecondary}
                 style={[styles.textInput, { color: theme.text }]}
-                value=""
+                value={inputIp}
               />
             </View>
 
