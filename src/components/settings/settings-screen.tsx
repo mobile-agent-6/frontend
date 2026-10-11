@@ -149,6 +149,8 @@ export function SettingsScreen() {
     setSaveFeedback(null);
   };
 
+  const renderedSequence = requestSequence.current;
+
   const handleIpChange = (value: string) => {
     if (activeSave.current !== null) return;
     const previousValue = currentInputRef.current;
@@ -165,7 +167,12 @@ export function SettingsScreen() {
   };
 
   const handleCheckConnection = async () => {
-    if (!canCheckConnection || activeRequest.current !== null) return;
+    if (
+      !canCheckConnection ||
+      renderedSequence !== requestSequence.current ||
+      activeRequest.current !== null ||
+      syncModalIp.current !== null
+    ) return;
 
     const ip = currentInputRef.current.trim();
     if (!ip) return;
@@ -218,14 +225,19 @@ export function SettingsScreen() {
   const handleOpenSyncModal = () => {
     if (
       !canSync ||
+      renderedSequence !== requestSequence.current ||
+      verification.ip !== currentInputRef.current.trim() ||
       activeRequest.current !== null ||
       syncModalIp.current !== null
     ) return;
+    requestSequence.current += 1;
     syncModalIp.current = currentInputRef.current.trim();
     setIsSyncModalOpen(true);
   };
 
   const handleCancelSync = () => {
+    if (renderedSequence !== requestSequence.current) return;
+    requestSequence.current += 1;
     syncModalIp.current = null;
     setIsSyncModalOpen(false);
   };
@@ -234,6 +246,7 @@ export function SettingsScreen() {
     const ip = syncModalIp.current;
     if (
       !ip ||
+      renderedSequence !== requestSequence.current ||
       ip !== currentInputRef.current.trim() ||
       verification.status !== "time-sync-required" ||
       verification.ip !== ip ||
@@ -305,11 +318,13 @@ export function SettingsScreen() {
     } catch {
       if (isCurrentRequest()) {
         setVerification({
-          ...initialVerification,
-          status: "failed",
+          ...(adjusted === null ? previousVerification : initialVerification),
+          status: adjusted === null ? "time-sync-required" : "failed",
           ip,
           syncAdjusted: adjusted,
-          error: "시간 맞추기 또는 재검증에 실패했습니다. 다시 연결 확인을 해주세요.",
+          error: adjusted === null
+            ? "Pi 시간 맞추기에 실패했습니다. 다시 시도하세요."
+            : "재검증에 실패했습니다. 다시 연결 확인을 해주세요.",
         });
       }
     } finally {
@@ -317,7 +332,6 @@ export function SettingsScreen() {
     }
   };
   // 이전 렌더의 이벤트가 IP 재수정 후 과거 검증을 저장하지 않도록 확인한다.
-  const renderedSequence = requestSequence.current;
   const handleSave = async () => {
     const ip = currentInputRef.current.trim();
     if (
@@ -340,7 +354,17 @@ export function SettingsScreen() {
       requestSequence.current === requestId &&
       currentInputRef.current.trim() === ip;
 
+    let isReadingSavedIp = restoreStatus === "failed";
     try {
+      // 복원 실패는 저장값 없음과 다르므로, 기존 값을 확인하기 전에는 쓰지 않는다.
+      if (isReadingSavedIp) {
+        const previousIp = await readSavedPiIp();
+        if (!isCurrentRequest()) return;
+        setSavedIp(previousIp);
+        setRestoreStatus("ready");
+        isReadingSavedIp = false;
+        if (previousIp === ip) return;
+      }
       await writeSavedPiIp(ip);
       if (!isCurrentRequest()) return;
       setSavedIp(ip);
@@ -353,7 +377,9 @@ export function SettingsScreen() {
       if (isCurrentRequest()) {
         setSaveFeedback({
           status: "error",
-          message: "설정을 저장하지 못했습니다. 다시 저장해 주세요.",
+          message: isReadingSavedIp
+            ? "기존 저장 IP를 확인하지 못해 저장하지 않았습니다. 다시 저장해 주세요."
+            : "설정을 저장하지 못했습니다. 다시 저장해 주세요.",
         });
       }
     } finally {
@@ -413,7 +439,7 @@ export function SettingsScreen() {
                 error={
                   verification.error ??
                   (restoreStatus === "failed"
-                    ? "저장된 Pi IP를 불러오지 못했습니다. 주소를 직접 입력해 연결을 확인하세요."
+                    ? "저장된 Pi IP를 불러오지 못했습니다. 주소를 직접 입력해 연결을 확인하세요. 저장 시 기존 IP를 다시 확인합니다."
                     : null)
                 }
               />
