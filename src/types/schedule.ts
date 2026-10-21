@@ -34,12 +34,6 @@ export type Schedule = {
 
   category: ScheduleCategory;
   completed: boolean;
-
-  /**
-   * 일정 10분 전 로컬 알림 사용 여부다.
-   * API 경계에서는 reminderMinutesBefore의 10 또는 null로 변환한다.
-   */
-  notificationEnabled: boolean;
 };
 
 export type ScheduleDto = {
@@ -48,8 +42,6 @@ export type ScheduleDto = {
   scheduledAt: string;
   category: ScheduleApiCategory;
   completed: boolean;
-  reminderMinutesBefore: 10 | null;
-  reminderAt: string | null;
   createdAt: string;
   updatedAt: string;
 };

@@ -1,4 +1,4 @@
-import { Pressable, StyleSheet, TextInput, View } from "react-native";
+import { Pressable, StyleSheet, Text, View } from "react-native";
 
 import { AssistantScheduleCard } from "@/components/assistant/assistant-schedule-card";
 import { ThemedText } from "@/components/ui/themed-text";
@@ -30,15 +30,12 @@ export function AssistantMessage({
   const confirmationDisabled = interaction?.resolved || !onDeleteConfirmation;
   return (
     <ThemedView type="primary" style={styles.bubble}>
-      <TextInput
-        readOnly
-        multiline
-        value={text}
-        scrollEnabled={false}
-        showSoftInputOnFocus={false}
-        underlineColorAndroid="transparent"
+      <Text
+        selectable
         style={[styles.messageText, { color: theme.primaryForeground }]}
-      />
+      >
+        {text}
+      </Text>
       {schedules?.map((schedule) => (
         <AssistantScheduleCard key={schedule.id} schedule={schedule} />
       ))}
@@ -123,7 +120,6 @@ const styles = StyleSheet.create({
     padding: 0,
     borderWidth: 0,
     backgroundColor: "transparent",
-    textAlignVertical: "top",
   },
   candidates: {
     alignSelf: "stretch",

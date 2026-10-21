@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useImperativeHandle, useRef, type Ref } from "react";
-import { FlatList, Keyboard, StyleSheet, TextInput, View } from "react-native";
+import { FlatList, Keyboard, StyleSheet, Text, View } from "react-native";
 
 import { AssistantMessage } from "@/components/assistant/assistant-message";
 import { ThemedText } from "@/components/ui/themed-text";
@@ -222,15 +222,12 @@ function UserMessage({ text }: { text: string }) {
   const theme = useTheme();
   return (
     <ThemedView type="backgroundElement" style={styles.userBubble}>
-      <TextInput
-        readOnly
-        multiline
-        value={text}
-        scrollEnabled={false}
-        showSoftInputOnFocus={false}
-        underlineColorAndroid="transparent"
+      <Text
+        selectable
         style={[styles.messageText, { color: theme.text }]}
-      />
+      >
+        {text}
+      </Text>
     </ThemedView>
   );
 }
@@ -247,7 +244,6 @@ const styles = StyleSheet.create({
     padding: 0,
     borderWidth: 0,
     backgroundColor: "transparent",
-    textAlignVertical: "top",
   },
   list: {
     flex: 1,

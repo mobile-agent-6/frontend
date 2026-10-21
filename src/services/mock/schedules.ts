@@ -8,7 +8,6 @@ export const MOCK_SCHEDULES: Schedule[] = [
     time: "09:00",
     category: "재고",
     completed: false,
-    notificationEnabled: true,
   },
   {
     id: "10000000-0000-4000-8000-000000000002",
@@ -17,7 +16,6 @@ export const MOCK_SCHEDULES: Schedule[] = [
     time: "10:30",
     category: "기타",
     completed: false,
-    notificationEnabled: true,
   },
   {
     id: "10000000-0000-4000-8000-000000000003",
@@ -26,7 +24,6 @@ export const MOCK_SCHEDULES: Schedule[] = [
     time: "13:00",
     category: "반품",
     completed: false,
-    notificationEnabled: false,
   },
   {
     id: "10000000-0000-4000-8000-000000000004",
@@ -35,7 +32,6 @@ export const MOCK_SCHEDULES: Schedule[] = [
     time: "14:30",
     category: "재고",
     completed: true,
-    notificationEnabled: false,
   },
   {
     id: "10000000-0000-4000-8000-000000000005",
@@ -44,7 +40,6 @@ export const MOCK_SCHEDULES: Schedule[] = [
     time: "16:00",
     category: "기타",
     completed: false,
-    notificationEnabled: true,
   },
   {
     id: "10000000-0000-4000-8000-000000000006",
@@ -53,7 +48,6 @@ export const MOCK_SCHEDULES: Schedule[] = [
     time: "17:00",
     category: "반품",
     completed: true,
-    notificationEnabled: false,
   },
   {
     id: "10000000-0000-4000-8000-000000000007",
@@ -62,7 +56,6 @@ export const MOCK_SCHEDULES: Schedule[] = [
     time: "18:00",
     category: "출고",
     completed: false,
-    notificationEnabled: true,
   },
   {
     id: "10000000-0000-4000-8000-000000000008",
@@ -71,7 +64,6 @@ export const MOCK_SCHEDULES: Schedule[] = [
     time: "19:00",
     category: "입고",
     completed: false,
-    notificationEnabled: false,
   },
   {
     id: "10000000-0000-4000-8000-000000000009",
@@ -80,7 +72,6 @@ export const MOCK_SCHEDULES: Schedule[] = [
     time: "11:00",
     category: "입고",
     completed: false,
-    notificationEnabled: true,
   },
   {
     id: "10000000-0000-4000-8000-000000000010",
@@ -89,6 +80,5 @@ export const MOCK_SCHEDULES: Schedule[] = [
     time: "18:30",
     category: "출고",
     completed: false,
-    notificationEnabled: true,
   },
 ];
