@@ -252,9 +252,10 @@ const styles = StyleSheet.create({
     minHeight: 56,
     borderRadius: 16,
     paddingHorizontal: Spacing.three,
+    paddingVertical: 0,
     fontSize: 16,
-    lineHeight: 24,
     fontWeight: "500",
+    textAlignVertical: "center",
   },
   picker: {
     minHeight: 180,
