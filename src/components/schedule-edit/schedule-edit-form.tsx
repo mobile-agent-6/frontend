@@ -14,7 +14,6 @@ import { SafeAreaView } from "react-native-safe-area-context";
 
 import { ScheduleCategorySelector } from "@/components/schedule-create/schedule-category-selector";
 import { ScheduleDateField } from "@/components/schedule-create/schedule-date-field";
-import { ScheduleNotificationToggle } from "@/components/schedule-create/schedule-notification-toggle";
 import { ScheduleTimeField } from "@/components/schedule-create/schedule-time-field";
 import { Button } from "@/components/ui/button";
 import { ThemedText } from "@/components/ui/themed-text";
@@ -45,14 +44,10 @@ export function ScheduleEditForm({ schedule }: ScheduleEditFormProps) {
     date: schedule.date,
     time: schedule.time,
     category: schedule.category,
-    notificationEnabled: schedule.notificationEnabled,
   }));
   const [title, setTitle] = useState(schedule.title);
   const [date, setDate] = useState(schedule.date);
   const [time, setTime] = useState(schedule.time);
-  const [notificationEnabled, setNotificationEnabled] = useState(
-    schedule.notificationEnabled,
-  );
   const [category, setCategory] = useState<ScheduleCategory>(schedule.category);
   const [activePicker, setActivePicker] = useState<"date" | "time" | null>(
     null,
@@ -64,16 +59,13 @@ export function ScheduleEditForm({ schedule }: ScheduleEditFormProps) {
   const isValid =
     trimmedTitle.length > 0 && Boolean(date) && Boolean(time) && Boolean(category);
   const updates: Partial<
-    Pick<Schedule, "title" | "date" | "time" | "category" | "notificationEnabled">
+    Pick<Schedule, "title" | "date" | "time" | "category">
   > = {};
 
   if (trimmedTitle !== original.title) updates.title = trimmedTitle;
   if (date !== original.date) updates.date = date;
   if (time !== original.time) updates.time = time;
   if (category !== original.category) updates.category = category;
-  if (notificationEnabled !== original.notificationEnabled) {
-    updates.notificationEnabled = notificationEnabled;
-  }
 
   const isDirty = Object.keys(updates).length > 0;
 
@@ -210,15 +202,6 @@ export function ScheduleEditForm({ schedule }: ScheduleEditFormProps) {
                 />
               ) : null}
             </View>
-
-            <ScheduleNotificationToggle
-              backgroundColor={fieldBackground}
-              notificationEnabled={notificationEnabled}
-              onValueChange={(value) => {
-                setNotificationEnabled(value);
-                setFormError(null);
-              }}
-            />
 
             <ScheduleCategorySelector
               category={category}

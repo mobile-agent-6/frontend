@@ -15,7 +15,6 @@ import { SafeAreaView } from "react-native-safe-area-context";
 
 import { ScheduleCategorySelector } from "@/components/schedule-create/schedule-category-selector";
 import { ScheduleDateField } from "@/components/schedule-create/schedule-date-field";
-import { ScheduleNotificationToggle } from "@/components/schedule-create/schedule-notification-toggle";
 import { ScheduleTimeField } from "@/components/schedule-create/schedule-time-field";
 import { Button } from "@/components/ui/button";
 import { ThemedText } from "@/components/ui/themed-text";
@@ -40,7 +39,6 @@ export function ScheduleCreateForm() {
   const [title, setTitle] = useState("");
   const [date, setDate] = useState<string | null>(null);
   const [time, setTime] = useState<string | null>(null);
-  const [notificationEnabled, setNotificationEnabled] = useState(true);
   const [category, setCategory] = useState<ScheduleCategory | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
   const [activePicker, setActivePicker] = useState<"date" | "time" | null>(
@@ -105,7 +103,7 @@ export function ScheduleCreateForm() {
       time,
       category,
       completed: false,
-      notificationEnabled,
+      notificationEnabled: true,
     };
 
     addSchedule(newSchedule);
@@ -190,12 +188,6 @@ export function ScheduleCreateForm() {
               />
             ) : null}
           </View>
-
-          <ScheduleNotificationToggle
-            backgroundColor={fieldBackground}
-            notificationEnabled={notificationEnabled}
-            onValueChange={setNotificationEnabled}
-          />
 
           <ScheduleCategorySelector
             category={category}

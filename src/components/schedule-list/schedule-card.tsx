@@ -122,15 +122,6 @@ export function ScheduleCard({
             {showDate ? `${formatScheduleDate(schedule.date)}  ` : null}
             {schedule.time}
           </ThemedText>
-
-          {schedule.notificationEnabled ? (
-            <SymbolView
-              name={{ ios: "bell", android: "notifications", web: "notifications" }}
-              fallback={<ThemedText themeColor="textSecondary">♢</ThemedText>}
-              size={12}
-              tintColor={theme.textSecondary}
-            />
-          ) : null}
         </View>
       </View>
 
