@@ -103,7 +103,6 @@ export function ScheduleCreateForm() {
       time,
       category,
       completed: false,
-      notificationEnabled: true,
     };
 
     addSchedule(newSchedule);

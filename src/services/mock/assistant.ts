@@ -23,7 +23,6 @@ const INVENTORY_TARGET_ID = "10000000-0000-4000-8000-000000000001";
 const RETURN_TARGET_ID = "10000000-0000-4000-8000-000000000003";
 const COMPLETED_INVENTORY_TARGET_ID = "10000000-0000-4000-8000-000000000004";
 const SAFETY_INSPECTION_TARGET_ID = "10000000-0000-4000-8000-000000000005";
-const OUTBOUND_PREPARATION_TARGET_ID = "10000000-0000-4000-8000-000000000007";
 const INBOUND_QUANTITY_TARGET_ID = "10000000-0000-4000-8000-000000000008";
 const RETURN_SHIPMENT_TARGET_ID = "10000000-0000-4000-8000-000000000006";
 
@@ -32,7 +31,7 @@ function updateMockSchedule(
   updates: Partial<
     Pick<
       Schedule,
-      "title" | "date" | "time" | "category" | "notificationEnabled" | "completed"
+      "title" | "date" | "time" | "category" | "completed"
     >
   >,
   text: string,
@@ -74,7 +73,6 @@ function addMockTeamMeeting() {
     time: "15:00",
     category: "기타",
     completed: false,
-    notificationEnabled: true,
   };
   useScheduleStore.getState().addSchedule(schedule);
 
@@ -197,18 +195,6 @@ function runStandaloneMockScenario(input: string): {
         INBOUND_QUANTITY_TARGET_ID,
         { category: "기타" },
         "입고 상품 수량 확인 카테고리를 기타로 변경했어요.",
-      );
-    case "출고 상품 준비 알림 꺼 줘":
-      return updateMockSchedule(
-        OUTBOUND_PREPARATION_TARGET_ID,
-        { notificationEnabled: false },
-        "출고 상품 준비 알림을 껐어요.",
-      );
-    case "출고 상품 준비 알림 켜 줘":
-      return updateMockSchedule(
-        OUTBOUND_PREPARATION_TARGET_ID,
-        { notificationEnabled: true },
-        "출고 상품 준비 알림을 켰어요.",
       );
     case "B구역 재고 정리를 미완료로 바꿔 줘":
       return updateMockSchedule(
