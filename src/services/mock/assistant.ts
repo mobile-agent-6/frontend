@@ -115,7 +115,7 @@ function runStandaloneMockScenario(input: string): {
   text: string;
   schedules: Schedule[];
   interaction?: AssistantInteraction;
-} {
+} | null {
   switch (input) {
     case "작업장 안전 점검 삭제해 줘":
       return createMockDeleteConfirmation(SAFETY_INSPECTION_TARGET_ID);
@@ -203,10 +203,7 @@ function runStandaloneMockScenario(input: string): {
         "B구역 재고 정리를 미완료로 변경했어요.",
       );
     default:
-      return {
-        text: "메시지를 받았어요. 지금은 텍스트 대화 흐름을 확인하는 단계예요.",
-        schedules: [],
-      };
+      return null;
   }
 }
 
@@ -290,8 +287,20 @@ export function runMockAssistantScenario(
     };
   }
 
+  const standaloneResult = runStandaloneMockScenario(input);
+  if (standaloneResult !== null) {
+    // 지원되는 독립 요청을 처리했으면 이전 정보 보완 질문은 더 이상 사용하지 않는다.
+    return {
+      ...standaloneResult,
+      status: "idle" as const,
+      pending: null,
+    };
+  }
+
+  // 미지원 입력은 기존 질문의 정상 후속 답변 기회를 유지한다.
   return {
-    ...runStandaloneMockScenario(input),
+    text: "메시지를 받았어요. 지금은 텍스트 대화 흐름을 확인하는 단계예요.",
+    schedules: [],
     status: pending === null ? ("idle" as const) : ("need-more-info" as const),
     pending,
   };
