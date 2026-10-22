@@ -230,6 +230,7 @@ export function runMockAssistantScenario(
     return {
       text: "어떤 일정으로 추가할까요?",
       schedules: [],
+      handled: true as const,
       status: "need-more-info" as const,
       pending: "awaiting-team-meeting-title-and-time" as const,
     };
@@ -242,6 +243,7 @@ export function runMockAssistantScenario(
     return {
       text: "몇 시로 할까요?",
       schedules: [],
+      handled: true as const,
       status: "need-more-info" as const,
       pending: "awaiting-team-meeting-time" as const,
     };
@@ -251,6 +253,7 @@ export function runMockAssistantScenario(
     return {
       text: "몇 시로 할까요?",
       schedules: [],
+      handled: true as const,
       status: "need-more-info" as const,
       pending: "awaiting-team-meeting-time" as const,
     };
@@ -260,6 +263,7 @@ export function runMockAssistantScenario(
     return {
       text: "어떤 일정으로 추가할까요?",
       schedules: [],
+      handled: true as const,
       status: "need-more-info" as const,
       pending: "awaiting-team-meeting-title" as const,
     };
@@ -269,6 +273,7 @@ export function runMockAssistantScenario(
     return {
       text: "언제로 추가할까요?",
       schedules: [],
+      handled: true as const,
       status: "need-more-info" as const,
       pending: "awaiting-team-meeting-date" as const,
     };
@@ -282,6 +287,7 @@ export function runMockAssistantScenario(
   if (matchesFollowUp) {
     return {
       ...addMockTeamMeeting(),
+      handled: true as const,
       status: "idle" as const,
       pending: null,
     };
@@ -292,6 +298,7 @@ export function runMockAssistantScenario(
     // 지원되는 독립 요청을 처리했으면 이전 정보 보완 질문은 더 이상 사용하지 않는다.
     return {
       ...standaloneResult,
+      handled: true as const,
       status: "idle" as const,
       pending: null,
     };
@@ -301,6 +308,8 @@ export function runMockAssistantScenario(
   return {
     text: "메시지를 받았어요. 지금은 텍스트 대화 흐름을 확인하는 단계예요.",
     schedules: [],
+    // 화면의 interaction 전환을 위한 Mock 전용 처리 여부다.
+    handled: false as const,
     status: pending === null ? ("idle" as const) : ("need-more-info" as const),
     pending,
   };

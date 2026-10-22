@@ -33,6 +33,7 @@ type ConversationListProps = {
   ref?: Ref<ConversationListHandle>;
   messages: readonly ConversationMessage[];
   isProcessing?: boolean;
+  interactionsDisabled?: boolean;
   onDeleteConfirmation?: (messageId: string, confirmed: boolean) => void;
   onCandidateSelection?: (messageId: string, scheduleId: string) => void;
 };
@@ -41,6 +42,7 @@ export function ConversationList({
   ref,
   messages,
   isProcessing = false,
+  interactionsDisabled = false,
   onDeleteConfirmation,
   onCandidateSelection,
 }: ConversationListProps) {
@@ -201,6 +203,7 @@ export function ConversationList({
             text={item.text}
             schedules={item.schedules}
             interaction={item.interaction}
+            interactionsDisabled={interactionsDisabled}
             onCandidateSelection={
               onCandidateSelection
                 ? (scheduleId) => onCandidateSelection(item.id, scheduleId)
