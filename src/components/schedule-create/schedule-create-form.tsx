@@ -1,7 +1,7 @@
 import { DateTimePicker } from "@expo/ui/community/datetime-picker";
 import * as Crypto from "expo-crypto";
 import { useRouter } from "expo-router";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import {
   Keyboard,
   KeyboardAvoidingView,
@@ -41,6 +41,8 @@ export function ScheduleCreateForm() {
   const [time, setTime] = useState<string | null>(null);
   const [category, setCategory] = useState<ScheduleCategory | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
+  const saveLockedRef = useRef(false);
+  const [saveLocked, setSaveLocked] = useState(false);
   const [activePicker, setActivePicker] = useState<"date" | "time" | null>(
     null,
   );
@@ -87,6 +89,10 @@ export function ScheduleCreateForm() {
   };
 
   const handleSave = () => {
+    if (saveLockedRef.current) {
+      return;
+    }
+
     const trimmedTitle = title.trim();
 
     if (!trimmedTitle || date === null || time === null || category === null) {
@@ -94,19 +100,35 @@ export function ScheduleCreateForm() {
       return;
     }
 
+    saveLockedRef.current = true;
+    setSaveLocked(true);
     setFormError(null);
 
-    const newSchedule: Schedule = {
-      id: Crypto.randomUUID(),
-      title: trimmedTitle,
-      date,
-      time,
-      category,
-      completed: false,
-    };
+    try {
+      const newSchedule: Schedule = {
+        id: Crypto.randomUUID(),
+        title: trimmedTitle,
+        date,
+        time,
+        category,
+        completed: false,
+      };
 
-    addSchedule(newSchedule);
-    router.back();
+      addSchedule(newSchedule);
+    } catch {
+      setFormError("일정을 저장하지 못했습니다. 다시 시도해 주세요.");
+      saveLockedRef.current = false;
+      setSaveLocked(false);
+      return;
+    }
+
+    // 화면 이동에 오류가 나더라도 이 화면을 벗어날 때까지 저장 잠금을 유지한다.
+    // 이미 저장한 일정을 저장 실패로 간주해 다시 등록하지 않도록 한다.
+    try {
+      router.back();
+    } catch {
+      setFormError("일정은 저장되었습니다. 뒤로가기로 이전 화면으로 돌아가 주세요.");
+    }
   };
 
   return (
@@ -218,7 +240,7 @@ export function ScheduleCreateForm() {
           <Button
             label="저장"
             onPress={handleSave}
-            disabled={!canSave}
+            disabled={!canSave || saveLocked}
           />
         </SafeAreaView>
       </KeyboardAvoidingView>
