@@ -9,27 +9,24 @@ import {
 } from "@/components/schedule-list/category-filter";
 import { Header } from "@/components/navigation/header";
 import { ScheduleCard } from "@/components/schedule-list/schedule-card";
-import {
-  ScheduleListState,
-  type ScheduleListViewState,
-} from "@/components/schedule-list/schedule-list-state";
+import { ScheduleListState } from "@/components/schedule-list/schedule-list-state";
 import { ThemedText } from "@/components/ui/themed-text";
 import { ThemedView } from "@/components/ui/themed-view";
 import { BottomTabInset, Spacing } from "@/constants/theme";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useTheme } from "@/hooks/use-theme";
-import { useScheduleStore } from "@/stores/scheduleStore";
+import { useScheduleData } from "@/hooks/use-schedule-data";
 
 export default function ScheduleListScreen() {
   const theme = useTheme();
   const colorScheme = useColorScheme();
   const router = useRouter();
-  const schedules = useScheduleStore((state) => state.schedules);
-  const toggleCompleted = useScheduleStore((state) => state.toggleCompleted);
   const [selectedCategory, setSelectedCategory] =
     useState<ScheduleCategoryFilter>("전체");
-  const [requestState] =
-    useState<Exclude<ScheduleListViewState, "empty">>("success");
+  const {
+    schedules, readError, hasSuccessfulRead, retryRead, completionError,
+    retryCompletion, toggleCompleted, canOpenSchedule,
+  } = useScheduleData();
 
   const visibleSchedules = useMemo(
     () => {
@@ -46,12 +43,6 @@ export default function ScheduleListScreen() {
     },
     [schedules, selectedCategory],
   );
-
-  const viewState: ScheduleListViewState =
-    requestState === "success" && visibleSchedules.length === 0
-      ? "empty"
-      : requestState;
-  const displayedSchedules = viewState === "success" ? visibleSchedules : [];
 
   return (
     <ThemedView
@@ -71,24 +62,51 @@ export default function ScheduleListScreen() {
       />
 
       <FlatList
-        data={displayedSchedules}
+        data={visibleSchedules}
         style={styles.list}
         keyExtractor={(schedule) => schedule.id}
         contentContainerStyle={[
           styles.listContent,
-          viewState !== "success" && styles.emptyListContent,
+          visibleSchedules.length === 0 && styles.emptyListContent,
         ]}
         ItemSeparatorComponent={ScheduleSeparator}
         ListEmptyComponent={
-          viewState === "success" ? null : (
-            <ScheduleListState state={viewState} />
+          readError && !hasSuccessfulRead ? null : (
+            <ScheduleListState
+              state="empty"
+              emptyText={selectedCategory === "전체" ? undefined : `${selectedCategory} 일정이 없어요.`}
+            />
           )
+        }
+        ListHeaderComponent={
+          readError || completionError ? (
+            <View style={((readError && hasSuccessfulRead) || completionError) && visibleSchedules.length > 0
+              ? styles.errorHeader
+              : undefined}>
+              {readError && (
+                <ScheduleListState
+                  state="error"
+                  errorTitle={hasSuccessfulRead
+                    ? "최신 정보를 불러오지 못했어요. 이전 정보를 표시하고 있어요."
+                    : undefined}
+                  onRetry={retryRead}
+                />
+              )}
+              {completionError && (
+                <ScheduleListState
+                  state="error"
+                  errorTitle="완료 상태를 변경하지 못했어요."
+                  onRetry={retryCompletion}
+                />
+              )}
+            </View>
+          ) : null
         }
         renderItem={({ item }) => (
           <ScheduleCard
             schedule={item}
-            onToggleCompleted={() => toggleCompleted(item.id)}
-            onPress={() =>
+            onToggleCompleted={() => toggleCompleted(item)}
+            onPress={() => canOpenSchedule() &&
               router.push({
                 pathname: "/schedule/[id]",
                 params: { id: item.id },
@@ -143,6 +161,9 @@ const styles = StyleSheet.create({
   },
   separator: {
     height: 12,
+  },
+  errorHeader: {
+    marginBottom: 24,
   },
   addButton: {
     position: "absolute",

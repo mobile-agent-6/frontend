@@ -5,26 +5,29 @@ import { ScrollView, StyleSheet, View } from "react-native";
 import { MonthCalendar } from "@/components/calendar/month-calendar";
 import { Header } from "@/components/navigation/header";
 import { ScheduleCard } from "@/components/schedule-list/schedule-card";
+import { ScheduleListState } from "@/components/schedule-list/schedule-list-state";
 import { ThemedText } from "@/components/ui/themed-text";
 import { ThemedView } from "@/components/ui/themed-view";
 import { Spacing } from "@/constants/theme";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useTheme } from "@/hooks/use-theme";
-import { useScheduleStore } from "@/stores/scheduleStore";
+import { useScheduleData } from "@/hooks/use-schedule-data";
 import { formatLocalDate } from "@/utils/schedule-date-time";
 
 export default function CalendarScreen() {
   const theme = useTheme();
   const colorScheme = useColorScheme();
   const router = useRouter();
-  const schedules = useScheduleStore((state) => state.schedules);
-  const toggleCompleted = useScheduleStore((state) => state.toggleCompleted);
   const [selectedDate, setSelectedDate] = useState(() =>
     formatLocalDate(new Date()),
   );
   const [visibleMonth, setVisibleMonth] = useState(
     () => `${selectedDate.slice(0, 7)}-01`,
   );
+  const {
+    schedules, readError, hasSuccessfulRead, retryRead, completionError,
+    retryCompletion, toggleCompleted, canOpenSchedule,
+  } = useScheduleData();
   const scheduleDates = useMemo(
     () => [...new Set(schedules.map((schedule) => schedule.date))],
     [schedules],
@@ -74,8 +77,26 @@ export default function CalendarScreen() {
           {selectedDateTitle}
         </ThemedText>
 
-        <View style={styles.scheduleList}>
-          {selectedSchedules.length === 0 ? (
+        <View style={[styles.scheduleList, readError && styles.readErrorList]}>
+          {readError && (
+            <View style={styles.readErrorMessage}>
+              <ScheduleListState
+                state="error"
+                errorTitle={hasSuccessfulRead
+                  ? "최신 정보를 불러오지 못했어요. 이전 정보를 표시하고 있어요."
+                  : undefined}
+                onRetry={retryRead}
+              />
+            </View>
+          )}
+          {completionError && (
+            <ScheduleListState
+              state="error"
+              errorTitle="완료 상태를 변경하지 못했어요."
+              onRetry={retryCompletion}
+            />
+          )}
+          {selectedSchedules.length === 0 && (!readError || hasSuccessfulRead) ? (
             <View style={styles.emptyState}>
               <ThemedText
                 type="small"
@@ -91,8 +112,8 @@ export default function CalendarScreen() {
                 key={schedule.id}
                 schedule={schedule}
                 showDate={false}
-                onToggleCompleted={() => toggleCompleted(schedule.id)}
-                onPress={() =>
+                onToggleCompleted={() => toggleCompleted(schedule)}
+                onPress={() => canOpenSchedule() &&
                   router.push({
                     pathname: "/schedule/[id]",
                     params: { id: schedule.id },
@@ -125,6 +146,12 @@ const styles = StyleSheet.create({
   scheduleList: {
     marginTop: Spacing.two,
     gap: 12,
+  },
+  readErrorList: {
+    marginTop: 16,
+  },
+  readErrorMessage: {
+    marginBottom: 4,
   },
   emptyState: {
     alignItems: "center",
