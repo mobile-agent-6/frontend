@@ -15,6 +15,7 @@ type AssistantMessageProps = {
   text: string;
   schedules?: readonly Schedule[];
   interaction?: AssistantInteraction;
+  interactionsDisabled?: boolean;
   onDeleteConfirmation?: (confirmed: boolean) => void;
   onCandidateSelection?: (scheduleId: string) => void;
 };
@@ -23,11 +24,12 @@ export function AssistantMessage({
   text,
   schedules,
   interaction,
+  interactionsDisabled = false,
   onDeleteConfirmation,
   onCandidateSelection,
 }: AssistantMessageProps) {
   const theme = useTheme();
-  const confirmationDisabled = interaction?.resolved || !onDeleteConfirmation;
+  const confirmationDisabled = interactionsDisabled || interaction?.resolved || !onDeleteConfirmation;
   return (
     <ThemedView type="primary" style={styles.bubble}>
       <Text
@@ -72,6 +74,7 @@ export function AssistantMessage({
         <CandidateSelectionInteraction
           interaction={interaction}
           onSelect={onCandidateSelection}
+          processing={interactionsDisabled}
         />
       )}
     </ThemedView>
@@ -81,12 +84,14 @@ export function AssistantMessage({
 function CandidateSelectionInteraction({
   interaction,
   onSelect,
+  processing,
 }: {
   interaction: AssistantCandidateSelection;
   onSelect?: (scheduleId: string) => void;
+  processing: boolean;
 }) {
   const theme = useTheme();
-  const disabled = interaction.resolved || !onSelect;
+  const disabled = processing || interaction.resolved || !onSelect;
   return (
     <View style={styles.candidates}>
       {interaction.candidates.map((candidate) => (

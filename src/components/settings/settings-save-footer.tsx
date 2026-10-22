@@ -38,18 +38,19 @@ export function SettingsSaveFooter({
             onLayout={(event) => onFeedbackHeightChange(event.nativeEvent.layout.height)}
             style={[
               styles.feedback,
-              {
-                backgroundColor:
-                  feedback.status === "success" ? "#EAF7F1" : fieldBackground,
-              },
+              feedback.status === "error"
+                ? styles.errorFeedback
+                : { backgroundColor: "#EAF7F1" },
             ]}
           >
             <ThemedText
+              type={feedback.status === "error" ? "small" : "default"}
               accessibilityRole="alert"
               accessibilityLiveRegion="polite"
               style={[
                 styles.feedbackText,
-                { color: feedback.status === "success" ? "#047857" : theme.destructive },
+                feedback.status === "error" && styles.errorFeedbackText,
+                { color: feedback.status === "success" ? "#047857" : theme.primary },
               ]}
             >
               {feedback.message}
@@ -98,6 +99,14 @@ const styles = StyleSheet.create({
   feedbackText: {
     textAlign: "center",
     fontWeight: "700",
+  },
+  errorFeedback: {
+    paddingHorizontal: Spacing.three,
+    paddingVertical: Spacing.two,
+    borderRadius: 12,
+  },
+  errorFeedbackText: {
+    fontWeight: "600",
   },
   footer: {
     flexShrink: 0,
