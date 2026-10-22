@@ -13,6 +13,7 @@ type ConfirmationModalProps = {
   confirmLabel: string;
   onCancel: () => void;
   onConfirm: () => void;
+  onDismiss?: () => void;
   confirmVariant?: "primary" | "destructive";
 };
 
@@ -23,6 +24,7 @@ export function ConfirmationModal({
   confirmLabel,
   onCancel,
   onConfirm,
+  onDismiss,
   confirmVariant = "primary",
 }: ConfirmationModalProps) {
   const theme = useTheme();
@@ -31,6 +33,7 @@ export function ConfirmationModal({
     <Modal
       animationType="fade"
       onRequestClose={onCancel}
+      onDismiss={onDismiss}
       transparent
       visible={visible}
     >

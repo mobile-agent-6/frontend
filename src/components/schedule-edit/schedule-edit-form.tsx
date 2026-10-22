@@ -1,5 +1,4 @@
 import { DateTimePicker } from "@expo/ui/community/datetime-picker";
-import { useRouter } from "expo-router";
 import { useState } from "react";
 import {
   Keyboard,
@@ -21,7 +20,6 @@ import { ThemedView } from "@/components/ui/themed-view";
 import { Spacing } from "@/constants/theme";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useTheme } from "@/hooks/use-theme";
-import { useScheduleStore } from "@/stores/scheduleStore";
 import type { Schedule, ScheduleCategory } from "@/types/schedule";
 import {
   createDatePickerValue,
@@ -32,13 +30,19 @@ import {
 
 type ScheduleEditFormProps = {
   schedule: Schedule;
+  onSave: (updates: Partial<Schedule>) => void;
+  actionLocked: boolean;
+  actionError: string | null;
 };
 
-export function ScheduleEditForm({ schedule }: ScheduleEditFormProps) {
+export function ScheduleEditForm({
+  schedule,
+  onSave,
+  actionLocked,
+  actionError,
+}: ScheduleEditFormProps) {
   const theme = useTheme();
   const colorScheme = useColorScheme();
-  const router = useRouter();
-  const updateSchedule = useScheduleStore((state) => state.updateSchedule);
   const [original] = useState(() => ({
     title: schedule.title.trim(),
     date: schedule.date,
@@ -70,6 +74,8 @@ export function ScheduleEditForm({ schedule }: ScheduleEditFormProps) {
   const isDirty = Object.keys(updates).length > 0;
 
   const handleSave = () => {
+    if (actionLocked) return;
+
     if (!isValid) {
       setFormError("필수 항목을 모두 입력해 주세요.");
       return;
@@ -79,8 +85,7 @@ export function ScheduleEditForm({ schedule }: ScheduleEditFormProps) {
 
     if (!isDirty) return;
 
-    updateSchedule(schedule.id, updates);
-    router.back();
+    onSave(updates);
   };
 
   const fieldBackground =
@@ -211,13 +216,13 @@ export function ScheduleEditForm({ schedule }: ScheduleEditFormProps) {
               }}
             />
 
-            {formError ? (
+            {formError || actionError ? (
               <View accessibilityRole="alert" style={styles.formError}>
                 <ThemedText
                   type="small"
                   style={[styles.formErrorText, { color: theme.primary }]}
                 >
-                  {formError}
+                  {formError ?? actionError}
                 </ThemedText>
               </View>
             ) : null}
@@ -234,7 +239,7 @@ export function ScheduleEditForm({ schedule }: ScheduleEditFormProps) {
             <Button
               label="수정 완료"
               onPress={handleSave}
-              disabled={!isDirty || !isValid}
+              disabled={!isDirty || !isValid || actionLocked}
             />
           </View>
         </KeyboardAvoidingView>
