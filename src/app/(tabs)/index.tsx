@@ -71,7 +71,7 @@ export default function ScheduleListScreen() {
         ]}
         ItemSeparatorComponent={ScheduleSeparator}
         ListEmptyComponent={
-          readError && !hasSuccessfulRead ? null : (
+          readError && !hasSuccessfulRead ? undefined : (
             <ScheduleListState
               state="empty"
               emptyText={selectedCategory === "전체" ? undefined : `${selectedCategory} 일정이 없어요.`}
@@ -100,7 +100,7 @@ export default function ScheduleListScreen() {
                 />
               )}
             </View>
-          ) : null
+          ) : undefined
         }
         renderItem={({ item }) => (
           <ScheduleCard
