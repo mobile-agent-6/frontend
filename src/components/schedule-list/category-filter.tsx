@@ -4,6 +4,7 @@ import {
   ScrollView,
   StyleSheet,
   type LayoutChangeEvent,
+  type ScrollViewInstance,
 } from "react-native";
 
 import { ThemedText } from "@/components/ui/themed-text";
@@ -32,7 +33,7 @@ export function CategoryFilter({
 }: CategoryFilterProps) {
   const theme = useTheme();
   const colorScheme = useColorScheme();
-  const scrollViewRef = useRef<ScrollView>(null);
+  const scrollViewRef = useRef<ScrollViewInstance>(null);
   const chipPositions = useRef(
     new Map<ScheduleCategoryFilter, { x: number; width: number }>(),
   );

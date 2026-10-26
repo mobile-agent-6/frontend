@@ -58,7 +58,7 @@ export function TabBar() {
   );
 }
 
-function CustomTabBar({ state, navigation, insets }: CustomTabBarProps) {
+function CustomTabBar({ state, emitter, navigateToTab, insets }: CustomTabBarProps) {
   const theme = useTheme();
   const colorScheme = useColorScheme();
   const { width } = useWindowDimensions();
@@ -94,19 +94,19 @@ function CustomTabBar({ state, navigation, insets }: CustomTabBarProps) {
           const label = TAB_LABELS[route.name] ?? route.name;
 
           const handlePress = () => {
-            const event = navigation.emit({
+            const event = emitter.emit({
               type: "tabPress",
               target: route.key,
               canPreventDefault: true,
             });
 
             if (!selected && !event.defaultPrevented) {
-              navigation.navigate(route.name, route.params);
+              navigateToTab(route.key);
             }
           };
 
           const handleLongPress = () => {
-            navigation.emit({
+            emitter.emit({
               type: "tabLongPress",
               target: route.key,
             });

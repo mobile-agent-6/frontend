@@ -8,7 +8,7 @@ import {
   useRouter,
 } from "expo-router";
 import { useEffect, useRef } from "react";
-import { useColorScheme } from "react-native";
+import { Platform, useColorScheme } from "react-native";
 
 export default function RootLayout() {
   const colorScheme = useColorScheme();
@@ -28,7 +28,7 @@ export default function RootLayout() {
       }
     };
 
-    const unsubscribe = navigationRef.addListener("ready", handleInitialRoute);
+    const unsubscribe = navigationRef.addListener("state", handleInitialRoute);
     handleInitialRoute();
     return unsubscribe;
   }, [navigationRef, pathname, router]);
@@ -42,11 +42,33 @@ export default function RootLayout() {
       >
         <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
 
-        <Stack.Screen name="schedule/create" options={{ title: "일정 추가" }} />
+        {/* SDK 58 iOS의 기본 투명 헤더 대신 기존 폼의 헤더 아래 배치를 유지한다. */}
+        <Stack.Screen
+          name="schedule/create"
+          options={{
+            title: "일정 추가",
+            headerTransparent: false,
+            animation: Platform.OS === "ios" ? "simple_push" : undefined,
+          }}
+        />
 
-        <Stack.Screen name="schedule/[id]" options={{ title: "일정 수정" }} />
+        <Stack.Screen
+          name="schedule/[id]"
+          options={{
+            title: "일정 수정",
+            headerTransparent: false,
+            animation: Platform.OS === "ios" ? "simple_push" : undefined,
+          }}
+        />
 
-        <Stack.Screen name="settings" options={{ title: "설정" }} />
+        <Stack.Screen
+          name="settings"
+          options={{
+            title: "설정",
+            headerTransparent: false,
+            animation: Platform.OS === "ios" ? "simple_push" : undefined,
+          }}
+        />
       </Stack>
     </ThemeProvider>
   );
