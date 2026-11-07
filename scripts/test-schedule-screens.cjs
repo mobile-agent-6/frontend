@@ -11,6 +11,7 @@ const root = path.resolve(__dirname, "..");
 function harness() {
   const modules = new Map(), screens = [], calls = [], navigations = [];
   let current;
+  const mark = (owner) => { owner.dirty = true; if (owner.root) owner.root.dirty = true; };
   const same = (a, b) => a && b && a.length === b.length && a.every((v, i) => Object.is(v, b[i]));
   const react = {
     useState(initial) {
@@ -18,7 +19,7 @@ function harness() {
       owner.slots[index] ??= { value: typeof initial === "function" ? initial() : initial };
       return [owner.slots[index].value, (next) => {
         const value = typeof next === "function" ? next(owner.slots[index].value) : next;
-        if (!Object.is(value, owner.slots[index].value)) { owner.slots[index].value = value; owner.dirty = true; }
+        if (!Object.is(value, owner.slots[index].value)) { owner.slots[index].value = value; mark(owner); }
       }];
     },
     useRef(initial) { return current.slots[current.cursor++] ??= { current: initial }; },
@@ -36,7 +37,7 @@ function harness() {
   };
   const useStore = (store, select = (s) => s) => {
     const owner = current;
-    react.useEffect(() => store.subscribe(() => { owner.dirty = true; }), [store]);
+    react.useEffect(() => store.subscribe(() => mark(owner)), [store]);
     return select(store.getState());
   };
   class FixedDate extends Date { constructor(...args) { super(...(args.length ? args : ["2026-11-07T03:00:00Z"])); } }
@@ -49,17 +50,23 @@ function harness() {
     }, fileName: filename }).outputText;
     const resolve = (name) => {
       if (name === "react") return react;
-      if (name === "react/jsx-runtime") return { jsx: (type, props) => ({ type, props }), jsxs: (type, props) => ({ type, props }) };
+      if (name === "react/jsx-runtime") return { jsx: (type, props, key) => ({ type, props, key }), jsxs: (type, props, key) => ({ type, props, key }) };
       if (name === "zustand/vanilla") return require(name);
       if (name === "zustand") return { useStore, create: (initializer) => {
         const store = require("zustand/vanilla").createStore(initializer);
         return Object.assign((select) => useStore(store, select), store);
       } };
-      if (name === "expo-router") return { useRouter: () => ({ push: (route) => navigations.push(route) }) };
+      if (name === "expo-router") return { Stack: { Screen: "Stack.Screen" },
+        useLocalSearchParams: () => ({ id: (current.root ?? current).routeId }),
+        useRouter: () => ({ push: (route) => navigations.push(route), back: () => navigations.push("back") }) };
       if (name === "expo-symbols") return { SymbolView: "SymbolView" };
       if (name === "expo-crypto") return { randomUUID: require("node:crypto").randomUUID };
       if (name === "@/constants/theme") return { Spacing: {}, BottomTabInset: 0 };
-      if (name === "react-native") return { ...Object.fromEntries(["FlatList", "Pressable", "View", "ScrollView"].map((s) => [s, s])), StyleSheet: { create: (s) => s } };
+      if (name === "react-native") return { ...Object.fromEntries(["FlatList", "Pressable", "View", "ScrollView", "TextInput", "KeyboardAvoidingView"].map((s) => [s, s])),
+        Platform: { OS: "ios" }, Keyboard: { dismiss() {} }, StyleSheet: { create: (s) => s } };
+      if (name === "@expo/ui/community/datetime-picker") return { DateTimePicker: "DateTimePicker" };
+      if (name === "react-native-safe-area-context") return { SafeAreaView: "SafeAreaView" };
+      if (name === "@/components/schedule-edit/schedule-edit-form") return source("src/components/schedule-edit/schedule-edit-form.tsx");
       if (name.startsWith("@/components/")) {
         const component = name.split("/").at(-1).split("-").map((s) => s[0].toUpperCase() + s.slice(1)).join("");
         return { [component]: component };
@@ -77,16 +84,33 @@ function harness() {
   configModule.getDevelopmentServerConfig = () => config;
   const http = source("src/services/api/http.ts");
   http.scheduleHttpClient = http.createScheduleHttpClient({ readConfig: () => config, fetchImpl: (url, options) =>
-    new Promise((resolve) => calls.push({ url, ...options, resolve })) });
+    new Promise((resolve, reject) => calls.push({ url, ...options, resolve, reject })) });
   const mode = source("src/stores/scheduleDataModeStore.ts").scheduleDataModeStore;
   const mock = source("src/stores/scheduleStore.ts").useScheduleStore;
   const server = source("src/stores/serverScheduleStore.ts").serverScheduleStore;
+  function expand(node, rootScreen, trail, seen) {
+    if (!node || typeof node !== "object") return node;
+    if (Array.isArray(node)) return node.map((n, i) => expand(n, rootScreen, `${trail}/${i}`, seen));
+    if (typeof node.type === "function") {
+      const key = `${trail}/${node.type.name}/${node.key ?? ""}`; seen.add(key);
+      let child = rootScreen.children.get(key);
+      if (!child) { child = { slots: [], effects: [], root: rootScreen }; rootScreen.children.set(key, child); }
+      current = child; child.cursor = 0; child.dirty = false;
+      const result = node.type(node.props); while (child.effects.length) child.effects.shift()();
+      return expand(result, rootScreen, key, seen);
+    }
+    return { ...node, props: { ...node.props, children: expand(node.props?.children, rootScreen, `${trail}/children`, seen) } };
+  }
   function flush() {
     let limit = 40;
     do {
       for (const s of screens.filter((s) => s.dirty && !s.closed)) {
-        current = s; s.dirty = false; s.cursor = 0; s.tree = s.Screen();
+        current = s; s.dirty = false; s.cursor = 0; const raw = s.Screen();
         while (s.effects.length) s.effects.shift()();
+        const seen = new Set(); s.tree = expand(raw, s, "root", seen);
+        for (const [key, child] of s.children) {
+          if (!seen.has(key)) { child.slots.forEach((slot) => slot?.cleanup?.()); s.children.delete(key); }
+        }
       }
     } while (screens.some((s) => s.dirty && !s.closed) && --limit);
     assert.ok(limit, "렌더 반복이 종료되어야 한다");
@@ -97,11 +121,14 @@ function harness() {
     return [...(tree.type === type ? [tree.props] : []), ...nodes(tree.props?.children, type),
       ...nodes(tree.props?.ListEmptyComponent, type), ...nodes(tree.props?.ListHeaderComponent, type)];
   }
-  function mount(kind) {
-    const s = { slots: [], effects: [], dirty: true, Screen: source(`src/app/(tabs)/${kind}.tsx`).default };
+  function mount(kind, routeId) {
+    const s = { slots: [], effects: [], children: new Map(), dirty: true, routeId,
+      Screen: source(kind === "detail" ? "src/app/schedule/[id].tsx" : `src/app/(tabs)/${kind}.tsx`).default };
     screens.push(s); flush();
     return { all: (type) => nodes(s.tree, type), one: (type) => nodes(s.tree, type)[0],
-      close() { s.closed = true; s.slots.forEach((slot) => slot?.cleanup?.()); } };
+      route(id) { s.routeId = id; s.dirty = true; flush(); },
+      close() { s.closed = true; s.slots.forEach((slot) => slot?.cleanup?.());
+        s.children.forEach((child) => child.slots.forEach((slot) => slot?.cleanup?.())); } };
   }
   return { mount, calls, mock, server, flush, source, navigations,
     mode(value) { mode.getState().setMode(value); flush(); },
@@ -109,7 +136,10 @@ function harness() {
     async settle() { for (let i = 0; i < 4; i++) { await new Promise(setImmediate); flush(); } },
     respond(index, items, status = 200) { calls[index].resolve(new Response(JSON.stringify({ items }), { status,
       headers: { "Content-Type": "application/json" } })); },
-    close() { for (const s of screens) { s.closed = true; s.slots.forEach((slot) => slot?.cleanup?.()); } mode.getState().setMode("mock"); },
+    detail(index, value, status = 200, media = "application/json") { calls[index].resolve(new Response(JSON.stringify(value), {
+      status, headers: { "Content-Type": media } })); },
+    close() { for (const s of screens) { s.closed = true; s.slots.forEach((slot) => slot?.cleanup?.());
+      s.children.forEach((child) => child.slots.forEach((slot) => slot?.cleanup?.())); } mode.getState().setMode("mock"); },
   };
 }
 const dto = (id, category = "INVENTORY", completed = false) => ({ id, title: id, category, completed,
@@ -243,5 +273,165 @@ test("선택 월 조회 실패 Retry는 실패 query만 재실행하고 성공 �
     assert.equal(h.calls[2].url, h.calls[1].url); h.respond(2, []); await h.settle();
     assert.equal(cal.all("ThemedText").some((p) => p.children === "일정 없음"), true);
     assert.equal(cal.one("MonthCalendar").selectedDate, "2027-03-12");
+  } finally { h.close(); }
+});
+
+const mockId = "10000000-0000-4000-8000-000000000001";
+const notFoundProblem = (code = "SCHEDULE_NOT_FOUND") => ({ type: "test", title: "test", status: 404,
+  detail: "test", instance: "/schedules", code, requestId: "test" });
+const saveButton = (screen) => screen.all("Button").find((p) => p.label === "수정 완료");
+
+test("상세 Mock 수정·삭제와 모달/navigation 유지, 서버 요청 0회", async () => {
+  for (const kind of ["update", "delete"]) {
+    const h = harness(); try {
+      const screen = h.mount("detail", mockId); await h.settle();
+      if (kind === "update") {
+        screen.one("TextInput").onChangeText("수정된 제목"); h.flush(); saveButton(screen).onPress(); h.flush();
+        assert.equal(h.mock.getState().schedules.find((s) => s.id === mockId).title, "수정된 제목");
+      } else {
+        screen.one("Stack.Screen").options.headerRight().props.onPress(); h.flush();
+        assert.equal(screen.one("ConfirmationModal").visible, true);
+        screen.one("ConfirmationModal").onConfirm(); h.flush(); screen.one("ConfirmationModal").onDismiss(); h.flush();
+        assert.equal(h.mock.getState().schedules.some((s) => s.id === mockId), false);
+      }
+      assert.deepEqual(h.navigations, ["back"]); assert.equal(h.calls.length, 0);
+    } finally { h.close(); }
+  }
+});
+test("cache 밖 상세 직접 진입·최초 loading·단건 성공은 월 coverage가 아님", async () => {
+  const h = harness(); try {
+    h.mode("server"); const screen = h.mount("detail", "opaque/id-v5"); await h.settle();
+    assert.ok(states(screen).includes("loading")); assert.equal(screen.one("TextInput"), undefined);
+    assert.ok(h.calls[0].url.endsWith("/schedules/opaque%2Fid-v5"));
+    h.detail(0, dto("opaque/id-v5")); await h.settle(); assert.equal(screen.one("TextInput").value, "opaque/id-v5");
+    const cache = Object.values(h.server.store.getState().servers)[0];
+    assert.deepEqual(cache.queries, {}); assert.ok(cache.entities["opaque/id-v5"]);
+  } finally { h.close(); }
+});
+test("SCHEDULE_NOT_FOUND와 다른 404·통신/응답 오류를 구분하고 GET-only Retry", async () => {
+  for (const code of ["SCHEDULE_NOT_FOUND", "ROUTE_NOT_FOUND", "invalid-response"]) {
+    const h = harness(); try {
+      h.mode("server"); const screen = h.mount("detail", "target"); await h.settle();
+      h.detail(0, code === "invalid-response" ? {} : notFoundProblem(code), code === "invalid-response" ? 500 : 404,
+        code === "invalid-response" ? "application/json" : "application/problem+json"); await h.settle();
+      const error = screen.all("ScheduleListState").find((p) => p.state === "error");
+      assert.equal(error.errorTitle, code === "SCHEDULE_NOT_FOUND" ? "일정을 찾을 수 없어요." : "일정을 불러오지 못했어요.");
+      assert.equal(screen.one("TextInput"), undefined); error.onRetry(); await h.settle();
+      h.detail(1, dto("target")); await h.settle(); assert.equal(screen.one("TextInput").value, "target");
+      assert.ok(h.calls.every((c) => c.method === "GET"));
+    } finally { h.close(); }
+  }
+});
+test("상세 재조회 실패와 늦은 성공에도 사용자 입력·dirty-check 보존", async () => {
+  const h = harness(); try {
+    h.mode("server"); const screen = h.mount("detail", "target"); await h.settle();
+    h.detail(0, dto("target")); await h.settle();
+    screen.one("TextInput").onChangeText("사용자 입력"); h.flush();
+    let retry = h.server.retryDetail("target"); await h.settle(); h.detail(1, {}, 500); await retry; await h.settle();
+    assert.equal(screen.one("TextInput").value, "사용자 입력"); assert.ok(states(screen).includes("error"));
+    retry = h.server.retryDetail("target"); await h.settle(); h.detail(2, { ...dto("target"), title: "다른 서버 제목" }); await retry; await h.settle();
+    assert.equal(screen.one("TextInput").value, "사용자 입력");
+    assert.equal(Object.values(h.server.store.getState().servers)[0].entities.target.title, "다른 서버 제목");
+  } finally { h.close(); }
+});
+test("목록 cache를 상세에 재사용하며 단건 결과도 같은 entity를 갱신", async () => {
+  const h = harness(); try {
+    h.mode("server"); const list = h.mount("index"); await h.settle(); h.respond(0, [dto("target")]); await h.settle();
+    const screen = h.mount("detail", "target"); assert.equal(screen.one("TextInput").value, "target"); await h.settle();
+    assert.equal(h.calls.length, 2); h.detail(1, { ...dto("target"), title: "최신 제목" }); await h.settle();
+    assert.equal(list.one("FlatList").data[0].title, "최신 제목");
+    // cache를 표시한 시점에 폼 원본은 이미 고정되어 재조회로 덮어쓰지 않는다.
+    assert.equal(screen.one("TextInput").value, "target");
+  } finally { h.close(); }
+});
+test("같은 ID 상세 요청 공유와 마지막 소비자 해제 취소", async () => {
+  const h = harness(); try {
+    h.mode("server"); const a = h.mount("detail", "target"), b = h.mount("detail", "target"); await h.settle();
+    assert.equal(h.calls.length, 1); a.close(); assert.equal(h.calls[0].signal.aborted, false);
+    b.close(); assert.equal(h.calls[0].signal.aborted, true);
+  } finally { h.close(); }
+});
+test("상세 route ID 변경 시 데이터·폼 입력과 늦은 응답 분리", async () => {
+  const h = harness(); try {
+    h.mode("server"); const screen = h.mount("detail", "first"); await h.settle(); h.detail(0, dto("first")); await h.settle();
+    screen.one("TextInput").onChangeText("이전 입력"); h.flush();
+    const retry = h.server.retryDetail("first"); await h.settle(); screen.route("second"); await h.settle();
+    assert.equal(screen.one("TextInput"), undefined); assert.equal(h.calls[1].signal.aborted, true);
+    h.detail(2, dto("second")); h.detail(1, dto("first")); await retry; await h.settle();
+    assert.equal(screen.one("TextInput").value, "second");
+  } finally { h.close(); }
+});
+test("상세 서버 변경·Mock 복귀 시 이전 응답·입력 차단", async () => {
+  const h = harness(); try {
+    h.mode("server"); const screen = h.mount("detail", mockId); await h.settle(); h.detail(0, dto(mockId)); await h.settle();
+    screen.one("TextInput").onChangeText("다른 서버 입력"); h.flush();
+    h.config("https://other.example.invalid"); await h.settle(); assert.equal(screen.one("TextInput"), undefined);
+    h.mode("mock"); await h.settle(); assert.equal(h.calls[1].signal.aborted, true);
+    h.detail(1, dto(mockId)); await h.settle(); assert.equal(screen.one("TextInput").value, "A구역 재고 실사");
+  } finally { h.close(); }
+});
+test("서버 상세의 Mock 저장·삭제·가짜 성공/navigation은 UI와 handler 양쪽에서 차단", async () => {
+  const h = harness(); try {
+    h.mode("server"); const before = h.mock.getState().schedules; const screen = h.mount("detail", mockId);
+    await h.settle(); h.detail(0, dto(mockId)); await h.settle();
+    screen.one("TextInput").onChangeText("저장 금지"); h.flush(); assert.equal(saveButton(screen).disabled, true);
+    saveButton(screen).onPress();
+    const deletion = screen.one("Stack.Screen").options.headerRight(); assert.equal(deletion.props.disabled, true);
+    deletion.props.onPress(); screen.one("ConfirmationModal").onConfirm(); screen.one("ConfirmationModal").onDismiss(); h.flush();
+    assert.strictEqual(h.mock.getState().schedules, before); assert.deepEqual(h.navigations, []);
+    assert.equal(screen.one("ConfirmationModal").visible, false); assert.equal(h.calls.length, 1);
+  } finally { h.close(); }
+});
+test("늦은 단건 응답이 더 최신 목록 객체를 덮지 않음", async () => {
+  const h = harness(); try {
+    h.mode("server"); const screen = h.mount("detail", "target"); await h.settle(); const list = h.mount("index"); await h.settle();
+    h.respond(1, [{ ...dto("target"), title: "최신" }]); await h.settle(); h.detail(0, { ...dto("target"), title: "과거" }); await h.settle();
+    assert.equal(list.one("FlatList").data[0].title, "최신"); assert.equal(screen.one("TextInput").value, "최신");
+  } finally { h.close(); }
+});
+test("mutation 조회 장벽 이후 이전 단건 응답을 반영하지 않음", async () => {
+  const h = harness(); try {
+    h.mode("server"); const screen = h.mount("detail", "target"); await h.settle(); h.server.invalidate();
+    assert.equal(h.calls[0].signal.aborted, true); h.detail(0, dto("target")); await h.settle();
+    assert.equal(screen.one("TextInput"), undefined);
+    assert.equal(Object.values(h.server.store.getState().servers)[0].entities.target, undefined);
+  } finally { h.close(); }
+});
+test("상세 설정 오류·잘못된 route와 응답 ID 불일치를 성공으로 처리하지 않음", async () => {
+  const h = harness(); try {
+    h.config(undefined); h.mode("server"); const screen = h.mount("detail", "target"); await h.settle();
+    assert.ok(states(screen).includes("error")); assert.equal(h.calls.length, 0);
+    h.config("https://example.invalid"); await h.settle(); h.detail(0, dto("wrong")); await h.settle();
+    assert.equal(screen.one("TextInput"), undefined); assert.ok(states(screen).includes("error"));
+    screen.route(["target", "other"]); await h.settle(); assert.equal(h.calls.length, 1); assert.ok(states(screen).includes("error"));
+  } finally { h.close(); }
+});
+
+test("상세 네트워크 오류는 404가 아니며 제한된 retry 후 오류 표시", async () => {
+  const h = harness(); try {
+    h.mode("server"); const screen = h.mount("detail", "target"); await h.settle();
+    h.calls[0].reject(new Error("메모리 네트워크 오류")); await h.settle();
+    h.calls[1].reject(new Error("메모리 네트워크 오류")); await h.settle();
+    assert.equal(h.calls.length, 2); assert.equal(screen.one("TextInput"), undefined);
+    assert.equal(screen.all("ScheduleListState").find((p) => p.state === "error").errorTitle, "일정을 불러오지 못했어요.");
+    assert.equal(Object.values(h.server.store.getState().servers)[0].details.target.error.kind, "network");
+  } finally { h.close(); }
+});
+test("상세 timeout은 loading을 종료하고 404와 구분", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const h = harness(); try {
+    h.mode("server"); const screen = h.mount("detail", "target"); await h.settle();
+    t.mock.timers.tick(10_000); await h.settle(); t.mock.timers.tick(10_000); await h.settle();
+    assert.equal(h.calls.length, 2); assert.equal(states(screen).includes("loading"), false);
+    assert.equal(screen.all("ScheduleListState").find((p) => p.state === "error").errorTitle, "일정을 불러오지 못했어요.");
+    assert.equal(Object.values(h.server.store.getState().servers)[0].details.target.error.kind, "timeout");
+  } finally { h.close(); }
+});
+test("더 최신 단건 이후 늦은 목록은 공유 객체를 되돌리지 않음", async () => {
+  const h = harness(); try {
+    h.mode("server"); const list = h.mount("index"); await h.settle(); const screen = h.mount("detail", "target"); await h.settle();
+    h.detail(1, { ...dto("target"), title: "최신 단건" }); await h.settle();
+    h.respond(0, [{ ...dto("target"), title: "과거 목록" }]); await h.settle();
+    assert.equal(list.one("FlatList").data[0].title, "최신 단건"); assert.equal(screen.one("TextInput").value, "최신 단건");
   } finally { h.close(); }
 });

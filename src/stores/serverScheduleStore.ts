@@ -1,7 +1,7 @@
 import { createStore } from "zustand/vanilla";
 
 import { scheduleHttpClient, type HttpError } from "@/services/api/http";
-import { listSchedules } from "@/services/api/schedules";
+import { getSchedule, listSchedules } from "@/services/api/schedules";
 import type { Schedule } from "@/types/schedule";
 import { parseScheduleApiDateTime } from "@/utils/schedule-mapper";
 import { buildScheduleListQuery, type ScheduleListQuery } from "@/utils/schedule-query";
@@ -19,9 +19,28 @@ type ServerCache = {
   entities: Record<string, Schedule>;
   entityVersions: Record<string, number>;
   queries: Record<string, ScheduleQueryEntry>;
+  details: Record<string, Omit<ScheduleQueryEntry, "query" | "ids">>;
 };
 type QueryState = { serverId: string | null; generation: number; servers: Record<string, ServerCache> };
-const emptyCache = (): ServerCache => ({ entities: {}, entityVersions: {}, queries: {} });
+const emptyCache = (): ServerCache => ({ entities: {}, entityVersions: {}, queries: {}, details: {} });
+
+// 목록과 단건이 같은 요청 순번·객체 원본을 사용한다. 서버 revision을 추정하지 않는다.
+function mergeEntities(cache: ServerCache, items: Schedule[], sequence: number) {
+  const entities: Record<string, Schedule> = Object.assign(Object.create(null), cache.entities);
+  const entityVersions = { ...cache.entityVersions }, queries = { ...cache.queries }, details = { ...cache.details };
+  let stale = false;
+  for (const item of items) {
+    if ((entityVersions[item.id] ?? 0) > sequence) { stale = true; continue; }
+    if (entities[item.id] && JSON.stringify(entities[item.id]) !== JSON.stringify(item)) {
+      for (const [key, entry] of Object.entries(queries)) {
+        if (entry.ids.includes(item.id)) queries[key] = { ...entry, stale: true };
+      }
+      if (details[item.id]) details[item.id] = { ...details[item.id], stale: true };
+    }
+    entities[item.id] = { ...item }; entityVersions[item.id] = sequence;
+  }
+  return { cache: { entities, entityVersions, queries, details }, stale };
+}
 
 export function normalizeScheduleQuery(query: ScheduleListQuery): ScheduleListQuery {
   const params = buildScheduleListQuery(query);
@@ -40,10 +59,11 @@ export function scheduleQueryKey(serverId: string, query: ScheduleListQuery): st
 export function createServerScheduleStore({
   readServerId = scheduleHttpClient.getServerId,
   list = listSchedules,
-}: { readServerId?: () => string | null; list?: typeof listSchedules } = {}) {
+  get = getSchedule,
+}: { readServerId?: () => string | null; list?: typeof listSchedules; get?: typeof getSchedule } = {}) {
   const store = createStore<QueryState>(() => ({ serverId: null, generation: 0, servers: {} }));
   let sequence = 0;
-  type Flight = { controller: AbortController; promise: Promise<void>; sequence: number };
+  type Flight = { controller: AbortController; promise: Promise<void>; sequence: number; detailId?: string };
   const flights = new Map<string, Flight>();
   const consumers = new Map<string, Set<symbol>>();
 
@@ -58,6 +78,11 @@ export function createServerScheduleStore({
     flight.controller.abort();
     const serverId = store.getState().serverId;
     if (serverId) update(serverId, (cache) => {
+      if (flight.detailId !== undefined) {
+        const entry = cache.details[flight.detailId];
+        return entry ? { ...cache, details: { ...cache.details, [flight.detailId]: { ...entry, stale: true,
+          status: "error", error: { kind: "aborted", requestState: "unconfirmed" } } } } : cache;
+      }
       const entry = cache.queries[key];
       if (!entry) return cache;
       return { ...cache, queries: { ...cache.queries, [key]: { ...entry, stale: true, status: "error",
@@ -71,7 +96,8 @@ export function createServerScheduleStore({
     for (const key of flights.keys()) cancel(key);
     store.setState((state) => ({ serverId, generation: state.generation + 1,
       servers: Object.fromEntries(Object.entries(state.servers).map(([id, cache]) => [id, {
-        ...cache, queries: Object.fromEntries(Object.entries(cache.queries).map(([key, entry]) =>
+        ...cache, details: Object.fromEntries(Object.entries(cache.details).map(([key, entry]) => [key, { ...entry, stale: true }])),
+        queries: Object.fromEntries(Object.entries(cache.queries).map(([key, entry]) =>
           [key, { ...entry, stale: true }])) }])) }));
     return serverId;
   }
@@ -81,6 +107,7 @@ export function createServerScheduleStore({
     store.setState((state) => ({ generation: state.generation + 1 }));
     const id = store.getState().serverId;
     if (id) update(id, (cache) => ({ ...cache,
+      details: Object.fromEntries(Object.entries(cache.details).map(([key, entry]) => [key, { ...entry, stale: true }])),
       queries: Object.fromEntries(Object.entries(cache.queries).map(([key, entry]) => [key, { ...entry, stale: true }])) }));
   }
 
@@ -114,25 +141,12 @@ export function createServerScheduleStore({
         if (result.serverId !== serverId) return { ...cache, queries: { ...cache.queries,
           [key]: { ...previous, status: "error", stale: true,
             error: { kind: "aborted", requestState: "response-received" } } } };
-        const entities: Record<string, Schedule> = Object.assign(Object.create(null), cache.entities);
-        const entityVersions = { ...cache.entityVersions };
-        const queries = { ...cache.queries };
-        let stale = false;
-        for (const item of result.data) {
-          // 응답 도착 순서가 아니라 요청 시작 순서를 사용한다. 서버 revision을 추정하지 않는다.
-          if ((entityVersions[item.id] ?? 0) > requestSequence) { stale = true; continue; }
-          if (entities[item.id] && JSON.stringify(entities[item.id]) !== JSON.stringify(item)) {
-            for (const [otherKey, other] of Object.entries(queries)) {
-              if (otherKey !== key && other.ids.includes(item.id)) queries[otherKey] = { ...other, stale: true };
-            }
-          }
-          entities[item.id] = { ...item };
-          entityVersions[item.id] = requestSequence;
-        }
+        const merged = mergeEntities(cache, result.data, requestSequence);
+        const { queries } = merged.cache;
         // 한 query에서 빠진 객체를 전역 삭제하지 않는다. 순서와 소속은 query별로 유지한다.
         queries[key] = { ...previous, ids: result.data.map((item) => item.id),
-          hasSuccess: true, status: "success", error: null, stale };
-        return { entities, entityVersions, queries };
+          hasSuccess: true, status: "success", error: null, stale: merged.stale };
+        return merged.cache;
       });
     }).catch(() => {
       // 주입된 서비스의 예상 밖 예외도 빈 성공으로 처리하지 않는다.
@@ -164,7 +178,76 @@ export function createServerScheduleStore({
       if (owners?.size === 0) { consumers.delete(key); cancel(key); }
     } };
   }
-  return { store, syncServer, acquire, invalidate,
+
+  function fetchDetail(scheduleId: string, force = false): Promise<void> {
+    const serverId = syncServer();
+    if (!serverId || !scheduleId) return Promise.resolve();
+    const key = JSON.stringify(["detail", serverId, scheduleId]);
+    const existing = flights.get(key);
+    if (existing) return existing.promise;
+    const entry = store.getState().servers[serverId]?.details[scheduleId];
+    if (!force && entry?.hasSuccess && !entry.stale) return Promise.resolve();
+    const requestSequence = ++sequence, generation = store.getState().generation;
+    const controller = new AbortController();
+    update(serverId, (cache) => ({ ...cache, details: { ...cache.details, [scheduleId]: {
+      status: "loading", hasSuccess: entry?.hasSuccess ?? false, stale: true, error: null, sequence: requestSequence,
+    } } }));
+    const promise = Promise.resolve().then(async () => {
+      if (controller.signal.aborted) return;
+      const result = await get(scheduleId, controller.signal);
+      syncServer();
+      if (controller.signal.aborted || store.getState().generation !== generation ||
+        store.getState().serverId !== serverId || flights.get(key)?.sequence !== requestSequence) return;
+      update(serverId, (cache) => {
+        const previous = cache.details[scheduleId];
+        if (!result.ok || result.serverId !== serverId || result.data.id !== scheduleId) {
+          const error: HttpError = !result.ok ? result.error : { kind: "response", requestState: "response-received" };
+          // 더 늦게 시작한 목록이 이미 새 객체를 확인했다면 이전 404도 확정하지 않는다.
+          const currentError: HttpError = (cache.entityVersions[scheduleId] ?? 0) > requestSequence
+            ? { kind: "aborted", requestState: "response-received" } : error;
+          const queries = { ...cache.queries };
+          if (currentError.problem?.code === "SCHEDULE_NOT_FOUND") {
+            for (const [key, value] of Object.entries(queries)) {
+              if (value.ids.includes(scheduleId)) queries[key] = { ...value, stale: true };
+            }
+          }
+          return { ...cache, queries, details: { ...cache.details, [scheduleId]: {
+            ...previous, status: "error", stale: true, error: currentError,
+          } } };
+        }
+        const merged = mergeEntities(cache, [result.data], requestSequence);
+        merged.cache.details[scheduleId] = { ...previous, status: "success", hasSuccess: true,
+          stale: merged.stale, error: null };
+        return merged.cache;
+      });
+    }).catch(() => {
+      syncServer();
+      if (!controller.signal.aborted && store.getState().generation === generation && flights.get(key)?.sequence === requestSequence) {
+        update(serverId, (cache) => ({ ...cache, details: { ...cache.details, [scheduleId]: {
+          ...cache.details[scheduleId], status: "error", error: { kind: "response", requestState: "unconfirmed" },
+        } } }));
+      }
+    }).finally(() => { if (flights.get(key)?.sequence === requestSequence) flights.delete(key); });
+    flights.set(key, { controller, promise, sequence: requestSequence, detailId: scheduleId });
+    return promise;
+  }
+
+  function acquireDetail(scheduleId: string) {
+    const serverId = syncServer();
+    const key = serverId ? JSON.stringify(["detail", serverId, scheduleId]) : null;
+    const token = Symbol();
+    if (key) { const owners = consumers.get(key) ?? new Set<symbol>(); owners.add(token); consumers.set(key, owners); }
+    let released = false;
+    return { promise: fetchDetail(scheduleId), retry: () => released ? Promise.resolve() : fetchDetail(scheduleId, true),
+      release() {
+        if (released || !key) return;
+        released = true;
+        const owners = consumers.get(key); owners?.delete(token);
+        if (owners?.size === 0) { consumers.delete(key); cancel(key); }
+      } };
+  }
+  return { store, syncServer, acquire, acquireDetail, invalidate,
+    retryDetail: (scheduleId: string) => fetchDetail(scheduleId, true),
     retry: (query: ScheduleListQuery) => fetchQuery(query, true) };
 }
 

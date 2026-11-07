@@ -57,3 +57,34 @@ export function useServerScheduleData(query: ScheduleListQuery, enabled = false,
     cancel: () => subscription.current?.release(),
   };
 }
+
+/** 단건 성공은 공유 객체에만 반영하며 목록 coverage를 만들지 않는다. */
+export function useServerScheduleDetail(scheduleId: string | undefined, enabled = false) {
+  const state = useStore(serverScheduleStore.store);
+  const subscription = useRef<{ release: () => void; retry: () => Promise<void> } | null>(null);
+  const config = getDevelopmentServerConfig();
+  const serverId = config.status === "ready" ? config.config.serverId : null;
+  useEffect(() => {
+    if (!enabled) return;
+    serverScheduleStore.syncServer();
+    if (!serverId || !scheduleId) return;
+    const consumer = serverScheduleStore.acquireDetail(scheduleId);
+    subscription.current = consumer;
+    return consumer.release;
+  }, [enabled, serverId, scheduleId]);
+  const cache = serverId && state.serverId === serverId ? state.servers[serverId] : undefined;
+  const entry = scheduleId ? cache?.details[scheduleId] : undefined;
+  const localError = enabled && (config.status !== "ready" ? {
+    kind: "configuration" as const, configurationStatus: config.status, requestState: "not-sent" as const,
+  } : !scheduleId ? { kind: "request" as const, requestState: "not-sent" as const } : null);
+  const error = localError || entry?.error || null;
+  const notFound = error?.kind === "http" && error.status === 404 && error.problem?.code === "SCHEDULE_NOT_FOUND";
+  const schedule = !localError && !notFound && scheduleId ? cache?.entities[scheduleId] : undefined;
+  return { serverId, schedule, error, notFound,
+    initialLoading: enabled && !schedule && !error,
+    isFetching: entry?.status === "loading",
+    hasSuccessfulRead: Boolean(schedule),
+    stale: entry?.stale ?? true,
+    retryRead: () => enabled ? subscription.current?.retry() ?? Promise.resolve() : Promise.resolve(),
+  };
+}
