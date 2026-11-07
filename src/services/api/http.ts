@@ -1,3 +1,5 @@
+import { fetch as expoFetch } from "expo/fetch";
+
 import { getDevelopmentServerConfig } from "@/services/api/config";
 import { isScheduleRequestAllowed } from "@/stores/scheduleDataModeStore";
 
@@ -77,7 +79,7 @@ export function parseProblemDetails(value: unknown): ProblemDetails | null {
 
 /** Schedule 전용 10초/최대 1회 retry 정책. health·time-sync·Assistant에 재사용하지 않는다. */
 export function createScheduleHttpClient({
-  fetchImpl = fetch,
+  fetchImpl,
   readConfig = getDevelopmentServerConfig,
 }: {
   fetchImpl?: typeof fetch;
@@ -85,11 +87,15 @@ export function createScheduleHttpClient({
 } = {}) {
   async function request(options: ScheduleHttpRequest): Promise<HttpResult<unknown>> {
     const method = options.method ?? "GET";
+    const path = options.path;
+    let query: string | undefined;
+    try { query = options.query?.toString(); }
+    catch { return { ok: false, attempts: 0, error: { kind: "request", requestState: "not-sent" } }; }
     const blocked = (attempts: number): HttpResult<never> => ({ ok: false, attempts, error: {
       kind: "request", policyReason: "read-only", requestState: attempts ? "unconfirmed" : "not-sent",
       unconfirmedAttempt: attempts > 0,
     } });
-    if (!isScheduleRequestAllowed(method, options.path)) return blocked(0);
+    if (!isScheduleRequestAllowed(method, path, query)) return blocked(0);
     const initial = readConfig();
     if (initial.status !== "ready") {
       return { ok: false, attempts: 0, error: {
@@ -109,9 +115,9 @@ export function createScheduleHttpClient({
     let body: string | undefined;
     let url: string;
     try {
-      if (!options.path.startsWith("/") || /[?#\s\\]/.test(options.path) || options.path.startsWith("//") ||
-        /^\/api\/v1(?:\/|$)/.test(options.path) ||
-        options.path.split("/").some((part) => [".", ".."].includes(decodeURIComponent(part)))) {
+      if (!path.startsWith("/") || /[?#\s\\]/.test(path) || path.startsWith("//") ||
+        /^\/api\/v1(?:\/|$)/.test(path) ||
+        path.split("/").some((part) => [".", ".."].includes(decodeURIComponent(part)))) {
         throw new Error();
       }
       headers = new Headers(options.headers);
@@ -122,13 +128,13 @@ export function createScheduleHttpClient({
         if (body === undefined) throw new Error();
         headers.set("Content-Type", "application/json");
       }
-      const query = options.query?.toString();
-      url = `${config.apiBaseUrl}${options.path}${query ? `?${query}` : ""}`;
+      url = `${config.apiBaseUrl}${path}${query ? `?${query}` : ""}`;
+      if (new URL(url).origin !== new URL(config.baseUrl).origin) throw new Error();
     } catch {
       return { ok: false, attempts: 0, error: { kind: "request", requestState: "not-sent" } };
     }
 
-    // URL·header·JSON body는 논리 요청마다 한 번만 확정하고 retry에서 재생성하지 않는다.
+    // path·query·URL·header·JSON body는 고정하고 동일 요청을 첫 전송/retry 직전에 검사한다.
     let attempts = 0;
     let unconfirmedAttempt = false;
     async function attempt(): Promise<HttpResult<unknown>> {
@@ -159,7 +165,9 @@ export function createScheduleHttpClient({
 
       const receive = async (): Promise<HttpResult<unknown>> => {
         try {
-          const response = await fetchImpl(url, { method, headers: new Headers(headers), body, signal: controller.signal,
+          // RN의 기본 whatwg-fetch는 redirect 옵션을 무시한다. 쓰기는 Expo native fetch로 차단한다.
+          const send = fetchImpl ?? (method === "GET" ? fetch : expoFetch);
+          const response = await send(url, { method, headers: new Headers(headers), body, signal: controller.signal,
             // 쓰기 요청의 redirect로 허용되지 않은 endpoint에 재전송되는 것을 방지한다.
             redirect: method === "GET" ? "follow" : "error" });
           status = response.status;
@@ -198,10 +206,10 @@ export function createScheduleHttpClient({
     }
 
     for (let index = 0; index < 2; index++) {
-      if (!isScheduleRequestAllowed(method, options.path)) return blocked(attempts);
       if (options.signal?.aborted || !isCurrentServer()) {
         return { ok: false, attempts, error: { kind: "aborted", requestState: attempts ? "unconfirmed" : "not-sent" } };
       }
+      if (!isScheduleRequestAllowed(method, path, query)) return blocked(attempts);
       attempts++;
       const result = await attempt();
       if (options.signal?.aborted || !isCurrentServer()) {

@@ -44,6 +44,7 @@ function harness() {
       if (name === "react/jsx-runtime") return { jsx: (type, props) => ({ type, props }), jsxs: (type, props) => ({ type, props }) };
       if (name === "react-native") return { KeyboardAvoidingView: "KeyboardAvoidingView", Platform: { OS: "ios" }, StyleSheet: { create: (s) => s } };
       if (name === "zustand" || name === "zustand/vanilla") return require(name);
+      if (name === "expo/fetch") return { fetch: () => { throw new Error("실제 네트워크 요청 금지"); } };
       if (name === "expo-crypto") return { randomUUID: () => {
         if (uuidFailure) throw new Error("UUID 생성 실패");
         onUUID?.();

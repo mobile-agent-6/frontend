@@ -4,11 +4,12 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { test } = require("node:test");
 const ts = require("typescript");
+const { randomUUID } = require("node:crypto");
 const root = path.resolve(__dirname, "..");
 
 // 실제 화면·Hook·서비스를 실행하되 native 컴포넌트와 React 실행기만 메모리 대역으로 둔다.
 // native 렌더링·레이아웃·아이폰 통신을 검증하는 테스트는 아니다.
-function harness(initialMode, { allowCreation = false, writeScope, allowPatch = false, allowDelete = false } = {}) {
+function harness(initialMode, { allowCreation = false, writeScope, writeTargetId, allowPatch = false, allowDelete = false } = {}) {
   const modules = new Map(), screens = [], calls = [], navigations = [];
   let current;
   const mark = (owner) => { owner.dirty = true; if (owner.root) owner.root.dirty = true; };
@@ -61,6 +62,8 @@ function harness(initialMode, { allowCreation = false, writeScope, allowPatch = 
         useRouter: () => ({ push: (route) => navigations.push(route), back: () => navigations.push("back") }) };
       if (name === "expo-symbols") return { SymbolView: "SymbolView" };
       if (name === "expo-crypto") return { randomUUID: require("node:crypto").randomUUID };
+      if (name === "expo/fetch") return { fetch: (url, options) => new Promise((resolve, reject) =>
+        calls.push({ url, ...options, resolve, reject, transport: "expo" })) };
       if (name === "@/constants/theme") return { Spacing: {}, BottomTabInset: 0 };
       if (name === "react-native") return { ...Object.fromEntries(["FlatList", "Pressable", "View", "ScrollView", "TextInput", "KeyboardAvoidingView"].map((s) => [s, s])),
         Platform: { OS: "ios" }, Keyboard: { dismiss() {} }, StyleSheet: { create: (s) => s } };
@@ -77,8 +80,9 @@ function harness(initialMode, { allowCreation = false, writeScope, allowPatch = 
       assert.ok(name.startsWith("@/")); return source(`src/${name.slice(2)}.ts`);
     };
     new Function("require", "module", "exports", "fetch", "Date", "process", code)(resolve, module, module.exports,
-      () => { throw new Error("실제 네트워크 요청 금지"); }, FixedDate,
+      (url, options) => new Promise((resolve, reject) => calls.push({ url, ...options, resolve, reject, transport: "global" })), FixedDate,
       { env: { EXPO_PUBLIC_SCHEDULE_DATA_MODE: initialMode,
+        EXPO_PUBLIC_SCHEDULE_WRITE_TARGET_ID: writeTargetId,
         EXPO_PUBLIC_SCHEDULE_WRITE_SCOPE: writeScope ?? (allowCreation ? "create" : undefined) } });
     return module.exports;
   }
@@ -1417,4 +1421,248 @@ test("I 앞선 응답 유실 뒤 DELETE 404는 확정 거절로 단정하지 않
     h.detail(3, notFoundProblem(), 404, "application/problem+json"); await h.settle(); await respondLists(h, 4, []);
     assert.match(formText(screen), /이전 삭제 요청의 성공 여부를 뜻하지/); assert.deepEqual(h.navigations, []); assert.equal(deleteCalls(h).length, 2);
   } finally { h.close(); }
+});
+
+test("J scope별 정확한 method·대상 경로 분리와 none/create 회귀", () => {
+  const target = randomUUID(), other = randomUUID();
+  for (const writeScope of [undefined, "none", "create", "target-patch", "target-delete", "all", "TARGET-PATCH", "target-delete "]) {
+    const h = harness("server", { writeScope, writeTargetId: target }); try {
+      const policy = h.source("src/stores/scheduleDataModeStore.ts");
+      assert.equal(policy.resolveScheduleWriteScope(writeScope), ["create", "target-patch", "target-delete"].includes(writeScope) ? writeScope : "none");
+      for (const method of ["GET", "POST", "PATCH", "DELETE", "PUT"]) for (const route of [
+        "/schedules", `/schedules/${target}`, `/schedules/${other}`, "/assistant/requests", "/system/time-sync",
+      ]) {
+        const expected = method === "GET" || (writeScope === "create" && method === "POST" && route === "/schedules") ||
+          (route === `/schedules/${target}` && ((writeScope === "target-patch" && method === "PATCH") || (writeScope === "target-delete" && method === "DELETE")));
+        assert.equal(policy.isScheduleRequestAllowed(method, route), expected);
+      }
+      assert.equal(h.calls.length, 0);
+    } finally { h.close(); }
+  }
+});
+
+test("J 대상 ID는 UUID 버전 제한 없이 원문 유지, 누락·변형·인코딩 값은 fail closed", async () => {
+  const generated = randomUUID();
+  const version5 = `${generated.slice(0, 14)}5${generated.slice(15)}`;
+  for (const writeTargetId of [undefined, "", " ", "not-a-uuid", ` ${generated}`, `${generated} `, `${generated}\n`,
+    generated.replaceAll("-", ""), `{${generated}}`, `g${generated.slice(1)}`, `%${generated}`, `${generated}/extra`, `${generated}?x=1`]) {
+    for (const writeScope of ["target-patch", "target-delete"]) {
+      const h = harness("server", { writeScope, writeTargetId }); try {
+        const policy = h.source("src/stores/scheduleDataModeStore.ts");
+        assert.equal(policy.resolveScheduleWriteTargetId(writeTargetId), null);
+        const http = h.source("src/services/api/http.ts").scheduleHttpClient;
+        for (const method of ["PATCH", "DELETE"]) {
+          const result = await http.request({ method, path: `/schedules/${generated}` });
+          assert.equal(result.attempts, 0); assert.equal(result.error.policyReason, "read-only");
+        }
+        assert.equal(h.calls.length, 0);
+      } finally { h.close(); }
+    }
+  }
+  const h = harness("server", { writeScope: "target-patch", writeTargetId: version5.toUpperCase() }); try {
+    const policy = h.source("src/stores/scheduleDataModeStore.ts");
+    assert.equal(policy.resolveScheduleWriteTargetId(version5), version5);
+    assert.equal(policy.resolveScheduleWriteTargetId(version5.toUpperCase()), version5.toUpperCase());
+    assert.equal(policy.isScheduleRequestAllowed("PATCH", `/schedules/${version5.toUpperCase()}`), true);
+    if (version5 !== version5.toUpperCase()) assert.equal(policy.isScheduleRequestAllowed("PATCH", `/schedules/${version5}`), false);
+  } finally { h.close(); }
+});
+
+test("J 대상 정책의 다른 ID·POST·유사/인코딩 경로·별도 query·외부 origin 전송 0회", async () => {
+  const target = randomUUID(), other = randomUUID(), encoded = `%${target.charCodeAt(0).toString(16)}${target.slice(1)}`;
+  for (const writeScope of ["target-patch", "target-delete"]) {
+    const h = harness("server", { writeScope, writeTargetId: target }); try {
+      const http = h.source("src/services/api/http.ts").scheduleHttpClient, allowedMethod = writeScope === "target-patch" ? "PATCH" : "DELETE";
+      const exact = `/schedules/${target}`;
+      const attempts = [
+        ...["POST", "PATCH", "DELETE"].map((method) => ({ method, path: `/schedules/${other}` })),
+        ...["/schedules", "/assistant/requests", "/system/time-sync"].map((path) => ({ method: "POST", path })),
+        ...[`${exact}/`, `${exact}?x=1`, `${exact}#fragment`, `${exact}/extra`, ` ${exact}`, `${exact}\n`,
+          `/SCHEDULES/${target}`, `/schedule/${target}`, `/api/v1${exact}`, `/other/..${exact}`,
+          `/schedules/${encoded}`, `/schedules/${encoded.replace("%", "%25")}`, `/schedules/${target.replaceAll("-", "%2D")}`,
+          `/schedules%2F${target}`, `/schedules\\${target}`, `${exact}/../${other}`,
+          `https://other.example.invalid/api/v1${exact}`, `//other.example.invalid${exact}`, `/\\other.example.invalid${exact}`]
+          .map((path) => ({ method: allowedMethod, path })),
+        { method: allowedMethod, path: exact, query: new URLSearchParams({ x: "1" }) },
+        { method: allowedMethod, path: exact, query: new URLSearchParams({ redirect: "https://other.example.invalid" }) },
+      ];
+      for (const request of attempts) {
+        const result = await http.request(request);
+        assert.equal(result.ok, false); assert.equal(result.attempts, 0); assert.equal(result.error.policyReason, "read-only");
+      }
+      assert.equal(h.calls.length, 0);
+    } finally { h.close(); }
+  }
+});
+
+test("J 실제 정책으로 허용된 서비스 PATCH/DELETE만 전송·redirect error·key 미전송", async () => {
+  const target = randomUUID();
+  for (const writeScope of ["target-patch", "target-delete"]) {
+    const h = harness("server", { writeScope, writeTargetId: target }); try {
+      const service = h.source("src/services/api/schedules.ts");
+      const operation = (writeScope === "target-patch" ? service.prepareScheduleUpdate(target, { completed: true }) : service.prepareScheduleDeletion(target)).operation;
+      const pending = operation.submit(); await h.settle();
+      assert.equal(h.calls.length, 1); assert.equal(h.calls[0].method, writeScope === "target-patch" ? "PATCH" : "DELETE");
+      assert.equal(h.calls[0].url, `https://example.invalid/api/v1/schedules/${target}`);
+      assert.equal(h.calls[0].redirect, "error"); assert.equal(h.calls[0].headers.has("Idempotency-Key"), false);
+      if (writeScope === "target-patch") h.detail(0, dto(target, "INVENTORY", true)); else noContent(h, 0);
+      const result = await pending; assert.equal(result.response.status, writeScope === "target-patch" ? 200 : 204);
+      const blocked = (writeScope === "target-patch" ? service.prepareScheduleDeletion(target) : service.prepareScheduleUpdate(target, { completed: false })).operation;
+      assert.equal((await blocked.submit()).outcome, "not-sent"); assert.equal(h.calls.length, 1);
+    } finally { h.close(); }
+  }
+});
+
+test("J GET 목록·단건·query 동작과 원본 DTO status/id/updatedAt 검사 유지", async () => {
+  const target = randomUUID();
+  for (const writeScope of ["none", "create", "target-patch", "target-delete", "invalid"]) {
+    const h = harness("server", { writeScope, writeTargetId: target }); try {
+      const http = h.source("src/services/api/http.ts").scheduleHttpClient;
+      const first = http.request({ path: "/schedules", query: new URLSearchParams({ completed: "false" }) }); await h.settle();
+      assert.equal(new URL(h.calls[0].url).searchParams.get("completed"), "false"); assert.equal(h.calls[0].redirect, "follow");
+      h.respond(0, [dto(target)]); assert.equal((await first).status, 200);
+      const next = http.request({ path: `/schedules/${target}` }); await h.settle(); h.detail(1, dto(target));
+      const raw = await next; assert.equal(raw.status, 200); assert.equal(raw.data.id, target); assert.equal(raw.data.updatedAt, dto(target).updatedAt);
+    } finally { h.close(); }
+  }
+});
+
+test("J 설정된 Base URL과 다른 origin의 apiBaseUrl도 fetch 이전 차단", async () => {
+  const target = randomUUID(), h = harness("server", { writeScope: "target-patch", writeTargetId: target }); try {
+    const config = h.source("src/services/api/config.ts").parseDevelopmentServerConfig("https://example.invalid"); let sends = 0;
+    const client = h.source("src/services/api/http.ts").createScheduleHttpClient({
+      readConfig: () => ({ ...config, config: { ...config.config, apiBaseUrl: "https://other.example.invalid/api/v1" } }),
+      fetchImpl: () => { sends++; throw new Error("전송 금지"); },
+    });
+    const result = await client.request({ method: "PATCH", path: `/schedules/${target}`, body: { completed: true } });
+    assert.equal(result.attempts, 0); assert.equal(result.error.kind, "request"); assert.equal(sends, 0);
+  } finally { h.close(); }
+});
+
+test("J 허용된 쓰기의 307 redirect는 후속 요청이나 자동 retry로 연결하지 않음", async () => {
+  const target = randomUUID();
+  for (const writeScope of ["target-patch", "target-delete"]) {
+    const h = harness("server", { writeScope, writeTargetId: target }); try {
+      const http = h.source("src/services/api/http.ts").scheduleHttpClient;
+      const pending = http.request({ method: writeScope === "target-patch" ? "PATCH" : "DELETE", path: `/schedules/${target}` });
+      await h.settle(); assert.equal(h.calls[0].redirect, "error");
+      h.detail(0, {}, 307, "application/json", { Location: "https://other.example.invalid" });
+      const result = await pending; assert.equal(result.ok, false); assert.equal(h.calls.length, 1);
+    } finally { h.close(); }
+  }
+});
+
+test("J 최초 전송 직전과 retry 직전에도 동일 정책·path·query 재검사", async () => {
+  const target = randomUUID();
+  for (const writeScope of ["target-patch", "target-delete"]) for (const rejectAt of [2, 3]) {
+    const h = harness("server", { writeScope, writeTargetId: target }); try {
+      const policy = h.source("src/stores/scheduleDataModeStore.ts"), actual = policy.isScheduleRequestAllowed;
+      const checks = [], method = writeScope === "target-patch" ? "PATCH" : "DELETE", path = `/schedules/${target}`;
+      // 번들 설정은 고정이므로 정책 재검사 지점의 거절을 테스트에서만 주입한다.
+      policy.isScheduleRequestAllowed = (...args) => { checks.push(args); return checks.length < rejectAt && actual(...args); };
+      const pending = h.source("src/services/api/http.ts").scheduleHttpClient.request({ method, path }); await h.settle();
+      if (rejectAt === 3) { assert.equal(h.calls.length, 1); h.calls[0].reject(new Error("memory")); }
+      const result = await pending; assert.equal(result.error.policyReason, "read-only");
+      assert.equal(result.attempts, rejectAt === 2 ? 0 : 1); assert.equal(h.calls.length, rejectAt === 2 ? 0 : 1);
+      assert.equal(checks.length, rejectAt); assert.ok(checks.every(([m, p, q]) => m === method && p === path && q === undefined));
+      if (rejectAt === 3) assert.equal(result.error.unconfirmedAttempt, true);
+    } finally { h.close(); }
+  }
+});
+
+test("J body 직렬화 중 request 변형도 고정 path/query와 실제 전송을 불일치시키지 않음", async () => {
+  const target = randomUUID(), h = harness("server", { writeScope: "target-patch", writeTargetId: target }); try {
+    const options = { method: "PATCH", path: `/schedules/${target}`, query: new URLSearchParams(),
+      body: { toJSON() { options.path = `/schedules/${randomUUID()}`; options.query.set("redirect", "other"); return { completed: true }; } } };
+    const pending = h.source("src/services/api/http.ts").scheduleHttpClient.request(options); await h.settle();
+    assert.equal(h.calls[0].url, `https://example.invalid/api/v1/schedules/${target}`);
+    h.detail(0, dto(target, "INVENTORY", true)); assert.equal((await pending).status, 200);
+  } finally { h.close(); }
+});
+
+test("J target-patch UI·수정 handler·완료 토글은 대상만 허용하고 공유 잠금 유지", async () => {
+  const target = randomUUID(), other = randomUUID(), h = harness("server", { writeScope: "target-patch", writeTargetId: target }); try {
+    const { list, calendar } = await completionScreens(h, [dto(target), dto(other)]), before = h.mock.getState().schedules;
+    const screen = await editableDetail(h, target), blocked = await editableDetail(h, other);
+    editTitle(h, blocked); assert.equal(saveButton(blocked).disabled, true); saveButton(blocked).onPress();
+    assert.equal(deleteButton(screen).disabled, true); deleteButton(screen).onPress(); h.flush(); screen.one("ConfirmationModal").onConfirm();
+    assert.equal(listCard(list, 1).completionDisabled, true); listCard(list, 1).onToggleCompleted(); calendar.all("ScheduleCard")[1].onToggleCompleted();
+    await h.settle(); assert.equal(h.calls.length, 4);
+    editTitle(h, screen); assert.equal(saveButton(screen).disabled, false); saveButton(screen).onPress(); saveButton(screen).onPress(); h.flush();
+    listCard(list).onToggleCompleted(); await h.settle(); assert.equal(patches(h).length, 1); assert.deepEqual(JSON.parse(h.calls[4].body), { title: "수정 입력" });
+    const updated = { ...dto(target), title: "수정 입력" }; h.detail(4, updated); await h.settle(); await respondLists(h, 5, [updated, dto(other)]);
+    assert.equal(listCard(list).completionDisabled, false); listCard(list).onToggleCompleted(); await h.settle();
+    assert.deepEqual(JSON.parse(h.calls[7].body), { completed: true }); h.detail(7, { ...updated, completed: true }); await h.settle();
+    await respondLists(h, 8, [{ ...updated, completed: true }, dto(other)]);
+    assert.equal(listCard(list).schedule.completed, true); assert.equal(calendar.all("ScheduleCard")[0].schedule.completed, true);
+    assert.equal(deleteCalls(h).length, 0); assert.strictEqual(h.mock.getState().schedules, before);
+    const create = h.mount("create"); fillCreation(h, create); assert.equal(createButton(create).disabled, true); await createButton(create).onPress();
+    assert.equal(h.calls.length, 10);
+  } finally { h.close(); }
+});
+
+test("J target-delete UI·모달·handler는 대상 삭제만 허용하며 모든 수정·완료·생성 차단", async () => {
+  const target = randomUUID(), other = randomUUID(), h = harness("server", { writeScope: "target-delete", writeTargetId: target }); try {
+    const { list, calendar } = await completionScreens(h, [dto(target), dto(other)]), before = h.mock.getState().schedules;
+    const screen = await editableDetail(h, target), blocked = await editableDetail(h, other); editTitle(h, screen); editTitle(h, blocked);
+    assert.equal(saveButton(screen).disabled, true); saveButton(screen).onPress(); saveButton(blocked).onPress();
+    assert.equal(deleteButton(blocked).disabled, true); deleteButton(blocked).onPress(); h.flush(); blocked.one("ConfirmationModal").onConfirm();
+    for (let i = 0; i < 2; i++) { assert.equal(listCard(list, i).completionDisabled, true); listCard(list, i).onToggleCompleted(); calendar.all("ScheduleCard")[i].onToggleCompleted(); }
+    const create = h.mount("create"); fillCreation(h, create); assert.equal(createButton(create).disabled, true); await createButton(create).onPress();
+    await h.settle(); assert.equal(h.calls.length, 4);
+    assert.equal(deleteButton(screen).disabled, false); confirmDelete(h, screen); screen.one("ConfirmationModal").onDismiss(); await h.settle();
+    assert.equal(deleteCalls(h).length, 1); assert.match(h.calls[4].url, new RegExp(`${target}$`)); noContent(h, 4); await h.settle();
+    await respondLists(h, 5, [dto(other)]); assert.deepEqual(list.one("FlatList").data.map((s) => s.id), [other]);
+    assert.equal(patches(h).length, 0); assert.strictEqual(h.mock.getState().schedules, before);
+  } finally { h.close(); }
+});
+
+test("J 대상 설정 누락·잘못된 ID는 UI·handler·Store에서 모두 차단", async () => {
+  const target = randomUUID();
+  for (const writeScope of ["target-patch", "target-delete"]) for (const writeTargetId of [undefined, "invalid", `${target} `]) {
+    const h = harness("server", { writeScope, writeTargetId }); try {
+      const { list } = await completionScreens(h, [dto(target)]), screen = await editableDetail(h, target); editTitle(h, screen);
+      assert.equal(saveButton(screen).disabled, true); assert.equal(deleteButton(screen).disabled, true); assert.equal(listCard(list).completionDisabled, true);
+      saveButton(screen).onPress(); deleteButton(screen).onPress(); h.flush(); screen.one("ConfirmationModal").onConfirm(); listCard(list).onToggleCompleted();
+      const serverId = h.server.store.getState().serverId; await h.server.toggleCompleted(serverId, target); await h.server.deleteSchedule(serverId, target);
+      await h.settle(); assert.equal(h.calls.length, 3); assert.deepEqual(h.navigations, []);
+    } finally { h.close(); }
+  }
+});
+
+test("J target scope도 Mock 화면 생성·수정·완료·삭제 CRUD 및 HTTP 0회 유지", async () => {
+  for (const writeScope of ["target-patch", "target-delete"]) for (const writeTargetId of [undefined, randomUUID()]) {
+    const h = harness("mock", { writeScope, writeTargetId }); try {
+      const create = h.mount("create"); fillCreation(h, create); await createButton(create).onPress(); h.flush();
+      const added = h.mock.getState().schedules.at(-1); assert.equal(h.mock.getState().schedules.length, 11);
+      const edit = h.mount("detail", added.id); editTitle(h, edit); saveButton(edit).onPress(); h.flush();
+      assert.equal(h.mock.getState().schedules.at(-1).title, "수정 입력"); h.mock.getState().toggleCompleted(added.id); assert.equal(h.mock.getState().schedules.at(-1).completed, true);
+      const remove = h.mount("detail", added.id); confirmDelete(h, remove); remove.one("ConfirmationModal").onDismiss(); h.flush();
+      assert.equal(h.mock.getState().schedules.length, 10); assert.equal(h.calls.length, 0);
+    } finally { h.close(); }
+  }
+});
+
+test("J scope·target ID는 정적 Expo 환경 참조이며 __DEV__ 및 값 로그 없음", () => {
+  const source = fs.readFileSync(path.join(root, "src/stores/scheduleDataModeStore.ts"), "utf8");
+  assert.match(source, /process\.env\.EXPO_PUBLIC_SCHEDULE_WRITE_SCOPE/);
+  assert.match(source, /process\.env\.EXPO_PUBLIC_SCHEDULE_WRITE_TARGET_ID/);
+  assert.doesNotMatch(source, /__DEV__|console\./);
+});
+
+test("J 기본 전송은 GET의 기존 fetch를 유지하고 쓰기만 Expo fetch의 redirect error 사용", async () => {
+  const target = randomUUID();
+  for (const writeScope of ["create", "target-patch", "target-delete"]) {
+    const h = harness("server", { writeScope, writeTargetId: target }); try {
+      // fetchImpl을 주입하지 않은 제품 기본 경로를 실행하되 두 transport는 모두 메모리 대역이다.
+      const client = h.source("src/services/api/http.ts").createScheduleHttpClient();
+      const read = client.request({ path: `/schedules/${target}` }); await h.settle();
+      assert.equal(h.calls[0].transport, "global"); assert.equal(h.calls[0].redirect, "follow"); h.detail(0, dto(target)); await read;
+      const method = writeScope === "create" ? "POST" : writeScope === "target-patch" ? "PATCH" : "DELETE";
+      const write = client.request({ method, path: method === "POST" ? "/schedules" : `/schedules/${target}` }); await h.settle();
+      assert.equal(h.calls[1].transport, "expo"); assert.equal(h.calls[1].redirect, "error");
+      if (method === "DELETE") noContent(h, 1); else h.detail(1, dto(target), method === "POST" ? 201 : 200);
+      assert.equal((await write).ok, true);
+    } finally { h.close(); }
+  }
 });

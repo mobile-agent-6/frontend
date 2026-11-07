@@ -20,6 +20,7 @@ function loader() {
       if (name === "zustand" || name === "zustand/vanilla") return require(name);
       if (name === "react") return require(name);
       if (name === "expo-crypto") return { randomUUID: require("node:crypto").randomUUID };
+      if (name === "expo/fetch") return { fetch: () => { throw new Error("실제 네트워크 요청 금지"); } };
       assert.ok(name.startsWith("@/"));
       return load(path.join(root, "src", `${name.slice(2)}.ts`));
     };

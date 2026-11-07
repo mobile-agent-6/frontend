@@ -25,6 +25,7 @@ function loadSource(file, timers = { setTimeout, clearTimeout }) {
     const resolve = (name) => {
       // Expo native 모듈을 로드하지 않고 기존 UUID API만 Node 구현으로 대체한다.
       if (name === "expo-crypto") return { randomUUID: require("node:crypto").randomUUID };
+      if (name === "expo/fetch") return { fetch: () => { throw new Error("실제 네트워크 요청 금지"); } };
       if (name === "zustand/vanilla") return require(name);
       assert.ok(name.startsWith("@/"), "앱 내부 순수 모듈만 로드한다.");
       return load(path.join(root, "src", `${name.slice(2)}.ts`));
