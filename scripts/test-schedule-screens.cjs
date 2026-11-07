@@ -93,7 +93,9 @@ function harness(initialMode, { allowCreation = false, writeScope, allowPatch = 
   if (allowPatch) {
     const originalPolicy = modeModule.isScheduleRequestAllowed;
     modeModule.isScheduleRequestAllowed = (method, path) =>
-      (method === "PATCH" && /^\/schedules\/[^/]+$/.test(path)) || originalPolicy(method, path);
+      (method === "PATCH" && (Array.isArray(allowPatch)
+        ? allowPatch.some((id) => path === `/schedules/${encodeURIComponent(id)}`)
+        : /^\/schedules\/[^/]+$/.test(path))) || originalPolicy(method, path);
   }
   // 테스트 전용 환경값으로 실제 정책을 사용한다. 네트워크는 항상 메모리 fetch다.
   const mode = modeModule.scheduleDataModeStore;
@@ -851,4 +853,281 @@ test("PATCH timeout은 결과 불확실·입력 유지·새 PATCH 차단", async
     assert.match(formText(screen), /수정 결과/); assert.equal(screen.one("TextInput").value, "수정 입력");
     saveButton(screen).onPress(); await h.settle(); assert.equal(h.calls.length, 3); assert.deepEqual(h.navigations, []);
   } finally { h.close(); }
+});
+
+const listCard = (screen, index = 0) => screen.one("FlatList").renderItem({ item: screen.one("FlatList").data[index] }).props;
+const completionNotice = (screen) => screen.all("ScheduleListState").find((p) => /완료|변경할 일정|서버의 현재 상태|목록을 갱신/.test(p.errorTitle ?? ""));
+const patches = (h) => h.calls.filter((c) => c.method === "PATCH");
+async function completionScreens(h, items = [dto("target")]) {
+  const list = h.mount("index"), calendar = h.mount("calendar"); await h.settle();
+  h.respond(0, items); h.respond(1, items); await h.settle();
+  return { list, calendar };
+}
+async function respondLists(h, start, items, status = 200) {
+  for (let i = start; i < h.calls.length; i++) if (h.calls[i].method === "GET") h.respond(i, items, status);
+  await h.settle();
+}
+
+test("H Mock 완료 true/false는 두 화면에 반영되며 HTTP 요청 0회", async () => {
+  const h = harness("mock"); try {
+    const list = h.mount("index"), calendar = h.mount("calendar");
+    const original = listCard(list).schedule;
+    listCard(list).onToggleCompleted(); h.flush();
+    assert.equal(h.mock.getState().schedules.find((s) => s.id === original.id).completed, !original.completed);
+    listCard(list).onToggleCompleted(); h.flush();
+    assert.equal(listCard(list).schedule.completed, original.completed);
+    calendar.all("ScheduleCard")[0]?.onToggleCompleted(); h.flush();
+    assert.equal(h.calls.length, 0);
+  } finally { h.close(); }
+});
+
+test("H completed만 true/false PATCH·key 없음·낙관적 공유 표시·현재 목록과 월 재조회", async () => {
+  const h = harness("server", { allowPatch: true }); try {
+    const { list, calendar } = await completionScreens(h); const before = h.mock.getState().schedules;
+    for (const target of [true, false]) {
+      const start = h.calls.length;
+      listCard(list).onToggleCompleted(); h.flush();
+      assert.equal(listCard(list).schedule.completed, target);
+      assert.equal(calendar.all("ScheduleCard")[0].schedule.completed, target);
+      assert.equal(listCard(list).completionDisabled, true);
+      await h.settle(); assert.deepEqual(JSON.parse(h.calls[start].body), { completed: target });
+      assert.equal(h.calls[start].headers.has("Idempotency-Key"), false);
+      h.detail(start, dto("target", "INVENTORY", target)); await h.settle();
+      assert.equal(Object.values(h.server.store.getState().servers)[0].entities.target.completed, target);
+      assert.equal(h.calls.length, start + 3);
+      assert.deepEqual(h.calls.slice(start + 1).map((c) => new URL(c.url).search), h.calls.slice(0, 2).map((c) => new URL(c.url).search));
+      await respondLists(h, start + 1, [dto("target", "INVENTORY", target)]);
+      assert.equal(listCard(list).completionDisabled, false);
+    }
+    assert.equal(patches(h).length, 2); assert.strictEqual(h.mock.getState().schedules, before);
+  } finally { h.close(); }
+});
+
+test("H 두 화면의 빠른 연속 입력은 동일 일정 PATCH 1회, 다른 일정은 독립 처리", async () => {
+  const h = harness("server", { allowPatch: true }); try {
+    const { list, calendar } = await completionScreens(h, [dto("target"), dto("other")]);
+    const stale = listCard(list).onToggleCompleted;
+    stale(); stale(); calendar.all("ScheduleCard")[0].onToggleCompleted(); h.flush();
+    listCard(list, 1).onToggleCompleted(); await h.settle();
+    assert.equal(patches(h).length, 2); assert.notEqual(patches(h)[0].url, patches(h)[1].url);
+    h.detail(2, dto("target", "INVENTORY", true)); h.detail(3, dto("other", "INVENTORY", true)); await h.settle();
+    await respondLists(h, 4, [dto("target", "INVENTORY", true), dto("other", "INVENTORY", true)]);
+    assert.ok(list.one("FlatList").data.every((s) => s.completed));
+  } finally { h.close(); }
+});
+
+test("H 확정 404·422는 completed rollback과 안내, 재시도 버튼은 GET만 실행", async () => {
+  for (const [status, code] of [[404, "SCHEDULE_NOT_FOUND"], [422, "VALIDATION_ERROR"]]) {
+    const h = harness("server", { allowPatch: true }); try {
+      const { list, calendar } = await completionScreens(h);
+      listCard(list).onToggleCompleted(); await h.settle();
+      h.detail(2, { ...notFoundProblem(), status, code }, status, "application/problem+json"); await h.settle();
+      assert.equal(listCard(list).schedule.completed, false); assert.equal(calendar.all("ScheduleCard")[0].schedule.completed, false);
+      assert.ok(completionNotice(list)); completionNotice(list).onRetry(); await h.settle();
+      assert.ok(h.calls.slice(3).every((c) => c.method === "GET")); await respondLists(h, 3, [dto("target")]);
+      assert.equal(patches(h).length, 1);
+    } finally { h.close(); }
+  }
+});
+
+test("H 네트워크 결과 불확실은 두 화면 잠금·GET 확인 후 현재값 표시", async () => {
+  const h = harness("server", { allowPatch: true }); try {
+    const { list, calendar } = await completionScreens(h);
+    listCard(list).onToggleCompleted(); await h.settle();
+    h.calls[2].reject(new Error("memory")); await h.settle(); h.calls[3].reject(new Error("memory")); await h.settle();
+    assert.equal(h.calls[2].body, h.calls[3].body); assert.equal(listCard(list).completionDisabled, true);
+    assert.equal(calendar.all("ScheduleCard")[0].completionDisabled, true);
+    assert.match(completionNotice(list).errorTitle, /확인/);
+    listCard(list).onToggleCompleted(); calendar.all("ScheduleCard")[0].onToggleCompleted(); await h.settle();
+    assert.equal(patches(h).length, 2);
+    completionNotice(list).onRetry(); completionNotice(calendar).onRetry(); await h.settle();
+    assert.equal(h.calls.length, 5); assert.equal(h.calls[4].method, "GET");
+    h.detail(4, dto("target", "INVENTORY", true)); await h.settle();
+    await respondLists(h, 5, [dto("target", "INVENTORY", true)]);
+    assert.equal(listCard(list).schedule.completed, true); assert.equal(listCard(list).completionDisabled, false);
+    assert.match(completionNotice(list).errorTitle, /이전 PATCH의 성공 여부를 뜻하지/); assert.equal(patches(h).length, 2);
+  } finally { h.close(); }
+});
+
+test("H timeout 불확실 뒤 GET 실패는 원래 잠금과 안내 유지", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const h = harness("server", { allowPatch: true }); try {
+    const { list } = await completionScreens(h);
+    listCard(list).onToggleCompleted(); await h.settle();
+    t.mock.timers.tick(10_000); await h.settle(); t.mock.timers.tick(10_000); await h.settle();
+    assert.equal(patches(h).length, 2); assert.equal(listCard(list).completionDisabled, true);
+    assert.match(completionNotice(list).errorTitle, /결과를 확인/);
+    completionNotice(list).onRetry(); await h.settle(); h.respond(4, [], 500); await h.settle();
+    assert.equal(listCard(list).completionDisabled, true); listCard(list).onToggleCompleted(); await h.settle();
+    assert.equal(patches(h).length, 2);
+  } finally { h.close(); }
+});
+
+test("H 응답 ID 불일치는 불확실 처리하며 다른 entity 삽입 금지", async () => {
+  const h = harness("server", { allowPatch: true }); try {
+    const { list } = await completionScreens(h); listCard(list).onToggleCompleted(); await h.settle();
+    h.detail(2, dto("wrong", "INVENTORY", true)); await h.settle();
+    const cache = Object.values(h.server.store.getState().servers)[0];
+    assert.equal(cache.entities.wrong, undefined); assert.equal(cache.entities.target.completed, false);
+    assert.equal(listCard(list).completionDisabled, true); assert.match(completionNotice(list).errorTitle, /결과를 확인/);
+  } finally { h.close(); }
+});
+
+test("H PATCH 성공 후 목록 GET 실패는 성공 유지하고 GET-only 재시도", async () => {
+  const h = harness("server", { allowPatch: true }); try {
+    const { list, calendar } = await completionScreens(h);
+    listCard(list).onToggleCompleted(); await h.settle(); h.detail(2, dto("target", "INVENTORY", true)); await h.settle();
+    h.respond(3, [], 500); h.respond(4, [dto("target", "INVENTORY", true)]); await h.settle();
+    assert.equal(listCard(list).schedule.completed, true); assert.match(completionNotice(list).errorTitle, /변경되었지만/);
+    listCard(list).onToggleCompleted(); completionNotice(calendar).onRetry(); await h.settle();
+    assert.equal(h.calls.length, 6); assert.equal(h.calls[5].url, h.calls[3].url); assert.equal(h.calls[5].method, "GET");
+    h.respond(5, [dto("target", "INVENTORY", true)]); await h.settle(); assert.equal(patches(h).length, 1);
+  } finally { h.close(); }
+});
+
+test("H 일반 수정과 완료 토글은 양방향으로 공유 잠금 적용", async () => {
+  for (const first of ["edit", "completion"]) {
+    const h = harness("server", { allowPatch: true }); try {
+      const { list } = await completionScreens(h); const screen = await editableDetail(h); editTitle(h, screen);
+      if (first === "edit") { saveButton(screen).onPress(); h.flush(); listCard(list).onToggleCompleted(); }
+      else { listCard(list).onToggleCompleted(); h.flush(); saveButton(screen).onPress(); }
+      await h.settle(); assert.equal(patches(h).length, 1);
+      assert.deepEqual(JSON.parse(patches(h)[0].body), first === "edit" ? { title: "수정 입력" } : { completed: true });
+      assert.equal(listCard(list).completionDisabled, true); assert.equal(saveButton(screen).disabled, true);
+    } finally { h.close(); }
+  }
+});
+
+test("H 불확실 일반 수정·완료 변경은 화면 재진입 후에도 상대 PATCH 차단", async () => {
+  for (const first of ["edit", "completion"]) {
+    const h = harness("server", { allowPatch: true }); try {
+      const { list } = await completionScreens(h); const screen = await editableDetail(h); editTitle(h, screen);
+      if (first === "edit") saveButton(screen).onPress(); else listCard(list).onToggleCompleted(); await h.settle();
+      h.calls[3].reject(new Error("memory")); await h.settle(); h.calls[4].reject(new Error("memory")); await h.settle();
+      screen.close(); const reopened = h.mount("detail", "target"); await h.settle();
+      // 재진입의 단건 GET만으로 이전 write 잠금을 해제하지 않는다.
+      if (h.calls[5]) { h.detail(5, dto("target")); await h.settle(); }
+      editTitle(h, reopened); saveButton(reopened).onPress(); listCard(list).onToggleCompleted(); await h.settle();
+      assert.equal(patches(h).length, 2); assert.equal(listCard(list).completionDisabled, true);
+    } finally { h.close(); }
+  }
+});
+
+test("H 토글 중 화면 해제 후에도 PATCH 결과를 공유하고 재진입 중복 요청 차단", async () => {
+  const h = harness("server", { allowPatch: true }); try {
+    const { list, calendar } = await completionScreens(h); listCard(list).onToggleCompleted(); await h.settle(); list.close();
+    calendar.all("ScheduleCard")[0].onToggleCompleted(); await h.settle(); assert.equal(patches(h).length, 1);
+    h.detail(2, dto("target", "INVENTORY", true)); await h.settle();
+    await respondLists(h, 3, [dto("target", "INVENTORY", true)]);
+    assert.equal(calendar.all("ScheduleCard")[0].schedule.completed, true);
+    const reopened = h.mount("index"); await h.settle(); await respondLists(h, h.calls.length - 1, [dto("target", "INVENTORY", true)]);
+    assert.equal(listCard(reopened).schedule.completed, true); assert.equal(patches(h).length, 1);
+  } finally { h.close(); }
+});
+
+test("H 서버·모드 변경은 이전 PATCH와 늦은 응답을 무효화하고 Mock 데이터 보존", async () => {
+  for (const change of ["mode", "server"]) {
+    const h = harness("server", { allowPatch: true }); try {
+      const { list } = await completionScreens(h); const before = h.mock.getState().schedules;
+      listCard(list).onToggleCompleted(); await h.settle();
+      if (change === "mode") h.mode("mock"); else h.config("https://other.example.invalid"); await h.settle();
+      assert.equal(h.calls[2].signal.aborted, true); h.detail(2, dto("target", "INVENTORY", true)); await h.settle();
+      assert.strictEqual(h.mock.getState().schedules, before);
+      const caches = Object.values(h.server.store.getState().servers);
+      assert.ok(caches.every((c) => c.entities.target?.completed !== true)); assert.equal(patches(h).length, 1);
+    } finally { h.close(); }
+  }
+});
+
+test("H 토글 전·처리 중 시작한 늦은 GET은 성공 PATCH를 덮지 않음", async () => {
+  const h = harness("server", { allowPatch: true }); try {
+    const { list } = await completionScreens(h);
+    const query = h.source("src/utils/schedule-query.ts").getMainScheduleRange(new Date("2026-11-07T03:00:00Z"));
+    const old = h.server.retry(query); await h.settle(); listCard(list).onToggleCompleted(); await h.settle();
+    assert.equal(h.calls[2].signal.aborted, true);
+    const during = h.server.retry(query); await h.settle();
+    assert.equal(listCard(list).schedule.completed, true);
+    h.detail(3, dto("target", "INVENTORY", true)); await h.settle(); assert.equal(h.calls[4].signal.aborted, true);
+    h.respond(2, [dto("target")]); h.respond(4, [dto("target")]); await Promise.all([old, during]); await h.settle();
+    assert.equal(listCard(list).schedule.completed, true); await respondLists(h, 5, [dto("target", "INVENTORY", true)]);
+  } finally { h.close(); }
+});
+
+test("H create 정책에서 카드·직접 handler·Store 호출·HTTP 경계 모두 PATCH 차단", async () => {
+  const h = harness("server", { writeScope: "create" }); try {
+    const { list, calendar } = await completionScreens(h);
+    const id = h.source("src/services/api/http.ts").scheduleHttpClient.getServerId();
+    assert.equal(listCard(list).completionDisabled, true); assert.equal(calendar.all("ScheduleCard")[0].completionDisabled, true);
+    listCard(list).onToggleCompleted(); calendar.all("ScheduleCard")[0].onToggleCompleted();
+    await h.server.toggleCompleted(id, "target");
+    const result = await h.source("src/services/api/schedules.ts").prepareScheduleUpdate("target", { completed: true }).operation.submit();
+    assert.equal(result.outcome, "not-sent"); assert.equal(result.error.policyReason, "read-only");
+    await h.settle(); assert.equal(h.calls.length, 2); assert.equal(listCard(list).schedule.completed, false);
+  } finally { h.close(); }
+});
+
+test("H 특정 ID 정책 주입은 허용 대상만 토글하며 카테고리 선택 유지", async () => {
+  const h = harness("server", { allowPatch: ["target"] }); try {
+    const { list, calendar } = await completionScreens(h, [dto("target"), dto("other", "OUTBOUND")]);
+    assert.equal(listCard(list, 1).completionDisabled, true); listCard(list, 1).onToggleCompleted();
+    list.one("CategoryFilter").onSelectCategory("재고"); h.flush();
+    listCard(list).onToggleCompleted(); await h.settle(); assert.equal(patches(h).length, 1);
+    assert.match(patches(h)[0].url, /\/target$/);
+    h.detail(2, dto("target", "INVENTORY", true)); await h.settle();
+    await respondLists(h, 3, [dto("target", "INVENTORY", true), dto("other", "OUTBOUND")]);
+    assert.equal(list.one("CategoryFilter").selectedCategory, "재고");
+    assert.equal(list.one("FlatList").data.length, 1); assert.equal(calendar.all("ScheduleCard")[0].schedule.completed, true);
+  } finally { h.close(); }
+});
+
+test("H completed·category 조건의 활성 GET도 그대로 재조회하며 부분 결과를 전체로 대체하지 않음", async () => {
+  const h = harness("server", { allowPatch: true }); let consumer;
+  try {
+    const { list } = await completionScreens(h);
+    const query = { ...h.source("src/utils/schedule-query.ts").getMainScheduleRange(new Date("2026-11-07T03:00:00Z")),
+      category: "INVENTORY", completed: false };
+    consumer = h.server.acquire(query); await h.settle(); h.respond(2, [dto("target")]); await h.settle();
+    listCard(list).onToggleCompleted(); await h.settle(); h.detail(3, dto("target", "INVENTORY", true)); await h.settle();
+    const filtered = h.calls.slice(4).find((c) => new URL(c.url).searchParams.get("completed") === "false");
+    assert.ok(filtered); assert.equal(new URL(filtered.url).searchParams.get("category"), "INVENTORY");
+    for (let i = 4; i < h.calls.length; i++) h.respond(i, h.calls[i] === filtered ? [] : [dto("target", "INVENTORY", true)]);
+    await h.settle(); assert.equal(list.one("FlatList").data.length, 1); assert.equal(listCard(list).schedule.completed, true);
+    const key = h.source("src/stores/serverScheduleStore.ts").scheduleQueryKey(h.server.store.getState().serverId, query);
+    assert.deepEqual(Object.values(h.server.store.getState().servers)[0].queries[key].ids, []);
+  } finally { consumer?.release(); h.close(); }
+});
+
+test("H 한 일정의 확정 실패 rollback은 다른 일정의 성공 상태를 보존", async () => {
+  const h = harness("server", { allowPatch: true }); try {
+    const { list } = await completionScreens(h, [dto("target"), dto("other")]);
+    listCard(list).onToggleCompleted(); h.flush(); listCard(list, 1).onToggleCompleted(); await h.settle();
+    h.detail(3, dto("other", "INVENTORY", true)); await h.settle();
+    h.detail(2, { ...notFoundProblem(), status: 422, code: "VALIDATION_ERROR" }, 422, "application/problem+json"); await h.settle();
+    assert.equal(listCard(list).schedule.completed, false); assert.equal(listCard(list, 1).schedule.completed, true);
+    await respondLists(h, 4, [dto("target"), dto("other", "INVENTORY", true)]);
+    assert.equal(listCard(list, 1).schedule.completed, true);
+  } finally { h.close(); }
+});
+
+test("H 불확실 GET의 원래 값도 현재 상태 확인으로만 처리하며 PATCH 재전송 없음", async () => {
+  const h = harness("server", { allowPatch: true }); try {
+    const { list } = await completionScreens(h);
+    listCard(list).onToggleCompleted(); await h.settle();
+    // 잘못된 성공 DTO는 재전송 없이 결과 확인 대상으로 전환한다.
+    h.detail(2, { invalid: true }); await h.settle(); completionNotice(list).onRetry(); await h.settle();
+    h.detail(3, dto("target")); await h.settle(); await respondLists(h, 4, [dto("target")]);
+    assert.equal(listCard(list).schedule.completed, false); assert.equal(listCard(list).completionDisabled, false);
+    assert.match(completionNotice(list).errorTitle, /이전 PATCH의 성공 여부를 뜻하지/); assert.equal(patches(h).length, 1);
+  } finally { h.close(); }
+});
+
+test("H 서버·모드 왕복 전환 전의 토글 callback은 재사용 불가", async () => {
+  for (const change of ["mode", "server"]) {
+    const h = harness("server", { allowPatch: true }); try {
+      const { list } = await completionScreens(h); const stale = listCard(list).onToggleCompleted;
+      if (change === "mode") { h.mode("mock"); h.mode("server"); }
+      else { h.config("https://other.example.invalid"); h.config("https://example.invalid"); }
+      stale(); await h.settle(); assert.equal(patches(h).length, 0);
+    } finally { h.close(); }
+  }
 });

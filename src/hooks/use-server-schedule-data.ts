@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef } from "react";
 import { useStore } from "zustand";
 
 import { getDevelopmentServerConfig } from "@/services/api/config";
+import { scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
 import { getScheduleCoverage, normalizeScheduleQuery, scheduleQueryKey, serverScheduleStore } from "@/stores/serverScheduleStore";
 import type { ScheduleDateRange, ScheduleListQuery } from "@/utils/schedule-query";
 
@@ -37,7 +38,11 @@ export function useServerScheduleData(query: ScheduleListQuery, enabled = false,
   const key = serverId && prepared.query ? scheduleQueryKey(serverId, prepared.query) : null;
   // effect가 서버 세대를 전환하기 전 렌더에서는 이전 서버의 성공 이력을 노출하지 않는다.
   const entry = key ? cache?.queries[key] : undefined;
-  const schedules = (entry?.ids ?? []).map((id) => cache!.entities[id]);
+  const schedules = (entry?.ids ?? []).map((id) => {
+    const schedule = cache!.entities[id], mutation = cache?.mutations[id];
+    return mutation?.kind === "completion" && mutation.phase === "pending" && mutation.completed !== undefined
+      ? { ...schedule, completed: mutation.completed } : schedule;
+  });
   const localError = enabled && (config.status !== "ready" ? {
     kind: "configuration" as const, configurationStatus: config.status, requestState: "not-sent" as const,
   } : prepared.invalid ? { kind: "request" as const, requestState: "not-sent" as const } : null);
@@ -55,6 +60,28 @@ export function useServerScheduleData(query: ScheduleListQuery, enabled = false,
     coverage: (from: string, to: string) => getScheduleCoverage(entry, from, to),
     retryRead: () => enabled ? subscription.current?.retry() ?? Promise.resolve() : Promise.resolve(),
     cancel: () => subscription.current?.release(),
+  };
+}
+
+/** 목록·캘린더는 같은 mutation 상태와 GET-only 복구를 사용한다. */
+export function useScheduleCompletion(serverId: string | null, enabled: boolean) {
+  const state = useStore(serverScheduleStore.store);
+  const generation = scheduleDataModeStore.getState().generation;
+  const mutations = serverId && state.serverId === serverId ? state.servers[serverId]?.mutations : undefined;
+  const notices = Object.entries(mutations ?? {}).filter(([, entry]) => entry.kind === "completion" && entry.message);
+  return {
+    completionError: notices.map(([, entry]) => entry.message).join(" ") || null,
+    completionDisabled: (id: string) => !enabled || !serverScheduleStore.completionAllowed(serverId, id) ||
+      ["pending", "uncertain", "refresh-error"].includes(mutations?.[id]?.phase ?? ""),
+    toggleCompleted: (id: string) => {
+      if (enabled && scheduleDataModeStore.getState().mode === "server" &&
+        generation === scheduleDataModeStore.getState().generation && state.generation === serverScheduleStore.store.getState().generation) {
+        void serverScheduleStore.toggleCompleted(serverId, id);
+      }
+    },
+    retryCompletion: () => {
+      if (enabled) void Promise.all(notices.map(([id]) => serverScheduleStore.checkCompletion(serverId, id)));
+    },
   };
 }
 

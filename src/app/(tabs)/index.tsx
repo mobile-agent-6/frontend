@@ -17,7 +17,7 @@ import { BottomTabInset, Spacing } from "@/constants/theme";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useTheme } from "@/hooks/use-theme";
 import { useScheduleData } from "@/hooks/use-schedule-data";
-import { useServerScheduleData } from "@/hooks/use-server-schedule-data";
+import { useScheduleCompletion, useServerScheduleData } from "@/hooks/use-server-schedule-data";
 import { isMockScheduleMode, scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
 import { getMainScheduleRange } from "@/utils/schedule-query";
 
@@ -30,13 +30,15 @@ export default function ScheduleListScreen() {
   const serverMode = useStore(scheduleDataModeStore, (state) => state.mode === "server");
   const mock = useScheduleData(!serverMode);
   const server = useServerScheduleData(getMainScheduleRange(new Date()), serverMode);
+  const completion = useScheduleCompletion(server.serverId, serverMode);
   const schedules = serverMode ? server.schedules : mock.schedules;
   const needsRefresh = serverMode && server.hasSuccessfulRead && server.stale && !server.isFetching && !server.error;
   const readError = serverMode ? Boolean(server.error) || needsRefresh : mock.readError;
   const hasSuccessfulRead = serverMode ? server.hasSuccessfulRead : mock.hasSuccessfulRead;
   const retryRead = serverMode ? server.retryRead : mock.retryRead;
-  const { retryCompletion, toggleCompleted, canOpenSchedule } = mock;
-  const completionError = serverMode ? null : mock.completionError;
+  const { toggleCompleted, canOpenSchedule } = mock;
+  const retryCompletion = serverMode ? completion.retryCompletion : mock.retryCompletion;
+  const completionError = serverMode ? completion.completionError : mock.completionError;
   const loading = serverMode && (server.initialLoading || server.isFetching);
   const canShowEmpty = serverMode ? server.success : !readError || hasSuccessfulRead;
 
@@ -108,7 +110,7 @@ export default function ScheduleListScreen() {
               {completionError && (
                 <ScheduleListState
                   state="error"
-                  errorTitle="완료 상태를 변경하지 못했어요."
+                  errorTitle={serverMode ? completion.completionError ?? undefined : "완료 상태를 변경하지 못했어요."}
                   onRetry={retryCompletion}
                 />
               )}
@@ -118,8 +120,8 @@ export default function ScheduleListScreen() {
         renderItem={({ item }) => (
           <ScheduleCard
             schedule={item}
-            completionDisabled={serverMode}
-            onToggleCompleted={() => isMockScheduleMode() && toggleCompleted(item)}
+            completionDisabled={serverMode && completion.completionDisabled(item.id)}
+            onToggleCompleted={() => serverMode ? completion.toggleCompleted(item.id) : isMockScheduleMode() && toggleCompleted(item)}
             onPress={() => (serverMode || canOpenSchedule()) &&
               router.push({
                 pathname: "/schedule/[id]",

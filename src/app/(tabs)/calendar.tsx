@@ -13,7 +13,7 @@ import { Spacing } from "@/constants/theme";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useTheme } from "@/hooks/use-theme";
 import { useScheduleData } from "@/hooks/use-schedule-data";
-import { useServerScheduleData } from "@/hooks/use-server-schedule-data";
+import { useScheduleCompletion, useServerScheduleData } from "@/hooks/use-server-schedule-data";
 import { isMockScheduleMode, scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
 import { getCalendarScheduleRange } from "@/utils/schedule-query";
 import { formatLocalDate } from "@/utils/schedule-date-time";
@@ -35,13 +35,15 @@ export default function CalendarScreen() {
   const dayEnd = new Date(Date.parse(dayStart) + 86_400_000).toISOString();
   const selected = useServerScheduleData(getCalendarScheduleRange(selectedDate.slice(0, 7)), serverMode,
     { from: dayStart, to: dayEnd });
+  const completion = useScheduleCompletion(selected.serverId, serverMode);
   const schedules = serverMode ? selected.schedules : mock.schedules;
   const needsRefresh = serverMode && selected.hasSuccessfulRead && selected.stale && !selected.isFetching && !selected.error;
   const readError = serverMode ? Boolean(selected.error) || needsRefresh : mock.readError;
   const hasSuccessfulRead = serverMode ? selected.hasSuccessfulRead : mock.hasSuccessfulRead;
   const retryRead = serverMode ? selected.retryRead : mock.retryRead;
-  const { retryCompletion, toggleCompleted, canOpenSchedule } = mock;
-  const completionError = serverMode ? null : mock.completionError;
+  const { toggleCompleted, canOpenSchedule } = mock;
+  const retryCompletion = serverMode ? completion.retryCompletion : mock.retryCompletion;
+  const completionError = serverMode ? completion.completionError : mock.completionError;
   const loading = serverMode && (selected.initialLoading || selected.isFetching);
   const canShowEmpty = serverMode ? selected.success && selected.coverage(dayStart, dayEnd) === "covered"
     : !readError || hasSuccessfulRead;
@@ -121,7 +123,7 @@ export default function CalendarScreen() {
           {completionError && (
             <ScheduleListState
               state="error"
-              errorTitle="완료 상태를 변경하지 못했어요."
+              errorTitle={serverMode ? completion.completionError ?? undefined : "완료 상태를 변경하지 못했어요."}
               onRetry={retryCompletion}
             />
           )}
@@ -141,8 +143,8 @@ export default function CalendarScreen() {
                 key={schedule.id}
                 schedule={schedule}
                 showDate={false}
-                completionDisabled={serverMode}
-                onToggleCompleted={() => isMockScheduleMode() && toggleCompleted(schedule)}
+                completionDisabled={serverMode && completion.completionDisabled(schedule.id)}
+                onToggleCompleted={() => serverMode ? completion.toggleCompleted(schedule.id) : isMockScheduleMode() && toggleCompleted(schedule)}
                 onPress={() => (serverMode || canOpenSchedule()) &&
                   router.push({
                     pathname: "/schedule/[id]",

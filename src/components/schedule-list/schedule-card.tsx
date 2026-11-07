@@ -63,7 +63,7 @@ export function ScheduleCard({
         }
         accessibilityRole="checkbox"
         accessibilityState={{ checked: schedule.completed, disabled: completionDisabled }}
-        accessibilityHint={completionDisabled ? "서버 완료 상태 변경은 아직 준비 중입니다." : undefined}
+        accessibilityHint={completionDisabled ? "현재 완료 상태를 변경할 수 없습니다." : undefined}
         disabled={completionDisabled}
         hitSlop={Spacing.two}
         onPress={handleToggle}

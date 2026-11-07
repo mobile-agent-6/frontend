@@ -1,7 +1,8 @@
 import { createStore } from "zustand/vanilla";
 
 import { scheduleHttpClient, type HttpError } from "@/services/api/http";
-import { getSchedule, listSchedules } from "@/services/api/schedules";
+import { getSchedule, listSchedules, prepareScheduleUpdate } from "@/services/api/schedules";
+import { isScheduleRequestAllowed, scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
 import type { Schedule } from "@/types/schedule";
 import { parseScheduleApiDateTime } from "@/utils/schedule-mapper";
 import { buildScheduleListQuery, getMainScheduleRange, type ScheduleListQuery } from "@/utils/schedule-query";
@@ -15,14 +16,22 @@ export type ScheduleQueryEntry = {
   error: HttpError | null;
   sequence: number;
 };
+export type ScheduleMutationState = {
+  kind: "edit" | "completion";
+  phase: "pending" | "uncertain" | "refresh-error" | "error" | "checked";
+  completed?: boolean;
+  message?: string;
+  failedQueries?: ScheduleListQuery[];
+};
 type ServerCache = {
   entities: Record<string, Schedule>;
   entityVersions: Record<string, number>;
   queries: Record<string, ScheduleQueryEntry>;
   details: Record<string, Omit<ScheduleQueryEntry, "query" | "ids">>;
+  mutations: Record<string, ScheduleMutationState>;
 };
 type QueryState = { serverId: string | null; generation: number; servers: Record<string, ServerCache> };
-const emptyCache = (): ServerCache => ({ entities: {}, entityVersions: {}, queries: {}, details: {} });
+const emptyCache = (): ServerCache => ({ entities: {}, entityVersions: {}, queries: {}, details: {}, mutations: {} });
 
 // 목록과 단건이 같은 요청 순번·객체 원본을 사용한다. 서버 revision을 추정하지 않는다.
 function mergeEntities(cache: ServerCache, items: Schedule[], sequence: number) {
@@ -39,7 +48,7 @@ function mergeEntities(cache: ServerCache, items: Schedule[], sequence: number) 
     }
     entities[item.id] = { ...item }; entityVersions[item.id] = sequence;
   }
-  return { cache: { entities, entityVersions, queries, details }, stale };
+  return { cache: { ...cache, entities, entityVersions, queries, details }, stale };
 }
 
 export function normalizeScheduleQuery(query: ScheduleListQuery): ScheduleListQuery {
@@ -66,6 +75,34 @@ export function createServerScheduleStore({
   type Flight = { controller: AbortController; promise: Promise<void>; sequence: number; detailId?: string };
   const flights = new Map<string, Flight>();
   const consumers = new Map<string, Set<symbol>>();
+  const mutationLocks = new Map<string, symbol>();
+  const mutationControllers = new Map<symbol, AbortController>();
+  const checking = new Set<string>();
+
+  function setMutation(serverId: string, id: string, mutation: ScheduleMutationState | undefined) {
+    update(serverId, (cache) => {
+      const mutations = { ...cache.mutations };
+      if (mutation) mutations[id] = mutation; else delete mutations[id];
+      return { ...cache, mutations };
+    });
+  }
+  /** 화면 수명과 독립적인 일정별 잠금. 불확실한 작업은 GET 확인 전까지 보유한다. */
+  function beginMutation(serverId: string, id: string, kind: ScheduleMutationState["kind"]) {
+    if (syncServer() !== serverId) return null;
+    const key = JSON.stringify([serverId, id]);
+    if (mutationLocks.has(key) || checking.has(key)) return null;
+    const token = Symbol(), controller = new AbortController();
+    mutationLocks.set(key, token); mutationControllers.set(token, controller);
+    setMutation(serverId, id, { kind, phase: "pending" });
+    return { controller,
+      finish(blocked = false) {
+        if (mutationLocks.get(key) !== token) return;
+        mutationControllers.delete(token);
+        if (blocked) setMutation(serverId, id, { kind, phase: "uncertain" });
+        else { mutationLocks.delete(key); setMutation(serverId, id, undefined); }
+      },
+    };
+  }
 
   function update(serverId: string, change: (cache: ServerCache) => ServerCache) {
     store.setState((state) => ({ servers: { ...state.servers,
@@ -93,6 +130,7 @@ export function createServerScheduleStore({
   function syncServer() {
     const serverId = readServerId();
     if (serverId === store.getState().serverId) return serverId;
+    for (const controller of mutationControllers.values()) controller.abort();
     for (const key of flights.keys()) cancel(key);
     store.setState((state) => ({ serverId, generation: state.generation + 1,
       servers: Object.fromEntries(Object.entries(state.servers).map(([id, cache]) => [id, {
@@ -275,7 +313,95 @@ export function createServerScheduleStore({
     });
     return true;
   }
+
+  function completionAllowed(serverId: string | null, id: string) {
+    return Boolean(serverId) && scheduleDataModeStore.getState().mode === "server" &&
+      readServerId() === serverId && isScheduleRequestAllowed("PATCH", `/schedules/${encodeURIComponent(id)}`);
+  }
+  async function toggleCompleted(serverId: string | null, id: string) {
+    if (!completionAllowed(serverId, id) || !serverId) return;
+    const original = store.getState().servers[serverId]?.entities[id];
+    if (!original) return;
+    if (store.getState().servers[serverId]?.mutations[id]?.phase === "refresh-error") return;
+    const prepared = prepareScheduleUpdate(id, { completed: !original.completed });
+    if (!prepared.ok) return;
+    const lease = beginMutation(serverId, id, "completion");
+    if (!lease) return;
+    const completed = !original.completed;
+    const generation = scheduleDataModeStore.getState().generation;
+    const current = () => generation === scheduleDataModeStore.getState().generation &&
+      scheduleDataModeStore.getState().mode === "server" && syncServer() === serverId;
+    const unsubscribe = scheduleDataModeStore.subscribe((next) => {
+      if (next.generation !== generation) { lease.controller.abort(); invalidate(); }
+    });
+    let blocked = false, message: string | undefined, phase: ScheduleMutationState["phase"] = "error";
+    let failedQueries: ScheduleListQuery[] | undefined;
+    let confirmed = false;
+    invalidate();
+    setMutation(serverId, id, { kind: "completion", phase: "pending", completed });
+    try {
+      const result = await prepared.operation.submit(lease.controller.signal);
+      if ("response" in result && result.response.serverId === serverId && result.response.data.id === id && current()) {
+        confirmed = true;
+        applyScheduleResult(serverId, result.response.data);
+        // 응답의 실제 boolean을 사용한다. 재조회 중에는 낙관적 목표값을 덧씌우지 않는다.
+        setMutation(serverId, id, { kind: "completion", phase: "pending" });
+        const refresh = await refreshLists(serverId);
+        if (!refresh.ok) {
+          phase = "refresh-error"; failedQueries = refresh.failedQueries;
+          message = "완료 상태는 변경되었지만 목록을 갱신하지 못했어요. GET 조회만 다시 시도해 주세요.";
+        }
+      } else if ("response" in result || result.requiresReconciliation) {
+        blocked = true; phase = "uncertain";
+        message = "완료 변경 결과를 확인하지 못했어요. PATCH를 다시 보내지 않고 GET으로 상태를 확인해 주세요.";
+      } else {
+        // rollback은 이 작업의 completed에만 적용하고 다른 필드·다른 일정은 보존한다.
+        update(serverId, (cache) => cache.entities[id] ? { ...cache, entities: { ...cache.entities,
+          [id]: { ...cache.entities[id], completed: original.completed } } } : cache);
+        const code = "problem" in result.error ? result.error.problem?.code : undefined;
+        message = code === "SCHEDULE_NOT_FOUND" ? "변경할 일정을 찾을 수 없어요. GET으로 목록을 확인해 주세요."
+          : code === "VALIDATION_ERROR" ? "완료 상태 변경 요청이 거절되었어요. GET으로 상태를 확인해 주세요."
+          : "완료 상태를 변경하지 못했어요. GET으로 상태를 확인해 주세요.";
+      }
+    } catch {
+      blocked = !confirmed; phase = confirmed ? "refresh-error" : "uncertain";
+      message = confirmed ? "완료 상태는 변경되었지만 목록을 갱신하지 못했어요. GET 조회만 다시 시도해 주세요."
+        : "완료 변경 결과가 불확실해요. GET으로 상태를 확인해 주세요.";
+    } finally {
+      unsubscribe();
+      lease.finish(blocked);
+      if (message) setMutation(serverId, id, { kind: "completion", phase, message, failedQueries });
+    }
+  }
+
+  /** 완료 변경의 오류 UI는 항상 GET만 실행한다. 불확실한 PATCH를 재전송하지 않는다. */
+  async function checkCompletion(serverId: string | null, id: string) {
+    if (!serverId || scheduleDataModeStore.getState().mode !== "server" || syncServer() !== serverId) return;
+    const mutation = store.getState().servers[serverId]?.mutations[id];
+    const key = JSON.stringify([serverId, id]);
+    if (!mutation || mutation.kind !== "completion" || mutation.phase === "pending" || checking.has(key)) return;
+    const generation = scheduleDataModeStore.getState().generation;
+    checking.add(key);
+    try {
+      // 불확실 결과는 해당 ID의 단건을 먼저 확인하고 현재 목록 조건도 다시 조회한다.
+      if (mutation.phase === "uncertain") await fetchDetail(id, true);
+      if (generation !== scheduleDataModeStore.getState().generation || syncServer() !== serverId) return;
+      const detail = store.getState().servers[serverId]?.details[id];
+      const reconciled = mutation.phase !== "uncertain" ||
+        (detail?.status === "success" && !detail.stale) ||
+        (detail?.error?.kind === "http" && detail.error.status === 404 && detail.error.problem?.code === "SCHEDULE_NOT_FOUND");
+      if (!reconciled) return;
+      const refresh = await refreshLists(serverId, mutation.phase === "refresh-error" ? mutation.failedQueries : undefined);
+      if (generation !== scheduleDataModeStore.getState().generation || syncServer() !== serverId) return;
+      if (mutation.phase === "uncertain") mutationLocks.delete(key);
+      setMutation(serverId, id, refresh.ok ? (mutation.phase === "uncertain" ? { kind: "completion", phase: "checked",
+        message: "서버의 현재 상태를 조회했어요. 이전 PATCH의 성공 여부를 뜻하지 않아요." } : undefined)
+        : { kind: "completion", phase: "refresh-error", failedQueries: refresh.failedQueries,
+          message: "목록을 갱신하지 못했어요. GET 조회만 다시 시도해 주세요." });
+    } finally { checking.delete(key); }
+  }
   return { store, syncServer, acquire, acquireDetail, invalidate, refreshLists, applyScheduleResult,
+    beginMutation, completionAllowed, toggleCompleted, checkCompletion,
     retryDetail: (scheduleId: string) => fetchDetail(scheduleId, true),
     retry: (query: ScheduleListQuery) => fetchQuery(query, true) };
 }

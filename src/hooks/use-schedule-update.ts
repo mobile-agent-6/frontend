@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useStore } from "zustand";
 
 import { scheduleHttpClient } from "@/services/api/http";
 import { prepareScheduleUpdate } from "@/services/api/schedules";
@@ -10,6 +11,9 @@ import type { ScheduleListQuery } from "@/utils/schedule-query";
 
 /** 일반 수정 전용 흐름. 완료 토글·삭제·낙관적 변경은 실행하지 않는다. */
 export function useScheduleUpdate(scheduleId: string | undefined, serverId: string | null) {
+  const shared = useStore(serverScheduleStore.store);
+  const mutation = serverId && scheduleId ? shared.servers[serverId]?.mutations[scheduleId] : undefined;
+  const sharedBlocked = mutation?.phase === "pending" || mutation?.phase === "uncertain";
   const [busy, setBusy] = useState(false), [saved, setSaved] = useState(false);
   const [needsCheck, setNeedsCheck] = useState(false), [error, setError] = useState<string | null>(null);
   const locked = useRef(false), confirmed = useRef(false), uncertain = useRef(false), mounted = useRef(true);
@@ -25,7 +29,7 @@ export function useScheduleUpdate(scheduleId: string | undefined, serverId: stri
 
   async function save(original: Schedule, updates: Partial<Schedule>): Promise<boolean> {
     if (!mounted.current || locked.current || confirmed.current || uncertain.current) return false;
-    if (!scheduleId || original.id !== scheduleId || !serverId || scheduleHttpClient.getServerId() !== serverId) {
+    if (scheduleDataModeStore.getState().mode !== "server" || !scheduleId || original.id !== scheduleId || !serverId || scheduleHttpClient.getServerId() !== serverId) {
       setError("수정 대상과 서버 설정을 다시 확인해 주세요."); return false;
     }
     if (!isScheduleRequestAllowed("PATCH", `/schedules/${encodeURIComponent(scheduleId)}`)) {
@@ -39,16 +43,18 @@ export function useScheduleUpdate(scheduleId: string | undefined, serverId: stri
     if (!Object.keys(payload).length) return false;
     const prepared = prepareScheduleUpdate(scheduleId, payload);
     if (!prepared.ok) { setError(Object.values(prepared.error.fields).join(" ")); return false; }
+    const lease = serverScheduleStore.beginMutation(serverId, scheduleId, "edit");
+    if (!lease) { setError("같은 일정의 변경 결과를 먼저 확인해 주세요."); return false; }
     const generation = scheduleDataModeStore.getState().generation;
     const currentScreen = () => mounted.current && generation === scheduleDataModeStore.getState().generation &&
       scheduleHttpClient.getServerId() === serverId;
     locked.current = true; setBusy(true); setError(null);
-    controller.current = new AbortController();
+    controller.current = lease.controller;
     try {
       serverScheduleStore.syncServer(); serverScheduleStore.invalidate();
       const result = await prepared.operation.submit(controller.current.signal);
       if ("response" in result) {
-        if (result.response.data.id !== scheduleId) {
+        if (result.response.data.id !== scheduleId || result.response.serverId !== serverId || !currentScreen()) {
           uncertain.current = true;
           if (currentScreen()) { setNeedsCheck(true); setError("응답의 대상 ID가 일치하지 않아요. GET으로 대상 상태를 확인해 주세요."); }
           return false;
@@ -78,7 +84,7 @@ export function useScheduleUpdate(scheduleId: string | undefined, serverId: stri
         ? "일정은 수정되었지만 목록을 갱신하지 못했어요. GET 조회만 다시 시도해 주세요."
         : "수정 결과를 확인하지 못했어요. 서버 상태를 먼저 확인해 주세요."); }
       return false;
-    } finally { locked.current = false; if (mounted.current) setBusy(false); }
+    } finally { lease.finish(uncertain.current); locked.current = false; if (mounted.current) setBusy(false); }
   }
 
   async function retryGet(): Promise<boolean> {
@@ -109,5 +115,5 @@ export function useScheduleUpdate(scheduleId: string | undefined, serverId: stri
       return false;
     } finally { locked.current = false; if (mounted.current) setBusy(false); }
   }
-  return { save, retryGet, busy, saved, needsCheck, blocked: saved || needsCheck, error };
+  return { save, retryGet, busy, saved, needsCheck, blocked: saved || needsCheck || sharedBlocked, error };
 }
