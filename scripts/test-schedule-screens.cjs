@@ -8,7 +8,7 @@ const root = path.resolve(__dirname, "..");
 
 // 실제 화면·Hook·서비스를 실행하되 native 컴포넌트와 React 실행기만 메모리 대역으로 둔다.
 // native 렌더링·레이아웃·아이폰 통신을 검증하는 테스트는 아니다.
-function harness() {
+function harness(initialMode) {
   const modules = new Map(), screens = [], calls = [], navigations = [];
   let current;
   const mark = (owner) => { owner.dirty = true; if (owner.root) owner.root.dirty = true; };
@@ -67,6 +67,7 @@ function harness() {
       if (name === "@expo/ui/community/datetime-picker") return { DateTimePicker: "DateTimePicker" };
       if (name === "react-native-safe-area-context") return { SafeAreaView: "SafeAreaView" };
       if (name === "@/components/schedule-edit/schedule-edit-form") return source("src/components/schedule-edit/schedule-edit-form.tsx");
+      if (name === "@/components/schedule-create/schedule-create-form") return source("src/components/schedule-create/schedule-create-form.tsx");
       if (name.startsWith("@/components/")) {
         const component = name.split("/").at(-1).split("-").map((s) => s[0].toUpperCase() + s.slice(1)).join("");
         return { [component]: component };
@@ -75,8 +76,9 @@ function harness() {
       if (name === "@/hooks/use-color-scheme") return { useColorScheme: () => "light" };
       assert.ok(name.startsWith("@/")); return source(`src/${name.slice(2)}.ts`);
     };
-    new Function("require", "module", "exports", "fetch", "Date", code)(resolve, module, module.exports,
-      () => { throw new Error("실제 네트워크 요청 금지"); }, FixedDate);
+    new Function("require", "module", "exports", "fetch", "Date", "process", code)(resolve, module, module.exports,
+      () => { throw new Error("실제 네트워크 요청 금지"); }, FixedDate,
+      { env: { EXPO_PUBLIC_SCHEDULE_DATA_MODE: initialMode } });
     return module.exports;
   }
   const configModule = source("src/services/api/config.ts");
@@ -123,7 +125,7 @@ function harness() {
   }
   function mount(kind, routeId) {
     const s = { slots: [], effects: [], children: new Map(), dirty: true, routeId,
-      Screen: source(kind === "detail" ? "src/app/schedule/[id].tsx" : `src/app/(tabs)/${kind}.tsx`).default };
+      Screen: source(kind === "detail" ? "src/app/schedule/[id].tsx" : kind === "create" ? "src/app/schedule/create.tsx" : `src/app/(tabs)/${kind}.tsx`).default };
     screens.push(s); flush();
     return { all: (type) => nodes(s.tree, type), one: (type) => nodes(s.tree, type)[0],
       route(id) { s.routeId = id; s.dirty = true; flush(); },
@@ -433,5 +435,86 @@ test("더 최신 단건 이후 늦은 목록은 공유 객체를 되돌리지 �
     h.detail(1, { ...dto("target"), title: "최신 단건" }); await h.settle();
     h.respond(0, [{ ...dto("target"), title: "과거 목록" }]); await h.settle();
     assert.equal(list.one("FlatList").data[0].title, "최신 단건"); assert.equal(screen.one("TextInput").value, "최신 단건");
+  } finally { h.close(); }
+});
+
+test("모드 환경변수 미설정·mock·잘못된 값은 최초 렌더부터 Mock", async () => {
+  for (const value of [undefined, "mock", "invalid", "SERVER", ""]) {
+    const h = harness(value); try {
+      const list = h.mount("index"); assert.equal(list.one("FlatList").data.length, 10);
+      await h.settle(); assert.equal(h.calls.length, 0);
+    } finally { h.close(); }
+  }
+});
+test("server 환경변수는 최초 렌더부터 목록·캘린더·상세 GET 사용", async () => {
+  const h = harness("server"); try {
+    const list = h.mount("index"), calendar = h.mount("calendar"), detail = h.mount("detail", "target");
+    assert.deepEqual(list.one("FlatList").data, []); assert.equal(detail.one("TextInput"), undefined);
+    assert.deepEqual(calendar.one("MonthCalendar").scheduleDates, []); await h.settle();
+    assert.equal(h.calls.length, 3); assert.ok(h.calls.every((c) => c.method === "GET"));
+    h.respond(0, [dto("target")]); h.respond(1, [dto("target")]); h.detail(2, dto("target")); await h.settle();
+    assert.equal(list.one("FlatList").data.length, 1); assert.equal(detail.one("TextInput").value, "target");
+    assert.equal(calendar.all("ScheduleCard")[0].schedule.id, "target");
+    const modeCode = fs.readFileSync(path.join(root, "src/stores/scheduleDataModeStore.ts"), "utf8");
+    assert.doesNotMatch(modeCode, /__DEV__/); assert.match(modeCode, /process\.env\.EXPO_PUBLIC_SCHEDULE_DATA_MODE/);
+  } finally { h.close(); }
+});
+test("추가 화면 직접 진입은 서버 모드에서 저장 버튼·handler·가짜 navigation 차단", async () => {
+  const h = harness("server"); try {
+    const screen = h.mount("create"); const before = h.mock.getState().schedules;
+    screen.one("TextInput").onChangeText("차단 검증");
+    screen.one("ScheduleCategorySelector").onSelectCategory("재고");
+    screen.one("ScheduleDateField").onPress(); h.flush();
+    screen.one("DateTimePicker").onValueChange(null, new Date("2026-11-10T03:00:00Z")); h.flush();
+    screen.one("ScheduleTimeField").onPress(); h.flush();
+    screen.one("DateTimePicker").onValueChange(null, new Date("2026-11-10T03:00:00Z")); h.flush();
+    const button = screen.all("Button").find((p) => p.label === "저장"); assert.equal(button.disabled, true);
+    button.onPress(); h.flush(); await h.settle();
+    assert.strictEqual(h.mock.getState().schedules, before); assert.equal(h.calls.length, 0); assert.deepEqual(h.navigations, []);
+    assert.ok(screen.all("ThemedText").some((p) => String(p.children).includes("서버 조회만")));
+  } finally { h.close(); }
+});
+test("Mock 추가 폼은 기존 저장 및 navigation 유지", async () => {
+  const h = harness("mock"); try {
+    const screen = h.mount("create"); screen.one("TextInput").onChangeText("추가 회귀");
+    screen.one("ScheduleCategorySelector").onSelectCategory("재고"); screen.one("ScheduleDateField").onPress(); h.flush();
+    screen.one("DateTimePicker").onValueChange(null, new Date("2026-11-10T03:00:00Z")); h.flush();
+    screen.one("ScheduleTimeField").onPress(); h.flush();
+    screen.one("DateTimePicker").onValueChange(null, new Date("2026-11-10T03:00:00Z")); h.flush();
+    const button = screen.all("Button").find((p) => p.label === "저장"); assert.equal(button.disabled, false);
+    button.onPress(); h.flush(); await h.settle();
+    assert.equal(h.mock.getState().schedules.length, 11); assert.deepEqual(h.navigations, ["back"]); assert.equal(h.calls.length, 0);
+  } finally { h.close(); }
+});
+test("서버 Schedule 서비스 직접 POST·PATCH·DELETE는 미전송으로 차단", async () => {
+  const h = harness("server"); try {
+    const service = h.source("src/services/api/schedules.ts");
+    const operations = [
+      service.prepareScheduleCreation({ title: "검증", category: "INVENTORY", scheduledAt: "2026-11-10T03:00:00Z" }),
+      service.prepareScheduleUpdate("target", { title: "검증" }),
+      service.prepareScheduleUpdate("target", { completed: true }),
+      service.prepareScheduleDeletion("target"),
+    ];
+    for (const prepared of operations) {
+      assert.equal(prepared.ok, true); const result = await prepared.operation.submit();
+      assert.equal(result.outcome, "not-sent"); assert.equal(result.attempts, 0);
+      assert.equal(result.requiresReconciliation, false); assert.equal(result.error.policyReason, "read-only");
+    }
+    assert.equal(h.calls.length, 0);
+    const http = h.source("src/services/api/http.ts").scheduleHttpClient;
+    for (const method of ["POST", "PATCH", "DELETE"]) {
+      const result = await http.request({ method, path: "/system/time-sync" });
+      assert.equal(result.error.policyReason, "read-only");
+    }
+    assert.equal(h.calls.length, 0);
+  } finally { h.close(); }
+});
+test("쓰기 첫 시도 후 서버 모드로 변경되면 자동 retry 차단 및 불확실 결과 보존", async () => {
+  const h = harness("mock"); try {
+    const prepared = h.source("src/services/api/schedules.ts").prepareScheduleUpdate("target", { title: "검증" });
+    const pending = prepared.operation.submit(); await h.settle(); assert.equal(h.calls.length, 1);
+    h.mode("server"); h.calls[0].reject(new Error("메모리 네트워크 오류")); await pending;
+    const result = await pending; assert.equal(result.outcome, "uncertain"); assert.equal(result.requiresReconciliation, true);
+    assert.equal(h.calls.length, 1);
   } finally { h.close(); }
 });

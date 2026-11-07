@@ -23,8 +23,8 @@ function loader() {
       assert.ok(name.startsWith("@/"));
       return load(path.join(root, "src", `${name.slice(2)}.ts`));
     };
-    new Function("require", "module", "exports", "fetch", code)(resolve, module, module.exports,
-      () => { throw new Error("실제 네트워크 요청 금지"); });
+    new Function("require", "module", "exports", "fetch", "process", code)(resolve, module, module.exports,
+      () => { throw new Error("실제 네트워크 요청 금지"); }, { env: {} });
     return module.exports;
   }
   return (file) => load(path.join(root, file));

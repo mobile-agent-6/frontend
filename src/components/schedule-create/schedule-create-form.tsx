@@ -2,6 +2,7 @@ import { DateTimePicker } from "@expo/ui/community/datetime-picker";
 import * as Crypto from "expo-crypto";
 import { useRouter } from "expo-router";
 import { useRef, useState } from "react";
+import { useStore } from "zustand";
 import {
   Keyboard,
   KeyboardAvoidingView,
@@ -23,6 +24,7 @@ import { Spacing } from "@/constants/theme";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useTheme } from "@/hooks/use-theme";
 import { useScheduleStore } from "@/stores/scheduleStore";
+import { isMockScheduleMode, scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
 import type { Schedule, ScheduleCategory } from "@/types/schedule";
 import {
   createDatePickerValue,
@@ -35,6 +37,7 @@ export function ScheduleCreateForm() {
   const theme = useTheme();
   const colorScheme = useColorScheme();
   const router = useRouter();
+  const serverMode = useStore(scheduleDataModeStore, (state) => state.mode === "server");
   const addSchedule = useScheduleStore((state) => state.addSchedule);
   const [title, setTitle] = useState("");
   const [date, setDate] = useState<string | null>(null);
@@ -89,6 +92,11 @@ export function ScheduleCreateForm() {
   };
 
   const handleSave = () => {
+    if (!isMockScheduleMode()) {
+      setFormError("현재 서버 조회만 지원합니다. 일정 추가는 아직 사용할 수 없어요.");
+      return;
+    }
+    const generation = scheduleDataModeStore.getState().generation;
     if (saveLockedRef.current) {
       return;
     }
@@ -114,6 +122,7 @@ export function ScheduleCreateForm() {
         completed: false,
       };
 
+      if (!isMockScheduleMode(generation)) return;
       addSchedule(newSchedule);
     } catch {
       setFormError("일정을 저장하지 못했습니다. 다시 시도해 주세요.");
@@ -125,7 +134,7 @@ export function ScheduleCreateForm() {
     // 화면 이동에 오류가 나더라도 이 화면을 벗어날 때까지 저장 잠금을 유지한다.
     // 이미 저장한 일정을 저장 실패로 간주해 다시 등록하지 않도록 한다.
     try {
-      router.back();
+      if (isMockScheduleMode(generation)) router.back();
     } catch {
       setFormError("일정은 저장되었습니다. 뒤로가기로 이전 화면으로 돌아가 주세요.");
     }
@@ -215,13 +224,13 @@ export function ScheduleCreateForm() {
             onSelectCategory={setCategory}
           />
 
-          {formError ? (
+          {formError || serverMode ? (
             <View accessibilityRole="alert" style={styles.formError}>
               <ThemedText
                 type="small"
                 style={[styles.formErrorText, { color: theme.primary }]}
               >
-                {formError}
+                {serverMode ? "현재 서버 조회만 지원합니다. 일정 추가는 아직 사용할 수 없어요." : formError}
               </ThemedText>
             </View>
           ) : null}
@@ -240,7 +249,7 @@ export function ScheduleCreateForm() {
           <Button
             label="저장"
             onPress={handleSave}
-            disabled={!canSave || saveLocked}
+            disabled={serverMode || !canSave || saveLocked}
           />
         </SafeAreaView>
       </KeyboardAvoidingView>

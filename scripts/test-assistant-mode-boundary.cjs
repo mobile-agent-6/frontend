@@ -58,9 +58,9 @@ function harness() {
       assert.ok(name.startsWith("@/"), name);
       return load(path.join(root, "src", `${name.slice(2)}.ts`));
     };
-    new Function("require", "module", "exports", "fetch", "setTimeout", "clearTimeout", code)(
+    new Function("require", "module", "exports", "fetch", "setTimeout", "clearTimeout", "process", code)(
       resolve, module, module.exports, () => { throw new Error("실제 네트워크 요청 금지"); },
-      (fn) => { timers.set(++timerId, fn); return timerId; }, (id) => timers.delete(id));
+      (fn) => { timers.set(++timerId, fn); return timerId; }, (id) => timers.delete(id), { env: {} });
     return module.exports;
   }
   const source = (file) => load(path.join(root, file));

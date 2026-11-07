@@ -1,4 +1,5 @@
 import { getDevelopmentServerConfig } from "@/services/api/config";
+import { isScheduleRequestAllowed } from "@/stores/scheduleDataModeStore";
 
 export type ValidationErrorItem = {
   location: "body" | "query" | "header" | "path";
@@ -31,6 +32,8 @@ export type HttpError = {
   idempotentReplayed?: string | null;
   // 이전 자동 시도에서 처리 결과를 확인하지 못했는지 보존한다.
   unconfirmedAttempt?: boolean;
+  // 서버 Problem Details code와 별개인 로컬 요청 차단 사유다.
+  policyReason?: "read-only";
 };
 
 export type HttpResult<T> =
@@ -81,6 +84,12 @@ export function createScheduleHttpClient({
   readConfig?: typeof getDevelopmentServerConfig;
 } = {}) {
   async function request(options: ScheduleHttpRequest): Promise<HttpResult<unknown>> {
+    const method = options.method ?? "GET";
+    const blocked = (attempts: number): HttpResult<never> => ({ ok: false, attempts, error: {
+      kind: "request", policyReason: "read-only", requestState: attempts ? "unconfirmed" : "not-sent",
+      unconfirmedAttempt: attempts > 0,
+    } });
+    if (!isScheduleRequestAllowed(method)) return blocked(0);
     const initial = readConfig();
     if (initial.status !== "ready") {
       return { ok: false, attempts: 0, error: {
@@ -96,7 +105,6 @@ export function createScheduleHttpClient({
       return current.status === "ready" && current.config.serverId === config.serverId &&
         current.config.apiBaseUrl === config.apiBaseUrl;
     };
-    const method = options.method ?? "GET";
     let headers: Headers;
     let body: string | undefined;
     let url: string;
@@ -188,6 +196,7 @@ export function createScheduleHttpClient({
     }
 
     for (let index = 0; index < 2; index++) {
+      if (!isScheduleRequestAllowed(method)) return blocked(attempts);
       if (options.signal?.aborted || !isCurrentServer()) {
         return { ok: false, attempts, error: { kind: "aborted", requestState: attempts ? "unconfirmed" : "not-sent" } };
       }
