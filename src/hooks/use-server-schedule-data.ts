@@ -57,6 +57,10 @@ export function useServerScheduleData(query: ScheduleListQuery, enabled = false,
     initialError: Boolean(error) && !hasSuccessfulRead,
     refetchError: Boolean(error) && hasSuccessfulRead,
     stale: entry?.stale ?? true,
+    refreshPending: Object.values(cache?.mutations ?? {}).some((mutation) => mutation.phase === "pending"),
+    completionRefreshFailed: Boolean(key && Object.values(cache?.mutations ?? {}).some((mutation) =>
+      mutation.kind === "completion" && mutation.phase === "refresh-error" && mutation.message &&
+      mutation.failedQueries?.some((query) => scheduleQueryKey(serverId!, query) === key))),
     coverage: (from: string, to: string) => getScheduleCoverage(entry, from, to),
     retryRead: () => enabled ? subscription.current?.retry() ?? Promise.resolve() : Promise.resolve(),
     cancel: () => subscription.current?.release(),
@@ -71,6 +75,7 @@ export function useScheduleCompletion(serverId: string | null, enabled: boolean)
   const notices = Object.entries(mutations ?? {}).filter(([, entry]) => entry.kind === "completion" && entry.message);
   return {
     completionError: notices.map(([, entry]) => entry.message).join(" ") || null,
+    completionNoticeState: notices.every(([, entry]) => entry.phase === "checked") ? "notice" as const : "error" as const,
     completionDisabled: (id: string) => !enabled || !serverScheduleStore.completionAllowed(serverId, id) ||
       ["pending", "uncertain", "refresh-error"].includes(mutations?.[id]?.phase ?? ""),
     toggleCompleted: (id: string) => {
@@ -113,6 +118,7 @@ export function useServerScheduleDetail(scheduleId: string | undefined, enabled 
     initialLoading: enabled && !schedule && !error && !notFound,
     isFetching: entry?.status === "loading",
     hasSuccessfulRead: Boolean(schedule),
+    refreshPending: Boolean(scheduleId && cache?.mutations[scheduleId]?.phase === "pending"),
     stale: entry?.stale ?? true,
     retryRead: () => enabled ? subscription.current?.retry() ?? Promise.resolve() : Promise.resolve(),
   };

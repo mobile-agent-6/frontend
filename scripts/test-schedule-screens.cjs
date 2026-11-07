@@ -12,6 +12,8 @@ const root = path.resolve(__dirname, "..");
 function harness(initialMode, { allowCreation = false, writeScope, writeTargetId, allowPatch = false, allowDelete = false } = {}) {
   const modules = new Map(), screens = [], calls = [], navigations = [];
   let current;
+  const router = { push: (route) => navigations.push(route), back: () => navigations.push("back") };
+  const navigationRef = { isReady: () => true, addListener: () => () => {} };
   const mark = (owner) => { owner.dirty = true; if (owner.root) owner.root.dirty = true; };
   const same = (a, b) => a && b && a.length === b.length && a.every((v, i) => Object.is(v, b[i]));
   const react = {
@@ -29,6 +31,7 @@ function harness(initialMode, { allowCreation = false, writeScope, writeTargetId
       if (!same(current.slots[index]?.deps, deps)) current.slots[index] = { deps, value: fn() };
       return current.slots[index].value;
     },
+    useCallback(fn, deps) { return react.useMemo(() => fn, deps); },
     useEffect(fn, deps) {
       const owner = current, index = owner.cursor++;
       if (!same(owner.slots[index]?.deps, deps)) owner.effects.push(() => {
@@ -57,16 +60,25 @@ function harness(initialMode, { allowCreation = false, writeScope, writeTargetId
         const store = require("zustand/vanilla").createStore(initializer);
         return Object.assign((select) => useStore(store, select), store);
       } };
-      if (name === "expo-router") return { Stack: { Screen: "Stack.Screen" },
+      if (name === "expo-router") return { Stack: { Screen: "Stack.Screen" }, ThemeProvider: "ThemeProvider", DarkTheme: {}, DefaultTheme: {},
+        useNavigationContainerRef: () => navigationRef, usePathname: () => "/assistant",
+        useFocusEffect(effect) {
+          const owner = current.root ?? current;
+          react.useEffect(() => {
+            const subscription = { effect, cleanup: owner.focused ? effect() : undefined };
+            owner.focusEffects.add(subscription);
+            return () => { subscription.cleanup?.(); owner.focusEffects.delete(subscription); };
+          }, [effect]);
+        },
         useLocalSearchParams: () => ({ id: (current.root ?? current).routeId }),
-        useRouter: () => ({ push: (route) => navigations.push(route), back: () => navigations.push("back") }) };
+        useRouter: () => router };
       if (name === "expo-symbols") return { SymbolView: "SymbolView" };
       if (name === "expo-crypto") return { randomUUID: require("node:crypto").randomUUID };
       if (name === "expo/fetch") return { fetch: (url, options) => new Promise((resolve, reject) =>
         calls.push({ url, ...options, resolve, reject, transport: "expo" })) };
-      if (name === "@/constants/theme") return { Spacing: {}, BottomTabInset: 0 };
-      if (name === "react-native") return { ...Object.fromEntries(["FlatList", "Pressable", "View", "ScrollView", "TextInput", "KeyboardAvoidingView"].map((s) => [s, s])),
-        Platform: { OS: "ios" }, Keyboard: { dismiss() {} }, StyleSheet: { create: (s) => s } };
+      if (name === "@/constants/theme") return { Spacing: { half: 2, one: 4, two: 8, three: 16, four: 24, five: 32, six: 64 }, BottomTabInset: 0 };
+      if (name === "react-native") return { ...Object.fromEntries(["FlatList", "Pressable", "View", "ScrollView", "TextInput", "KeyboardAvoidingView", "ActivityIndicator"].map((s) => [s, s])),
+        Platform: { OS: "ios" }, useColorScheme: () => "light", Keyboard: { dismiss() {} }, StyleSheet: { create: (s) => s, hairlineWidth: 0.5 } };
       if (name === "@expo/ui/community/datetime-picker") return { DateTimePicker: "DateTimePicker" };
       if (name === "react-native-safe-area-context") return { SafeAreaView: "SafeAreaView" };
       if (name === "@/components/schedule-edit/schedule-edit-form") return source("src/components/schedule-edit/schedule-edit-form.tsx");
@@ -75,7 +87,7 @@ function harness(initialMode, { allowCreation = false, writeScope, writeTargetId
         const component = name.split("/").at(-1).split("-").map((s) => s[0].toUpperCase() + s.slice(1)).join("");
         return { [component]: component };
       }
-      if (name === "@/hooks/use-theme") return { useTheme: () => ({ background: "white" }) };
+      if (name === "@/hooks/use-theme") return { useTheme: () => ({ background: "white", primary: "#FB6C2D", destructive: "red" }) };
       if (name === "@/hooks/use-color-scheme") return { useColorScheme: () => "light" };
       assert.ok(name.startsWith("@/")); return source(`src/${name.slice(2)}.ts`);
     };
@@ -146,15 +158,25 @@ function harness(initialMode, { allowCreation = false, writeScope, writeTargetId
       ...nodes(tree.props?.ListEmptyComponent, type), ...nodes(tree.props?.ListHeaderComponent, type)];
   }
   function mount(kind, routeId) {
-    const s = { slots: [], effects: [], children: new Map(), dirty: true, routeId,
-      Screen: source(kind === "detail" ? "src/app/schedule/[id].tsx" : kind === "create" ? "src/app/schedule/create.tsx" : `src/app/(tabs)/${kind}.tsx`).default };
+    const s = { slots: [], effects: [], children: new Map(), dirty: true, routeId, focused: true, focusEffects: new Set(),
+      Screen: source(kind === "detail" ? "src/app/schedule/[id].tsx" : kind === "create" ? "src/app/schedule/create.tsx" : kind === "layout" ? "src/app/_layout.tsx" : `src/app/(tabs)/${kind}.tsx`).default };
     screens.push(s); flush();
     return { all: (type) => nodes(s.tree, type), one: (type) => nodes(s.tree, type)[0],
+      instance: (name) => [...s.children].find(([key]) => key.includes(`/${name}/`))?.[1],
+      focus(value) {
+        if (s.focused === value) return;
+        s.focused = value;
+        for (const subscription of s.focusEffects) {
+          subscription.cleanup?.(); subscription.cleanup = value ? subscription.effect() : undefined;
+        }
+        flush();
+      },
       route(id) { s.routeId = id; s.dirty = true; flush(); },
       close() { s.closed = true; s.slots.forEach((slot) => slot?.cleanup?.());
         s.children.forEach((child) => child.slots.forEach((slot) => slot?.cleanup?.())); } };
   }
   return { mount, calls, mock, server, flush, source, navigations,
+    back() { router.back(); }, // native 뒤로 가기 동작은 메모리 navigation으로만 모사한다.
     mode(value) { mode.getState().setMode(value); flush(); },
     config(value) { config = configModule.parseDevelopmentServerConfig(value); screens.forEach((s) => { s.dirty = true; }); flush(); },
     async settle() { for (let i = 0; i < 4; i++) { await new Promise(setImmediate); flush(); } },
@@ -209,12 +231,12 @@ test("최초 실패는 empty가 아니며 GET Retry 후 정상 0건", async () =
     h.respond(1, []); await h.settle(); assert.ok(states(list).includes("empty")); assert.ok(h.calls.every((c) => c.method === "GET"));
   } finally { h.close(); }
 });
-test("재조회 loading·실패에도 마지막 성공 카드와 오류 보존", async () => {
+test("재조회는 스피너 없이 마지막 성공 카드를 유지하고 실제 오류와 GET Retry 보존", async () => {
   const h = harness(); try {
     h.mode("server"); const list = h.mount("index"); await h.settle(); h.respond(0, [dto("kept")]); await h.settle();
     const q = h.source("src/utils/schedule-query.ts").getMainScheduleRange(new Date("2026-11-07T03:00:00Z"));
     const retry = h.server.retry(q); await h.settle(); assert.equal(list.one("FlatList").data[0].id, "kept");
-    assert.ok(states(list).includes("loading")); h.respond(1, [], 500); await retry; await h.settle();
+    assert.equal(states(list).includes("loading"), false); h.respond(1, [], 500); await retry; await h.settle();
     assert.equal(list.one("FlatList").data[0].id, "kept"); assert.ok(states(list).includes("error"));
   } finally { h.close(); }
 });
@@ -303,6 +325,8 @@ test("선택 월 조회 실패 Retry는 실패 query만 재실행하고 성공 �
 const mockId = "10000000-0000-4000-8000-000000000001";
 const notFoundProblem = (code = "SCHEDULE_NOT_FOUND") => ({ type: "test", title: "test", status: 404,
   detail: "test", instance: "/schedules", code, requestId: "test" });
+const validationProblem = () => ({ ...notFoundProblem("VALIDATION_ERROR"), status: 422,
+  errors: [{ location: "body", pointer: "/completed", code: "INVALID_TYPE", detail: "test" }] });
 const saveButton = (screen) => screen.all("Button").find((p) => p.label === "수정 완료");
 
 test("상세 Mock 수정·삭제와 모달/navigation 유지, 서버 요청 0회", async () => {
@@ -313,7 +337,7 @@ test("상세 Mock 수정·삭제와 모달/navigation 유지, 서버 요청 0회
         screen.one("TextInput").onChangeText("수정된 제목"); h.flush(); saveButton(screen).onPress(); h.flush();
         assert.equal(h.mock.getState().schedules.find((s) => s.id === mockId).title, "수정된 제목");
       } else {
-        screen.one("Stack.Screen").options.headerRight().props.onPress(); h.flush();
+        deleteButton(screen).onPress(); h.flush();
         assert.equal(screen.one("ConfirmationModal").visible, true);
         screen.one("ConfirmationModal").onConfirm(); h.flush(); screen.one("ConfirmationModal").onDismiss(); h.flush();
         assert.equal(h.mock.getState().schedules.some((s) => s.id === mockId), false);
@@ -325,7 +349,7 @@ test("상세 Mock 수정·삭제와 모달/navigation 유지, 서버 요청 0회
 test("cache 밖 상세 직접 진입·최초 loading·단건 성공은 월 coverage가 아님", async () => {
   const h = harness(); try {
     h.mode("server"); const screen = h.mount("detail", "opaque/id-v5"); await h.settle();
-    assert.ok(states(screen).includes("loading")); assert.equal(screen.one("TextInput"), undefined);
+    assert.ok(screen.one("ActivityIndicator")); assert.equal(screen.one("TextInput"), undefined);
     assert.ok(h.calls[0].url.endsWith("/schedules/opaque%2Fid-v5"));
     h.detail(0, dto("opaque/id-v5")); await h.settle(); assert.equal(screen.one("TextInput").value, "opaque/id-v5");
     const cache = Object.values(h.server.store.getState().servers)[0];
@@ -400,8 +424,8 @@ test("서버 상세의 Mock 저장·삭제·가짜 성공/navigation은 UI와 ha
     await h.settle(); h.detail(0, dto(mockId)); await h.settle();
     screen.one("TextInput").onChangeText("저장 금지"); h.flush(); assert.equal(saveButton(screen).disabled, true);
     saveButton(screen).onPress();
-    const deletion = screen.one("Stack.Screen").options.headerRight(); assert.equal(deletion.props.disabled, true);
-    deletion.props.onPress(); screen.one("ConfirmationModal").onConfirm(); screen.one("ConfirmationModal").onDismiss(); h.flush();
+    assert.equal(deleteButton(screen).disabled, true);
+    deleteButton(screen).onPress(); screen.one("ConfirmationModal").onConfirm(); screen.one("ConfirmationModal").onDismiss(); h.flush();
     assert.strictEqual(h.mock.getState().schedules, before); assert.deepEqual(h.navigations, []);
     assert.equal(screen.one("ConfirmationModal").visible, false); assert.equal(h.calls.length, 1);
   } finally { h.close(); }
@@ -719,7 +743,7 @@ test("create scope의 최초 201·실제 replay 전송·409 메타데이터를 �
 test("create scope라도 수정·삭제·완료 및 Assistant UI 차단은 유지", async () => {
   const h = harness("server", { writeScope: "create" }); try {
     const screen = h.mount("detail", "target"); await h.settle(); h.detail(0, dto("target")); await h.settle();
-    assert.equal(saveButton(screen).disabled, true); assert.equal(screen.one("Stack.Screen").options.headerRight().props.disabled, true);
+    assert.equal(saveButton(screen).disabled, true); assert.equal(deleteButton(screen).disabled, true);
     const before = h.mock.getState().schedules;
     h.source("src/services/mock/assistant.ts").runMockAssistantScenario("내일 오후 3시 팀 회의 추가해 줘");
     assert.strictEqual(h.mock.getState().schedules, before);
@@ -932,7 +956,7 @@ test("H 확정 404·422는 completed rollback과 안내, 재시도 버튼은 GET
     const h = harness("server", { allowPatch: true }); try {
       const { list, calendar } = await completionScreens(h);
       listCard(list).onToggleCompleted(); await h.settle();
-      h.detail(2, { ...notFoundProblem(), status, code }, status, "application/problem+json"); await h.settle();
+      h.detail(2, status === 422 ? validationProblem() : { ...notFoundProblem(), status, code }, status, "application/problem+json"); await h.settle();
       assert.equal(listCard(list).schedule.completed, false); assert.equal(calendar.all("ScheduleCard")[0].schedule.completed, false);
       assert.ok(completionNotice(list)); completionNotice(list).onRetry(); await h.settle();
       assert.ok(h.calls.slice(3).every((c) => c.method === "GET")); await respondLists(h, 3, [dto("target")]);
@@ -1113,7 +1137,7 @@ test("H 한 일정의 확정 실패 rollback은 다른 일정의 성공 상태�
     const { list } = await completionScreens(h, [dto("target"), dto("other")]);
     listCard(list).onToggleCompleted(); h.flush(); listCard(list, 1).onToggleCompleted(); await h.settle();
     h.detail(3, dto("other", "INVENTORY", true)); await h.settle();
-    h.detail(2, { ...notFoundProblem(), status: 422, code: "VALIDATION_ERROR" }, 422, "application/problem+json"); await h.settle();
+    h.detail(2, validationProblem(), 422, "application/problem+json"); await h.settle();
     assert.equal(listCard(list).schedule.completed, false); assert.equal(listCard(list, 1).schedule.completed, true);
     await respondLists(h, 4, [dto("target"), dto("other", "INVENTORY", true)]);
     assert.equal(listCard(list, 1).schedule.completed, true);
@@ -1648,6 +1672,326 @@ test("J scope·target ID는 정적 Expo 환경 참조이며 __DEV__ 및 값 로�
   assert.match(source, /process\.env\.EXPO_PUBLIC_SCHEDULE_WRITE_SCOPE/);
   assert.match(source, /process\.env\.EXPO_PUBLIC_SCHEDULE_WRITE_TARGET_ID/);
   assert.doesNotMatch(source, /__DEV__|console\./);
+});
+
+const flatStyle = (style) => Object.assign({}, ...[style].flat(Infinity).filter(Boolean));
+const editHeader = (screen) => screen.one("Stack.Screen");
+const editContent = (screen) => screen.all("View").find((props) => props.testID === "schedule-edit-content");
+const feedbackPanel = (screen) => screen.all("ScrollView").find((props) => props.testID === "schedule-feedback");
+function assertStableCards(list, calendar) {
+  assert.equal(states(list).includes("loading"), false); assert.equal(states(calendar).includes("loading"), false);
+  assert.equal(list.one("FlatList").ListHeaderComponent, undefined);
+  assert.equal(flatStyle(calendar.all("View").find((props) => props.testID === "calendar-schedule-list").style).marginTop, 8);
+}
+
+test("H 빠른 수정 진입: PATCH가 진행 중 단건 GET을 취소해도 성공 cache와 입력 유지, 재조회 안내 없음", async () => {
+  for (const late of ["success", "failure"]) {
+    const h = harness("server", { allowPatch: true }); try {
+      const id = randomUUID(), { list, calendar } = await completionScreens(h, [dto(id)]);
+      listCard(list).onToggleCompleted(); await h.settle();
+      const screen = h.mount("detail", id); editTitle(h, screen, "빠른 진입 후 입력"); await h.settle();
+      assert.equal(h.calls[3].method, "GET");
+      h.detail(2, dto(id, "INVENTORY", true)); await h.settle();
+      assert.equal(h.calls[3].signal.aborted, true);
+      const cache = Object.values(h.server.store.getState().servers)[0];
+      assert.equal(cache.entities[id].completed, true); assert.equal(cache.details[id].stale, false);
+      assert.equal(cache.details[id].error, null); assert.equal(h.calls.length, 6);
+      if (late === "success") h.detail(3, dto(id)); else h.calls[3].reject(new Error("memory late GET"));
+      await respondLists(h, 4, [dto(id, "INVENTORY", true)]);
+      assert.deepEqual(screen.all("ScheduleListState"), []);
+      assert.equal(screen.one("TextInput").value, "빠른 진입 후 입력"); assert.equal(saveButton(screen).disabled, false);
+      assert.equal(listCard(list).schedule.completed, true); assert.equal(calendar.one("ScheduleCard").schedule.completed, true);
+      assert.equal(patches(h).length, 1);
+    } finally { h.close(); }
+  }
+});
+
+test("H 빠른 수정 진입: PATCH 성공 후 목록 GET 중 진입은 확인된 단건 cache를 재사용하고 오래된 목록 응답 무시", async () => {
+  const h = harness("server", { allowPatch: true }); try {
+    const id = randomUUID(), { list, calendar } = await completionScreens(h, [dto(id)]);
+    const query = h.source("src/utils/schedule-query.ts").getMainScheduleRange(new Date("2026-11-07T03:00:00Z"));
+    const old = h.server.retry(query); await h.settle();
+    listCard(list).onToggleCompleted(); await h.settle(); h.detail(3, dto(id, "INVENTORY", true)); await h.settle();
+    assert.equal(h.calls[2].signal.aborted, true); assert.equal(h.calls.length, 6);
+    const screen = h.mount("detail", id); editTitle(h, screen, "목록 재조회 중 입력"); await h.settle();
+    assert.equal(h.calls.length, 6); // PATCH 응답으로 확인된 같은 ID 단건의 불필요한 재조회 없음
+    h.respond(2, [dto(id)]); await old; await respondLists(h, 4, [dto(id, "INVENTORY", true)]);
+    assert.deepEqual(screen.all("ScheduleListState"), []); assert.equal(screen.one("ActivityIndicator"), undefined);
+    assert.equal(screen.one("TextInput").value, "목록 재조회 중 입력"); assert.equal(saveButton(screen).disabled, false);
+    assert.equal(listCard(list).schedule.completed, true); assert.equal(calendar.one("ScheduleCard").schedule.completed, true);
+    assert.equal(patches(h).length, 1);
+  } finally { h.close(); }
+});
+
+test("H 빠른 수정 진입: 목록 재조회 중 단건 GET의 정상 구독 해제는 오류·stale을 남기지 않고 재진입 입력 유지", async () => {
+  const h = harness("server", { allowPatch: true }); try {
+    const id = randomUUID(), { list, calendar } = await completionScreens(h, [dto(id)]);
+    listCard(list).onToggleCompleted(); await h.settle(); h.detail(2, dto(id, "INVENTORY", true)); await h.settle();
+    const first = h.mount("detail", id); const cancelled = h.server.retryDetail(id); await h.settle();
+    first.close(); await cancelled; await h.settle();
+    assert.equal(h.calls[5].signal.aborted, true);
+    const cache = Object.values(h.server.store.getState().servers)[0];
+    assert.equal(cache.details[id].error, null); assert.equal(cache.details[id].stale, false);
+    const screen = h.mount("detail", id); editTitle(h, screen, "재진입 후 입력"); await h.settle();
+    assert.equal(h.calls.length, 6); h.detail(5, dto(id));
+    h.respond(3, [dto(id, "INVENTORY", true)]); h.respond(4, [dto(id, "INVENTORY", true)]); await h.settle();
+    assert.deepEqual(screen.all("ScheduleListState"), []); assert.equal(screen.one("TextInput").value, "재진입 후 입력");
+    assert.equal(listCard(list).schedule.completed, true); assert.equal(calendar.one("ScheduleCard").schedule.completed, true);
+    assert.equal(patches(h).length, 1);
+  } finally { h.close(); }
+});
+
+test("H 빠른 수정 진입: 실제 단건 네트워크 실패는 cache·입력과 오류를 유지하며 GET-only Retry", async () => {
+  const h = harness("server", { allowPatch: true }); try {
+    const id = randomUUID(), { list, calendar } = await completionScreens(h, [dto(id)]);
+    listCard(list).onToggleCompleted(); await h.settle(); h.detail(2, dto(id, "INVENTORY", true)); await h.settle();
+    const screen = h.mount("detail", id); editTitle(h, screen, "통신 실패 중 입력");
+    const read = h.server.retryDetail(id); await h.settle();
+    h.respond(3, [dto(id, "INVENTORY", true)]); h.respond(4, [dto(id, "INVENTORY", true)]); await h.settle();
+    h.calls[5].reject(new Error("memory network")); await h.settle(); h.calls[6].reject(new Error("memory network"));
+    await read; await h.settle();
+    assert.equal(screen.one("ScheduleListState").state, "error"); assert.match(screen.one("ScheduleListState").errorTitle, /최신 정보를 불러오지 못했어요/);
+    assert.equal(screen.one("TextInput").value, "통신 실패 중 입력"); assert.equal(saveButton(screen).disabled, true);
+    assert.equal(listCard(list).schedule.completed, true); assert.equal(calendar.one("ScheduleCard").schedule.completed, true);
+    screen.one("ScheduleListState").onRetry(); await h.settle();
+    assert.equal(h.calls[7].method, "GET"); h.detail(7, dto(id, "INVENTORY", true)); await h.settle();
+    assert.deepEqual(screen.all("ScheduleListState"), []); assert.equal(screen.one("TextInput").value, "통신 실패 중 입력");
+    assert.equal(saveButton(screen).disabled, false); assert.equal(patches(h).length, 1);
+  } finally { h.close(); }
+});
+
+test("UI 최초 단건 GET만 중앙 absolute 로딩, native Header 옵션은 폼·로딩 외부에 유지", async () => {
+  const h = harness("server"); try {
+    const layout = h.mount("layout"), id = randomUUID(), screen = h.mount("detail", id);
+    const options = layout.all("Stack.Screen").find((props) => props.name === "schedule/[id]").options;
+    assert.equal(options.headerShown, undefined); assert.equal(options.title, "일정 수정");
+    assert.equal(options.headerTransparent, false); assert.equal(options.animation, "simple_push");
+    assert.equal(options.headerLeft, undefined); assert.equal(editHeader(screen).options.headerLeft, undefined);
+    for (const route of ["schedule/create", "settings"]) assert.notEqual(layout.all("Stack.Screen").find((props) => props.name === route).options.headerShown, false);
+    assert.equal(typeof editHeader(screen).options.headerRight, "function");
+    assert.equal(deleteButton(screen), undefined); assert.equal(screen.one("TextInput"), undefined);
+    const overlay = screen.all("View").find((props) => props.testID === "schedule-edit-loading-overlay");
+    const style = flatStyle(overlay.style); assert.equal(style.position, "absolute");
+    assert.equal(style.alignItems, "center"); assert.equal(style.justifyContent, "center");
+    assert.deepEqual([style.top, style.right, style.bottom, style.left], [0, 0, 0, 0]);
+    assert.equal(screen.one("ActivityIndicator").color, "#FB6C2D"); assert.equal(states(screen).includes("loading"), false);
+    const contentStyle = editContent(screen).style, content = screen.instance("ScheduleEditContent");
+    await h.settle(); h.detail(0, dto(id)); await h.settle();
+    assert.equal(screen.one("TextInput").value, id); assert.equal(screen.one("ActivityIndicator"), undefined);
+    assert.deepEqual(editContent(screen).style, contentStyle); assert.strictEqual(screen.instance("ScheduleEditContent"), content);
+    assert.ok(editHeader(screen)); assert.equal(deleteButton(screen).disabled, true);
+  } finally { h.close(); }
+});
+
+test("UI 목록·캘린더 캐시 수정 진입과 GET 재조회는 스피너 없이 폼·입력·Picker 보존", async () => {
+  for (const origin of ["index", "calendar"]) {
+    const h = harness("server", { allowPatch: true }); try {
+      const id = randomUUID(); h.mount(origin); await h.settle(); h.respond(0, [dto(id)]); await h.settle();
+      const screen = h.mount("detail", id), form = screen.instance("ScheduleEditForm"), content = screen.instance("ScheduleEditContent");
+      assert.equal(screen.one("TextInput").value, id); assert.equal(screen.one("ActivityIndicator"), undefined);
+      editTitle(h, screen, "보존할 입력"); screen.one("ScheduleDateField").onPress(); h.flush();
+      const picker = screen.one("DateTimePicker").value, scrollStyle = screen.one("ScrollView").contentContainerStyle;
+      await h.settle(); assert.equal(h.calls.length, 2); assert.equal(screen.one("ActivityIndicator"), undefined);
+      h.detail(1, { ...dto(id), title: "새 서버 제목" }); await h.settle();
+      assert.equal(screen.one("TextInput").value, "보존할 입력"); assert.equal(saveButton(screen).disabled, false);
+      assert.strictEqual(screen.instance("ScheduleEditForm"), form); assert.strictEqual(screen.instance("ScheduleEditContent"), content); assert.ok(editHeader(screen));
+      assert.strictEqual(screen.one("DateTimePicker").value, picker); assert.strictEqual(screen.one("ScrollView").contentContainerStyle, scrollStyle);
+      const retry = h.server.retryDetail(id); await h.settle(); h.respond(2, [], 500); await retry; await h.settle();
+      assert.equal(screen.one("TextInput").value, "보존할 입력"); assert.equal(screen.one("ActivityIndicator"), undefined);
+      assert.ok(states(screen).includes("error")); screen.one("ScheduleListState").onRetry(); await h.settle();
+      h.detail(3, dto(id)); await h.settle(); assert.strictEqual(screen.instance("ScheduleEditForm"), form);
+      assert.equal(screen.one("TextInput").value, "보존할 입력"); assert.ok(h.calls.every((call) => call.method === "GET"));
+    } finally { h.close(); }
+  }
+});
+
+test("UI native Header 아래 폼은 기존 하단 Safe Area만 사용하고 별도 Header 높이·inset 보정 없음", () => {
+  const h = harness("mock"); try {
+    const screen = h.mount("detail", mockId), form = screen.instance("ScheduleEditForm");
+    assert.deepEqual(screen.all("SafeAreaView").map((props) => props.edges), [["bottom"]]);
+    assert.equal(screen.all("SafeAreaView").some((props) => props.testID === "schedule-edit-header"), false);
+    editTitle(h, screen, "키보드 입력");
+    assert.equal(screen.one("KeyboardAvoidingView").keyboardVerticalOffset, undefined);
+    assert.equal(screen.one("ScrollView").contentInsetAdjustmentBehavior, undefined); assert.equal(screen.one("ScrollView").automaticallyAdjustKeyboardInsets, undefined);
+    assert.strictEqual(screen.instance("ScheduleEditForm"), form); assert.equal(screen.one("TextInput").value, "키보드 입력");
+    assert.equal(h.calls.length, 0);
+  } finally { h.close(); }
+});
+
+test("UI 완료 PATCH true/false 처리·후속 GET 동안 스피너와 가짜 오류·상단 레이아웃 삽입 없음", async () => {
+  const h = harness("server", { allowPatch: true }); try {
+    const id = randomUUID(), { list, calendar } = await completionScreens(h, [dto(id)]);
+    for (const completed of [true, false]) {
+      const start = h.calls.length;
+      listCard(list).onToggleCompleted(); calendar.all("ScheduleCard")[0].onToggleCompleted(); h.flush();
+      assertStableCards(list, calendar); assert.deepEqual(states(list), []); assert.deepEqual(states(calendar), []);
+      assert.equal(listCard(list).schedule.completed, completed); assert.equal(calendar.all("ScheduleCard")[0].schedule.completed, completed);
+      await h.settle(); assert.deepEqual(JSON.parse(h.calls[start].body), { completed });
+      h.detail(start, dto(id, "INVENTORY", completed)); await h.settle();
+      assertStableCards(list, calendar); assert.deepEqual(states(list), []); assert.deepEqual(states(calendar), []);
+      await respondLists(h, start + 1, [dto(id, "INVENTORY", completed)]);
+      assert.equal(feedbackPanel(list), undefined); assert.equal(feedbackPanel(calendar), undefined);
+    }
+    assert.equal(patches(h).length, 2);
+  } finally { h.close(); }
+});
+
+test("UI mutation이 진행 중 GET을 취소해도 오류를 만들지 않고 늦은 응답은 무시", async () => {
+  const h = harness("server", { allowPatch: true }); try {
+    const id = randomUUID(), { list, calendar } = await completionScreens(h, [dto(id)]);
+    const query = h.source("src/utils/schedule-query.ts").getMainScheduleRange(new Date("2026-11-07T03:00:00Z"));
+    const retry = h.server.retry(query); await h.settle();
+    assertStableCards(list, calendar); listCard(list).onToggleCompleted(); await h.settle();
+    assert.equal(h.calls[2].signal.aborted, true); assert.deepEqual(states(list), []); assertStableCards(list, calendar);
+    h.respond(2, [dto(id)]); await retry; await h.settle();
+    assert.equal(listCard(list).schedule.completed, true); assert.deepEqual(states(list), []);
+    h.detail(3, dto(id, "INVENTORY", true)); await h.settle(); await respondLists(h, 4, [dto(id, "INVENTORY", true)]);
+    assert.equal(listCard(list).schedule.completed, true); assert.equal(calendar.all("ScheduleCard")[0].schedule.completed, true);
+  } finally { h.close(); }
+});
+
+test("UI PATCH 성공 뒤 GET 실패는 중복 오류 없이 하단에서 안내하고 실패한 GET만 재시도", async () => {
+  const h = harness("server", { allowPatch: true }); try {
+    const id = randomUUID(), { list, calendar } = await completionScreens(h, [dto(id)]);
+    listCard(list).onToggleCompleted(); await h.settle(); h.detail(2, dto(id, "INVENTORY", true)); await h.settle();
+    h.respond(3, [], 500); h.respond(4, [dto(id, "INVENTORY", true)]); await h.settle();
+    assertStableCards(list, calendar); assert.equal(listCard(list).schedule.completed, true);
+    assert.equal(list.all("ScheduleListState").length, 1); assert.equal(completionNotice(list).state, "error");
+    assert.match(completionNotice(list).errorTitle, /변경되었지만 목록/); assert.ok(feedbackPanel(list)); assert.ok(feedbackPanel(calendar));
+    assert.equal(completionNotice(list).retryLabel, "GET 상태 확인");
+    completionNotice(list).onRetry(); completionNotice(calendar).onRetry(); await h.settle();
+    assert.equal(h.calls.length, 6); assert.equal(h.calls[5].method, "GET"); assert.equal(h.calls[5].url, h.calls[3].url);
+    assertStableCards(list, calendar); h.respond(5, [dto(id, "INVENTORY", true)]); await h.settle();
+    assert.equal(patches(h).length, 1); assert.equal(feedbackPanel(list), undefined);
+  } finally { h.close(); }
+});
+
+test("UI PATCH 확정 거절은 rollback과 오류를 유지하며 불확실 GET 확인은 성공 오류로 단정하지 않음", async () => {
+  for (const outcome of ["rejected", "uncertain", "malformed-422"]) {
+    const h = harness("server", { allowPatch: true }); try {
+      const id = randomUUID(), { list, calendar } = await completionScreens(h, [dto(id)]);
+      listCard(list).onToggleCompleted(); await h.settle();
+      if (outcome === "rejected") h.detail(2, validationProblem(), 422, "application/problem+json");
+      else if (outcome === "malformed-422") h.detail(2, { ...notFoundProblem(), status: 422, code: "VALIDATION_ERROR" }, 422, "application/problem+json");
+      else h.detail(2, { invalid: true });
+      await h.settle(); assertStableCards(list, calendar); assert.equal(listCard(list).schedule.completed, false);
+      assert.equal(Object.values(h.server.store.getState().servers)[0].mutations[id].phase, outcome === "rejected" ? "error" : "uncertain");
+      assert.equal(completionNotice(list).state, "error"); assert.ok(feedbackPanel(list)); assert.equal(list.all("ScheduleListState").length, 1);
+      completionNotice(list).onRetry(); await h.settle();
+      if (outcome !== "rejected") { h.detail(3, dto(id, "INVENTORY", true)); await h.settle(); }
+      await respondLists(h, outcome !== "rejected" ? 4 : 3, [dto(id, "INVENTORY", outcome !== "rejected")]);
+      assert.equal(patches(h).length, 1);
+      if (outcome !== "rejected") {
+        assert.equal(completionNotice(list).state, "notice"); assert.match(completionNotice(list).errorTitle, /이전 PATCH의 성공 여부를 뜻하지/);
+      } else assert.equal(completionNotice(list), undefined);
+    } finally { h.close(); }
+  }
+});
+
+test("UI 독립적인 GET 오류는 카드 위 배치 없이 표시하고 GET Retry만 실행", async () => {
+  const h = harness("server"); try {
+    const { list, calendar } = await completionScreens(h);
+    const query = h.source("src/utils/schedule-query.ts").getMainScheduleRange(new Date("2026-11-07T03:00:00Z"));
+    const retry = h.server.retry(query); await h.settle(); assertStableCards(list, calendar);
+    h.respond(2, [], 500); await retry; await h.settle();
+    assertStableCards(list, calendar); assert.ok(feedbackPanel(list)); assert.match(list.one("ScheduleListState").errorTitle, /최신/);
+    list.one("ScheduleListState").onRetry(); await h.settle(); h.respond(3, [dto("target")]); await h.settle();
+    assert.equal(feedbackPanel(list), undefined); assert.ok(h.calls.every((call) => call.method === "GET"));
+  } finally { h.close(); }
+});
+
+test("UI 수정 GET가 mutation으로 취소되면 가짜 오류 대신 GET 확인 제공, Header·입력 유지", async () => {
+  const h = harness("server", { allowPatch: true }); try {
+    const id = randomUUID(), { list } = await completionScreens(h, [dto(id)]), screen = h.mount("detail", id);
+    editTitle(h, screen, "진행 중 입력"); await h.settle();
+    listCard(list).onToggleCompleted(); await h.settle(); assert.equal(h.calls[2].signal.aborted, true);
+    h.detail(3, validationProblem(), 422, "application/problem+json"); await h.settle();
+    assert.equal(screen.one("ScheduleListState").state, "notice"); assert.ok(editHeader(screen));
+    assert.equal(screen.one("ActivityIndicator"), undefined); assert.equal(screen.one("TextInput").value, "진행 중 입력");
+    screen.one("ScheduleListState").onRetry(); await h.settle(); h.detail(4, dto(id)); await h.settle();
+    assert.equal(screen.one("TextInput").value, "진행 중 입력"); assert.equal(saveButton(screen).disabled, false); assert.equal(patches(h).length, 1);
+  } finally { h.close(); }
+});
+
+test("UI native Header 옵션은 서버 404·네트워크 오류·GET Retry에도 등록되며 본문 수명 유지", async () => {
+  for (const outcome of ["404", "network"]) {
+    const h = harness("server"); try {
+      const id = randomUUID(), screen = h.mount("detail", id), content = screen.instance("ScheduleEditContent"); await h.settle();
+      if (outcome === "404") h.detail(0, notFoundProblem(), 404, "application/problem+json");
+      else { h.calls[0].reject(new Error("memory")); await h.settle(); h.calls[1].reject(new Error("memory")); }
+      await h.settle(); assert.ok(editHeader(screen)); assert.strictEqual(screen.instance("ScheduleEditContent"), content);
+      assert.equal(editHeader(screen).options.headerShown, undefined); assert.equal(deleteButton(screen), undefined);
+      assert.ok(states(screen).includes("error")); assert.equal(screen.one("ActivityIndicator"), undefined);
+      const next = h.calls.length; screen.one("ScheduleListState").onRetry(); await h.settle();
+      assert.ok(screen.one("ActivityIndicator")); assert.ok(editHeader(screen)); assert.strictEqual(screen.instance("ScheduleEditContent"), content);
+      h.detail(next, dto(id)); await h.settle(); assert.ok(editHeader(screen)); assert.equal(deleteButton(screen).disabled, true);
+      h.back(); assert.deepEqual(h.navigations, ["back"]);
+    } finally { h.close(); }
+  }
+});
+
+test("UI Mock/server 목록·캘린더 20회 반복 진입·복귀와 native Header 옵션·중복 push 차단", async () => {
+  for (const mode of ["mock", "server"]) for (const origin of ["index", "calendar"]) {
+    const h = harness(mode); try {
+      const list = h.mount(origin); await h.settle();
+      if (mode === "server") { h.respond(0, [dto(randomUUID())]); await h.settle(); }
+      else if (origin === "calendar") { list.one("MonthCalendar").onSelectDate({ dateString: "2026-09-30" }); h.flush(); }
+      for (let index = 0; index < 20; index++) {
+        const card = origin === "index" ? listCard(list) : list.one("ScheduleCard");
+        card.onPress(); card.onPress(); list.focus(false); card.onPress();
+        assert.equal(h.navigations.filter((nav) => typeof nav === "object").length, index + 1);
+        const start = h.calls.length, screen = h.mount("detail", card.schedule.id); await h.settle();
+        if (h.calls.length > start) { h.detail(start, dto(card.schedule.id)); await h.settle(); }
+        assert.ok(editHeader(screen)); assert.ok(deleteButton(screen)); assert.equal(editHeader(screen).options.headerShown, undefined);
+        h.back(); screen.close();
+        assert.equal(h.navigations.filter((nav) => nav === "back").length, index + 1); list.focus(true);
+      }
+      assert.ok(h.calls.every((call) => call.method === "GET"));
+    } finally { h.close(); }
+  }
+});
+
+test("UI 캘린더 별도 월 캐시의 배경 GET 실패도 선택 날짜 카드 위에 상태 UI를 삽입하지 않음", async () => {
+  const h = harness("server"); try {
+    const id = randomUUID(), calendar = h.mount("calendar"); await h.settle(); h.respond(0, [dto(id)]); await h.settle();
+    calendar.one("MonthCalendar").onMonthChange({ dateString: "2026-12-01" }); await h.settle();
+    const december = { ...dto(randomUUID()), scheduledAt: "2026-12-07T03:00:00Z" };
+    h.respond(1, [december]); await h.settle();
+    const dates = calendar.one("MonthCalendar").scheduleDates;
+    const query = h.source("src/utils/schedule-query.ts").getCalendarScheduleRange("2026-12-01");
+    const retry = h.server.retry(query); await h.settle();
+    assert.equal(states(calendar).includes("loading"), false); assert.equal(feedbackPanel(calendar), undefined);
+    assert.equal(calendar.one("ScheduleCard").schedule.id, id); h.respond(2, [], 500); await retry; await h.settle();
+    assert.ok(feedbackPanel(calendar)); assert.equal(calendar.one("ScheduleCard").schedule.id, id);
+    assert.deepEqual(calendar.one("MonthCalendar").scheduleDates, dates);
+    const content = calendar.one("ScrollView").children;
+    assert.equal(content.some((node) => node?.type === "ScheduleListState"), false);
+    calendar.one("ScheduleListState").onRetry(); await h.settle(); h.respond(3, [december]); await h.settle();
+    assert.equal(feedbackPanel(calendar), undefined); assert.ok(h.calls.every((call) => call.method === "GET"));
+  } finally { h.close(); }
+});
+
+test("UI route·서버·모드 변경 시 이전 폼 노출 없이 native Header 옵션 유지와 늦은 GET 무효화", async () => {
+  const h = harness("server"); try {
+    h.mount("index"); await h.settle(); h.respond(0, [{ ...dto(mockId), title: "이전 서버 데이터" }]); await h.settle();
+    const screen = h.mount("detail", mockId); await h.settle();
+    assert.equal(screen.one("TextInput").value, "이전 서버 데이터"); const next = randomUUID();
+    screen.route(next); await h.settle(); assert.deepEqual(h.navigations, []);
+    assert.ok(editHeader(screen)); assert.equal(screen.one("TextInput"), undefined); assert.ok(screen.one("ActivityIndicator"));
+    h.detail(1, { ...dto(mockId), title: "늦은 이전 일정" }); await h.settle(); assert.equal(screen.one("TextInput"), undefined);
+    const serverStart = h.calls.length; h.config("https://other.example.invalid"); await h.settle();
+    h.detail(2, { ...dto(next), title: "늦은 이전 서버" }); await h.settle(); assert.equal(screen.one("TextInput"), undefined);
+    for (let index = serverStart; index < h.calls.length; index++) {
+      if (new URL(h.calls[index].url).pathname.endsWith(`/${next}`)) h.detail(index, { ...dto(next), title: "현재 서버 데이터" });
+      else h.respond(index, []);
+    }
+    await h.settle();
+    assert.ok(editHeader(screen)); assert.equal(screen.one("TextInput").value, "현재 서버 데이터");
+    h.mode("mock"); screen.route(mockId); await h.settle();
+    assert.ok(editHeader(screen)); assert.equal(screen.one("ActivityIndicator"), undefined);
+    assert.equal(screen.one("TextInput").value, h.mock.getState().schedules.find((schedule) => schedule.id === mockId).title);
+    assert.ok(h.calls.every((call) => call.method === "GET"));
+  } finally { h.close(); }
 });
 
 test("J 기본 전송은 GET의 기존 fetch를 유지하고 쓰기만 Expo fetch의 redirect error 사용", async () => {

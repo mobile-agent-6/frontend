@@ -103,7 +103,7 @@ test("동일 query 동시 요청 공유, 일부 해제 유지, 마지막 해제 
   assert.strictEqual(a.promise, b.promise); await tick(); assert.equal(h.calls.length, 1);
   a.release(); assert.equal(h.calls[0].signal.aborted, false);
   b.release(); assert.equal(h.calls[0].signal.aborted, true); await a.promise;
-  assert.equal(h.entry().error.kind, "aborted"); assert.equal(h.entry().hasSuccess, false);
+  assert.equal(h.entry().error, null); assert.equal(h.entry().hasSuccess, false); assert.equal(h.entry().status, "idle");
   assert.equal(h.calls.length, 1);
 });
 test("해제 직전 새 요청의 소유권과 응답 순서 역전", async () => {
@@ -133,10 +133,19 @@ test("서버 전환은 이전 응답과 오류·성공 이력을 새 서버에 �
 test("세대 무효화는 mutation 이전 GET 반영을 차단하고 엔터티를 유지", async () => {
   const h = harness(); const a = h.cache.acquire(query); await tick(); h.calls[0].resolve(response([dto()])); await a.promise;
   const retry = h.cache.retry(query); await tick(); h.cache.invalidate();
+  assert.equal(h.calls[1].signal.aborted, true);
+  assert.equal(h.entry().status, "success"); assert.equal(h.entry().error, null); assert.equal(h.entry().hasSuccess, true);
   h.calls[1].resolve(response([dto("obsolete")])); await retry;
   assert.ok(h.data().entities.shared); assert.equal(h.data().entities.obsolete, undefined);
   assert.equal(h.entry().stale, true);
 });
+test("최초 GET의 mutation 무효화는 오류나 빈 성공 없이 idle·stale로 구분", async () => {
+  const h = harness(), consumer = h.cache.acquire(query); await tick(); h.cache.invalidate();
+  assert.equal(h.entry().status, "idle"); assert.equal(h.entry().hasSuccess, false); assert.equal(h.entry().stale, true); assert.equal(h.entry().error, null);
+  h.calls[0].resolve(response([dto("obsolete")])); await consumer.promise;
+  assert.equal(h.data().entities.obsolete, undefined); consumer.release();
+});
+
 test("최초 HTTP 실패는 빈 성공이 아니며 GET retry만 수행", async () => {
   const h = harness(); const a = h.cache.acquire(query); await tick();
   h.calls[0].resolve(new Response(JSON.stringify({ type: "test", title: "test", detail: "test", instance: "/schedules",
@@ -185,7 +194,7 @@ test("timeout은 취소와 구분하며 두 시도 후 마지막 성공 결과 �
 });
 test("해제된 소비자는 Retry로 요청을 다시 시작하지 않음", async () => {
   const h = harness(); const a = h.cache.acquire(query); a.release(); await a.promise;
-  await a.retry(); assert.equal(h.calls.length, 0); assert.equal(h.entry().error.kind, "aborted");
+  await a.retry(); assert.equal(h.calls.length, 0); assert.equal(h.entry().error, null); assert.equal(h.entry().status, "idle");
 });
 test("원래 서버로 돌아와도 기존 cache는 stale로 재조회", async () => {
   const h = harness(); const a = h.cache.acquire(query); await tick();

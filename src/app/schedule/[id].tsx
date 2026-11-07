@@ -1,7 +1,7 @@
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import { SymbolView } from "expo-symbols";
 import { useEffect, useRef, useState } from "react";
-import { Platform, Pressable, StyleSheet } from "react-native";
+import { ActivityIndicator, Platform, Pressable, StyleSheet, View } from "react-native";
 import { useStore } from "zustand";
 
 import { ScheduleEditForm } from "@/components/schedule-edit/schedule-edit-form";
@@ -10,6 +10,7 @@ import { ThemedText } from "@/components/ui/themed-text";
 import { ThemedView } from "@/components/ui/themed-view";
 import { Spacing } from "@/constants/theme";
 import { useTheme } from "@/hooks/use-theme";
+import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useScheduleStore } from "@/stores/scheduleStore";
 import { isMockScheduleMode, isScheduleRequestAllowed, scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
 import { useScheduleUpdate } from "@/hooks/use-schedule-update";
@@ -37,6 +38,7 @@ function ScheduleEditContent({ id, serverMode, generation, detail }: {
 }) {
   const router = useRouter();
   const theme = useTheme();
+  const colorScheme = useColorScheme();
   const serverUpdate = useScheduleUpdate(id, detail.serverId);
   const serverDeletion = useScheduleDeletion(id, detail.serverId);
   const patchAllowed = serverMode && Boolean(id) && isScheduleRequestAllowed("PATCH", `/schedules/${encodeURIComponent(id ?? "")}`);
@@ -68,6 +70,7 @@ function ScheduleEditContent({ id, serverMode, generation, detail }: {
 
   // 확정 성공 또는 결과 확인 중에는 원래 폼을 유지해 입력 유실·not-found 깜빡임을 막는다.
   const displayedSchedule = schedule ?? ((serverMode ? serverUpdate.busy || serverUpdate.blocked || serverDeletion.active : actionLocked) ? actionSchedule : null);
+  const initialLoading = serverMode && detail.initialLoading && !displayedSchedule && !serverDeletion.active;
 
   const openDeleteModal = () => {
     if (!mountedRef.current || generation !== scheduleDataModeStore.getState().generation) return;
@@ -198,6 +201,16 @@ function ScheduleEditContent({ id, serverMode, generation, detail }: {
     runMutation("delete", () => deleteSchedule(schedule.id));
   };
 
+  const needsRefresh = serverMode && Boolean(displayedSchedule) && detail.stale && !detail.isFetching &&
+    !detail.error && !detail.refreshPending;
+  const readFeedback = serverMode && (detail.error || detail.notFound || needsRefresh) && !serverDeletion.active ? (
+    <ScheduleListState state={needsRefresh ? "notice" : "error"} onRetry={detail.retryRead}
+      retryLabel={needsRefresh ? "GET 다시 조회" : undefined}
+      errorTitle={detail.notFound ? "일정을 찾을 수 없어요." : detail.hasSuccessfulRead
+        ? needsRefresh ? "일정 정보를 다시 확인해 주세요." : "최신 정보를 불러오지 못했어요. 이전 정보를 표시하고 있어요."
+        : "일정을 불러오지 못했어요."} />
+  ) : null;
+
   return (
     <>
       <Stack.Screen
@@ -234,33 +247,36 @@ function ScheduleEditContent({ id, serverMode, generation, detail }: {
         }}
       />
 
-      {serverMode && (detail.initialLoading || detail.isFetching) && <ScheduleListState state="loading" />}
-      {serverMode && (detail.error || detail.notFound) && !serverDeletion.active && (
-        <ScheduleListState state="error" onRetry={detail.retryRead}
-          errorTitle={detail.notFound ? "일정을 찾을 수 없어요." : detail.hasSuccessfulRead
-            ? "최신 정보를 불러오지 못했어요. 이전 정보를 표시하고 있어요." : "일정을 불러오지 못했어요."} />
-      )}
-      {displayedSchedule ? (
-        <ScheduleEditForm
-          key={displayedSchedule.id}
-          schedule={displayedSchedule}
-          onSave={handleSave}
-          actionLocked={(serverMode && (!patchAllowed || detail.isFetching || !detail.hasDetailSuccess || Boolean(detail.error) ||
-            serverUpdate.busy || serverUpdate.blocked || serverDeletion.busy || serverDeletion.blocked)) || actionLocked || isDeleteModalVisible || isDeleteModalDismissing}
-          actionError={serverMode ? serverDeletion.error ?? serverUpdate.error ?? actionError ?? (!patchAllowed && !deleteAllowed ? "현재 정책에서는 일정 수정·삭제를 사용할 수 없어요." : null) : actionError}
-          onRetryRead={serverMode && serverDeletion.needsCheck ? retryDeletionRead : serverMode && serverUpdate.needsCheck ? retryServerRead : undefined}
-          retryReadDisabled={serverUpdate.busy || serverDeletion.busy}
-        />
-      ) : !serverMode ? (
-        <ThemedView style={styles.notFound}>
-          <ThemedText>일정을 찾을 수 없어요.</ThemedText>
-        </ThemedView>
-      ) : null}
-      {serverMode && !displayedSchedule && serverDeletion.active && (
-        <ScheduleListState state={serverDeletion.busy ? "loading" : "error"}
-          errorTitle={serverDeletion.error ?? (detail.notFound ? "일정을 찾을 수 없어요." : "일정 삭제 결과를 확인하고 있어요.")}
-          onRetry={serverDeletion.busy ? undefined : retryDeletionRead} />
-      )}
+      <View testID="schedule-edit-content" style={[styles.contentArea,
+        { backgroundColor: colorScheme === "dark" ? theme.background : "#FCF9F7" }]}>
+        {!displayedSchedule && readFeedback}
+        {displayedSchedule ? (
+          <ScheduleEditForm
+            key={displayedSchedule.id}
+            schedule={displayedSchedule}
+            onSave={handleSave}
+            actionLocked={(serverMode && (!patchAllowed || detail.isFetching || !detail.hasDetailSuccess || Boolean(detail.error) ||
+              serverUpdate.busy || serverUpdate.blocked || serverDeletion.busy || serverDeletion.blocked)) || actionLocked || isDeleteModalVisible || isDeleteModalDismissing}
+            actionError={serverMode ? serverDeletion.error ?? serverUpdate.error ?? actionError ?? (!patchAllowed && !deleteAllowed ? "현재 정책에서는 일정 수정·삭제를 사용할 수 없어요." : null) : actionError}
+            onRetryRead={serverMode && serverDeletion.needsCheck ? retryDeletionRead : serverMode && serverUpdate.needsCheck ? retryServerRead : undefined}
+            retryReadDisabled={serverUpdate.busy || serverDeletion.busy}
+          />
+        ) : !serverMode ? (
+          <ThemedView style={styles.notFound}>
+            <ThemedText>일정을 찾을 수 없어요.</ThemedText>
+          </ThemedView>
+        ) : null}
+        {serverMode && !displayedSchedule && serverDeletion.active && (
+          <ScheduleListState state={serverDeletion.busy ? "loading" : "error"}
+            errorTitle={serverDeletion.error ?? (detail.notFound ? "일정을 찾을 수 없어요." : "일정 삭제 결과를 확인하고 있어요.")}
+            onRetry={serverDeletion.busy ? undefined : retryDeletionRead} />
+        )}
+        {displayedSchedule && readFeedback}
+        {initialLoading && <View testID="schedule-edit-loading-overlay" style={[styles.loadingOverlay,
+          { backgroundColor: colorScheme === "dark" ? "rgba(0, 0, 0, 0.18)" : "rgba(252, 249, 247, 0.55)" }]}>
+          <ActivityIndicator color={theme.primary} accessibilityLabel="일정을 불러오는 중" />
+        </View>}
+      </View>
 
       <ConfirmationModal
         visible={isDeleteModalVisible && Boolean(schedule) && (!serverMode || deleteAllowed)}
@@ -285,6 +301,11 @@ const styles = StyleSheet.create({
   },
   deleteButtonPressed: {
     opacity: 0.7,
+  },
+  contentArea: { flex: 1 },
+  loadingOverlay: {
+    position: "absolute", top: 0, right: 0, bottom: 0, left: 0,
+    alignItems: "center", justifyContent: "center",
   },
   notFound: {
     flex: 1,

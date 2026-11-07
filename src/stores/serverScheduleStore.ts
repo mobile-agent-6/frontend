@@ -111,7 +111,7 @@ export function createServerScheduleStore({
     store.setState((state) => ({ servers: { ...state.servers,
       [serverId]: change(state.servers[serverId] ?? emptyCache()) } }));
   }
-  function cancel(key: string) {
+  function cancel(key: string, invalidating = false) {
     const flight = flights.get(key);
     if (!flight) return;
     flights.delete(key);
@@ -120,13 +120,15 @@ export function createServerScheduleStore({
     if (serverId) update(serverId, (cache) => {
       if (flight.detailId !== undefined) {
         const entry = cache.details[flight.detailId];
-        return entry ? { ...cache, details: { ...cache.details, [flight.detailId]: { ...entry, stale: true,
-          status: "error", error: { kind: "aborted", requestState: "unconfirmed" } } } } : cache;
+        return entry ? { ...cache, details: { ...cache.details, [flight.detailId]: { ...entry, stale: invalidating ? entry.stale : true,
+          status: invalidating ? (entry.hasSuccess ? "success" : "idle") : "error",
+          error: invalidating ? null : { kind: "aborted", requestState: "unconfirmed" } } } } : cache;
       }
       const entry = cache.queries[key];
       if (!entry) return cache;
-      return { ...cache, queries: { ...cache.queries, [key]: { ...entry, stale: true, status: "error",
-        error: { kind: "aborted", requestState: "unconfirmed" } } } };
+      return { ...cache, queries: { ...cache.queries, [key]: { ...entry, stale: true,
+        status: invalidating ? (entry.hasSuccess ? "success" : "idle") : "error",
+        error: invalidating ? null : { kind: "aborted", requestState: "unconfirmed" } } } };
     });
   }
   /** 설정 변경 시 호출한다. HTTP 계층의 완료 시점 검사와 함께 이전 응답을 차단한다. */
@@ -143,12 +145,15 @@ export function createServerScheduleStore({
     return serverId;
   }
   /** 향후 mutation 시작 전에 호출할 조회 장벽. mutation 자체는 실행하지 않는다. */
-  function invalidate() {
-    for (const key of flights.keys()) cancel(key);
-    store.setState((state) => ({ generation: state.generation + 1 }));
+  function invalidate(includeDetails = true) {
+    // mutation 장벽으로 중단한 GET은 통신 실패가 아니다. 성공 데이터와 stale 표시는 유지한다.
+    for (const [key, flight] of flights) {
+      if (includeDetails || flight.detailId === undefined) cancel(key, true);
+    }
+    if (includeDetails) store.setState((state) => ({ generation: state.generation + 1 }));
     const id = store.getState().serverId;
     if (id) update(id, (cache) => ({ ...cache,
-      details: Object.fromEntries(Object.entries(cache.details).map(([key, entry]) => [key, { ...entry, stale: true }])),
+      details: includeDetails ? Object.fromEntries(Object.entries(cache.details).map(([key, entry]) => [key, { ...entry, stale: true }])) : cache.details,
       queries: Object.fromEntries(Object.entries(cache.queries).map(([key, entry]) => [key, { ...entry, stale: true }])) }));
   }
 
@@ -216,7 +221,7 @@ export function createServerScheduleStore({
       released = true;
       const owners = consumers.get(key);
       owners?.delete(token);
-      if (owners?.size === 0) { consumers.delete(key); cancel(key); }
+      if (owners?.size === 0) { consumers.delete(key); cancel(key, true); }
     } };
   }
 
@@ -231,7 +236,8 @@ export function createServerScheduleStore({
     const requestSequence = ++sequence, generation = store.getState().generation;
     const controller = new AbortController();
     update(serverId, (cache) => ({ ...cache, details: { ...cache.details, [scheduleId]: {
-      status: "loading", hasSuccess: entry?.hasSuccess ?? false, stale: true, error: null, sequence: requestSequence,
+      // 재조회 시작 자체는 이미 확인된 단건을 무효화하지 않는다. 실제 실패·mutation은 별도로 stale 처리한다.
+      status: "loading", hasSuccess: entry?.hasSuccess ?? false, stale: entry?.stale ?? true, error: null, sequence: requestSequence,
     } } }));
     const promise = Promise.resolve().then(async () => {
       if (controller.signal.aborted) return;
@@ -284,7 +290,7 @@ export function createServerScheduleStore({
         if (released || !key) return;
         released = true;
         const owners = consumers.get(key); owners?.delete(token);
-        if (owners?.size === 0) { consumers.delete(key); cancel(key); }
+        if (owners?.size === 0) { consumers.delete(key); cancel(key, true); }
       } };
   }
   /** 성공 write와 GET 실패를 분리한다. 재시도 인자가 있으면 실패한 GET만 실행한다. */
@@ -294,7 +300,9 @@ export function createServerScheduleStore({
     const cache = store.getState().servers[expectedServerId];
     const active = Object.entries(cache?.queries ?? {}).filter(([key]) => consumers.has(key)).map(([, entry]) => entry.query);
     const queries = retryQueries ?? (active.length ? active : [getMainScheduleRange(new Date())]);
-    if (!retryQueries) invalidate();
+    // PATCH/단건 GET으로 확인한 정보와 진행 중인 단건 조회는 목록 재조회가 무효화하지 않는다.
+    // 목록의 이전 응답은 각 flight 취소·요청 순번으로 차단하고 mutation의 세대 장벽은 유지한다.
+    if (!retryQueries) invalidate(false);
     await Promise.all(queries.map((query) => fetchQuery(query, true)));
     if (syncServer() !== expectedServerId) return { ok: false, failedQueries: queries };
     const current = store.getState().servers[expectedServerId];
