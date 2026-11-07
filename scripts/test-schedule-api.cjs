@@ -967,11 +967,11 @@ test("PATCH: POST 제목 규칙 재사용·과거 일정의 제목/카테고리/
     { scheduledAt: "2025-01-01T00:00:00Z" }]) assert.equal(service.prepareScheduleUpdate(dto.id, input).ok, true);
 });
 
-test("PATCH: method·안전한 ID 인코딩·허용 필드·200 DTO 변환·멱등성 key 없음", async () => {
+test("PATCH: method·원래 일정 ID·허용 필드·200 DTO 변환·멱등성 key 없음", async () => {
   const h = harness(async () => json({ ...dto, title: "renamed", completed: true }));
   const service = createService(h.client);
   const op = preparedUpdate(service, { title: "  renamed  ", completed: true,
-    id: "forbidden", createdAt: "bad", updatedAt: "bad", reminderMinutesBefore: 10, reminderAt: "bad" }, "a/b ?#%");
+    id: "forbidden", createdAt: "bad", updatedAt: "bad", reminderMinutesBefore: 10, reminderAt: "bad" });
   const result = await op.submit();
   assert.equal(result.outcome, "updated");
   assert.equal(result.response.status, 200);
@@ -979,7 +979,7 @@ test("PATCH: method·안전한 ID 인코딩·허용 필드·200 DTO 변환·멱�
   assert.equal(result.response.data.title, "renamed");
   assert.equal(result.response.requestId, "header-request-id");
   const [url, init] = h.state.calls[0];
-  assert.equal(url, "https://example.invalid/api/v1/schedules/a%2Fb%20%3F%23%25");
+  assert.equal(url, `https://example.invalid/api/v1/schedules/${dto.id}`);
   assert.equal(init.method, "PATCH");
   assert.equal(init.headers.get("Content-Type"), "application/json");
   assert.equal(init.headers.get("Idempotency-Key"), null);
@@ -1055,11 +1055,11 @@ test("DELETE: 503 retry에서도 같은 ID 유지·body 생략", async () => {
   let calls = 0;
   const h = harness(async () => ++calls === 1
     ? json(problem(503, "DATABASE_UNAVAILABLE"), 503, "application/problem+json") : noContent());
-  const result = await preparedDelete(createService(h.client), "id/with ?#%").submit();
+  const result = await preparedDelete(createService(h.client), dto.id).submit();
   assert.equal(result.outcome, "deleted");
   assert.equal(result.response.attempts, 2);
   assert.equal(h.state.calls[0][0], h.state.calls[1][0]);
-  assert.match(h.state.calls[0][0], /id%2Fwith%20%3F%23%25$/);
+  assert.equal(h.state.calls[0][0], `https://example.invalid/api/v1/schedules/${dto.id}`);
   assert.equal(h.state.calls[1][1].body, undefined);
 });
 

@@ -8,7 +8,7 @@ import type { ScheduleCategory } from "@/types/schedule";
 import { toApiCategory, uiDateTimeToScheduledAt } from "@/utils/schedule-mapper";
 import type { ScheduleListQuery } from "@/utils/schedule-query";
 
-export const SCHEDULE_CREATION_READ_ONLY_MESSAGE = "현재 서버 조회만 지원합니다. 일정 추가는 아직 사용할 수 없어요.";
+export const SCHEDULE_CREATION_READ_ONLY_MESSAGE = "현재 읽기 전용 모드에서는 일정을 추가할 수 없어요.";
 
 /** 폼 수명 동안 key·payload를 보존한다. 앱 종료 후 복구나 서버 결과 추정은 하지 않는다. */
 export function useScheduleCreation() {

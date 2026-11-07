@@ -8,7 +8,7 @@ const root = path.resolve(__dirname, "..");
 
 // native 렌더러 대신 실제 화면 함수의 Hook·이벤트·effect를 메모리에서 구동한다.
 // 레이아웃 검증이 아니라 모드 전환과 지연 callback의 상태 경계를 검사한다.
-function harness() {
+function harness(initialMode = "mock") {
   const slots = [], effects = [], timers = new Map(), cache = new Map();
   let cursor = 0, dirty = false, tree, timerId = 0, uuidFailure = false, onUUID = null;
   const same = (a, b) => a && b && a.length === b.length && a.every((v, i) => Object.is(v, b[i]));
@@ -61,7 +61,7 @@ function harness() {
     };
     new Function("require", "module", "exports", "fetch", "setTimeout", "clearTimeout", "process", code)(
       resolve, module, module.exports, () => { throw new Error("실제 네트워크 요청 금지"); },
-      (fn) => { timers.set(++timerId, fn); return timerId; }, (id) => timers.delete(id), { env: {} });
+      (fn) => { timers.set(++timerId, fn); return timerId; }, (id) => timers.delete(id), { env: { EXPO_PUBLIC_SCHEDULE_DATA_MODE: initialMode } });
     return module.exports;
   }
   const source = (file) => load(path.join(root, file));
@@ -93,7 +93,7 @@ function harness() {
 const id = (last) => `10000000-0000-4000-8000-${String(last).padStart(12, "0")}`;
 const messages = (h) => h.find("ConversationList").messages;
 
-test("기본 모드는 Mock이며 기존 등록·조회·수정·완료·삭제/취소 유지", () => {
+test("명시적 Mock 모드의 기존 등록·조회·수정·완료·삭제/취소 유지", () => {
   const h = harness();
   try {
     assert.equal(h.mode.scheduleDataModeStore.getState().mode, "mock");
@@ -145,6 +145,19 @@ test("Mock 화면 후보 선택·삭제 확인·완료 interaction 재실행 차
     assert.equal(h.mock.getState().schedules.some((s) => s.id === id(1)), false);
   } finally { h.close(); }
 });
+test("서버 초기 진입에서도 Assistant Mock write·HTTP 쓰기 허용 없이 미연동 안내", () => {
+  const h = harness("server"); try {
+    const before = h.mock.getState().schedules;
+    assert.equal(h.mode.scheduleDataModeStore.getState().mode, "server");
+    const result = h.service.runMockAssistantScenario("내일 오후 3시 팀 회의 추가해 줘");
+    assert.equal(result.text, h.mode.ASSISTANT_NOT_CONNECTED_MESSAGE);
+    h.send("재고 일정 삭제해 줘"); assert.equal(messages(h).at(-1).text, h.mode.ASSISTANT_NOT_CONNECTED_MESSAGE);
+    assert.equal(h.mode.isScheduleRequestAllowed("POST", "/assistant/requests"), false);
+    assert.equal(h.mode.isScheduleRequestAllowed("POST", "/system/time-sync"), false);
+    assert.strictEqual(h.mock.getState().schedules, before); assert.equal(h.timers.size, 0);
+  } finally { h.close(); }
+});
+
 test("서버 모드의 모든 공개 Mock 진입점은 조회·생성·수정·삭제 0회", () => {
   const h = harness();
   try {
