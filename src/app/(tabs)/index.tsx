@@ -1,7 +1,8 @@
 import { SymbolView } from "expo-symbols";
 import { useRouter } from "expo-router";
 import { useMemo, useState } from "react";
-import { FlatList, Pressable, StyleSheet, View } from "react-native";
+import { useStore } from "zustand";
+import { FlatList, Pressable, ScrollView, StyleSheet, View } from "react-native";
 
 import {
   CategoryFilter,
@@ -16,17 +17,41 @@ import { BottomTabInset, Spacing } from "@/constants/theme";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useTheme } from "@/hooks/use-theme";
 import { useScheduleData } from "@/hooks/use-schedule-data";
+import { useScheduleEditNavigation } from "@/hooks/use-schedule-edit-navigation";
+import { useScheduleCompletion, useServerScheduleData } from "@/hooks/use-server-schedule-data";
+import { isMockScheduleMode, scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
+import { getMainScheduleRange } from "@/utils/schedule-query";
 
 export default function ScheduleListScreen() {
   const theme = useTheme();
   const colorScheme = useColorScheme();
   const router = useRouter();
+  const openSchedule = useScheduleEditNavigation();
   const [selectedCategory, setSelectedCategory] =
     useState<ScheduleCategoryFilter>("전체");
-  const {
-    schedules, readError, hasSuccessfulRead, retryRead, completionError,
-    retryCompletion, toggleCompleted, canOpenSchedule,
-  } = useScheduleData();
+  const serverMode = useStore(scheduleDataModeStore, (state) => state.mode === "server");
+  const mock = useScheduleData(!serverMode);
+  const server = useServerScheduleData(getMainScheduleRange(new Date()), serverMode);
+  const completion = useScheduleCompletion(server.serverId, serverMode);
+  const schedules = serverMode ? server.schedules : mock.schedules;
+  const readError = serverMode ? Boolean(server.error) : mock.readError;
+  const hasSuccessfulRead = serverMode ? server.hasSuccessfulRead : mock.hasSuccessfulRead;
+  const retryRead = serverMode ? server.retryRead : mock.retryRead;
+  const { toggleCompleted, canOpenSchedule } = mock;
+  const retryCompletion = serverMode ? completion.retryCompletion : mock.retryCompletion;
+  const completionError = serverMode ? completion.completionError : mock.completionError;
+  const needsRefresh = serverMode && server.hasSuccessfulRead && server.stale && !server.isFetching &&
+    !server.error && !server.refreshPending && !completionError;
+  const loading = serverMode && server.initialLoading;
+  const canShowEmpty = serverMode ? server.success : !readError || hasSuccessfulRead;
+  const feedback = <>
+    {readError && !(serverMode && server.completionRefreshFailed) && <ScheduleListState state="error" onRetry={retryRead}
+      errorTitle={hasSuccessfulRead ? "최신 정보를 불러오지 못했어요. 이전 정보를 표시하고 있어요." : undefined} />}
+    {needsRefresh && <ScheduleListState state="notice" errorTitle="일정 정보를 다시 확인해 주세요." onRetry={retryRead} retryLabel="GET 다시 조회" />}
+    {completionError && <ScheduleListState state={serverMode ? completion.completionNoticeState : "error"}
+      errorTitle={serverMode ? completion.completionError ?? undefined : "완료 상태를 변경하지 못했어요."}
+      onRetry={retryCompletion} retryLabel={serverMode ? "GET 상태 확인" : undefined} />}
+  </>;
 
   const visibleSchedules = useMemo(
     () => {
@@ -37,11 +62,11 @@ export default function ScheduleListScreen() {
               (schedule) => schedule.category === selectedCategory,
             );
 
-      return filteredSchedules.sort(
+      return serverMode ? filteredSchedules : filteredSchedules.sort(
         (a, b) => a.date.localeCompare(b.date) || a.time.localeCompare(b.time),
       );
     },
-    [schedules, selectedCategory],
+    [schedules, selectedCategory, serverMode],
   );
 
   return (
@@ -71,7 +96,7 @@ export default function ScheduleListScreen() {
         ]}
         ItemSeparatorComponent={ScheduleSeparator}
         ListEmptyComponent={
-          readError && !hasSuccessfulRead ? undefined : (
+          !canShowEmpty ? undefined : (
             <ScheduleListState
               state="empty"
               emptyText={selectedCategory === "전체" ? undefined : `${selectedCategory} 일정이 없어요.`}
@@ -79,42 +104,28 @@ export default function ScheduleListScreen() {
           )
         }
         ListHeaderComponent={
-          readError || completionError ? (
-            <View style={((readError && hasSuccessfulRead) || completionError) && visibleSchedules.length > 0
-              ? styles.errorHeader
-              : undefined}>
-              {readError && (
-                <ScheduleListState
-                  state="error"
-                  errorTitle={hasSuccessfulRead
-                    ? "최신 정보를 불러오지 못했어요. 이전 정보를 표시하고 있어요."
-                    : undefined}
-                  onRetry={retryRead}
-                />
-              )}
-              {completionError && (
-                <ScheduleListState
-                  state="error"
-                  errorTitle="완료 상태를 변경하지 못했어요."
-                  onRetry={retryCompletion}
-                />
-              )}
+          (!serverMode || !hasSuccessfulRead) && (readError || completionError || loading) ? (
+            <View style={!serverMode && visibleSchedules.length > 0 ? styles.errorHeader : undefined}>
+              {loading && <ScheduleListState state="loading" />}
+              {feedback}
             </View>
           ) : undefined
         }
         renderItem={({ item }) => (
           <ScheduleCard
             schedule={item}
-            onToggleCompleted={() => toggleCompleted(item)}
-            onPress={() => canOpenSchedule() &&
-              router.push({
-                pathname: "/schedule/[id]",
-                params: { id: item.id },
-              })
-            }
+            completionDisabled={serverMode && completion.completionDisabled(item.id)}
+            onToggleCompleted={() => serverMode ? completion.toggleCompleted(item.id) : isMockScheduleMode() && toggleCompleted(item)}
+            onPress={() => (serverMode || canOpenSchedule()) && openSchedule(item.id)}
           />
         )}
       />
+
+      {serverMode && hasSuccessfulRead && (readError || needsRefresh || completionError) && (
+        <ScrollView testID="schedule-feedback" style={styles.feedback} contentContainerStyle={styles.feedbackContent}>
+          {feedback}
+        </ScrollView>
+      )}
 
       <Pressable
         accessibilityLabel="새 일정 추가"
@@ -162,9 +173,9 @@ const styles = StyleSheet.create({
   separator: {
     height: 12,
   },
-  errorHeader: {
-    marginBottom: 24,
-  },
+  feedback: { flexGrow: 0, maxHeight: "40%" },
+  feedbackContent: { gap: Spacing.two, padding: Spacing.three, paddingRight: 84 },
+  errorHeader: { marginBottom: 24 },
   addButton: {
     position: "absolute",
     right: Spacing.four,

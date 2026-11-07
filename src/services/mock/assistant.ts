@@ -1,6 +1,7 @@
 import * as Crypto from "expo-crypto";
 
 import { useScheduleStore } from "@/stores/scheduleStore";
+import { ASSISTANT_NOT_CONNECTED_MESSAGE, isMockScheduleMode, scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
 import type { AssistantInteraction } from "@/types/assistant";
 import type { Schedule } from "@/types/schedule";
 import {
@@ -26,6 +27,11 @@ const SAFETY_INSPECTION_TARGET_ID = "10000000-0000-4000-8000-000000000005";
 const INBOUND_QUANTITY_TARGET_ID = "10000000-0000-4000-8000-000000000008";
 const RETURN_SHIPMENT_TARGET_ID = "10000000-0000-4000-8000-000000000006";
 
+function blockedResponse() {
+  return { text: ASSISTANT_NOT_CONNECTED_MESSAGE, schedules: [], handled: true as const,
+    status: "idle" as const, pending: null };
+}
+
 function updateMockSchedule(
   id: string,
   updates: Partial<
@@ -36,6 +42,8 @@ function updateMockSchedule(
   >,
   text: string,
 ) {
+  const generation = scheduleDataModeStore.getState().generation;
+  if (!isMockScheduleMode(generation)) return blockedResponse();
   const store = useScheduleStore.getState();
   const target = store.schedules.find((schedule) => schedule.id === id);
   if (!target) return { text: "일정을 찾지 못했어요.", schedules: [] };
@@ -44,6 +52,7 @@ function updateMockSchedule(
     ([field, value]) => target[field as keyof Schedule] === value,
   );
   if (alreadyMatches) {
+    if (!isMockScheduleMode(generation)) return blockedResponse();
     const unchangedText =
       updates.completed === true
         ? "이미 완료된 일정이에요."
@@ -53,16 +62,20 @@ function updateMockSchedule(
     return { text: unchangedText, schedules: [target] };
   }
 
+  if (!isMockScheduleMode(generation)) return blockedResponse();
   store.updateSchedule(id, updates);
   const updated = useScheduleStore
     .getState()
     .schedules.find((schedule) => schedule.id === id);
   if (!updated) return { text: "일정을 찾지 못했어요.", schedules: [] };
 
+  if (!isMockScheduleMode(generation)) return blockedResponse();
   return { text, schedules: [updated] };
 }
 
 function addMockTeamMeeting() {
+  const generation = scheduleDataModeStore.getState().generation;
+  if (!isMockScheduleMode(generation)) return blockedResponse();
   const tomorrow = new Date();
   tomorrow.setDate(tomorrow.getDate() + 1);
 
@@ -74,8 +87,10 @@ function addMockTeamMeeting() {
     category: "기타",
     completed: false,
   };
+  if (!isMockScheduleMode(generation)) return blockedResponse();
   useScheduleStore.getState().addSchedule(schedule);
 
+  if (!isMockScheduleMode(generation)) return blockedResponse();
   return { text: "네, 일정을 추가했어요.", schedules: [schedule] };
 }
 
@@ -95,11 +110,14 @@ export function createMockDeleteConfirmation(scheduleId: string): {
   schedules: Schedule[];
   interaction?: AssistantInteraction;
 } {
+  const generation = scheduleDataModeStore.getState().generation;
+  if (!isMockScheduleMode(generation)) return blockedResponse();
   const target = useScheduleStore
     .getState()
     .schedules.find((schedule) => schedule.id === scheduleId);
   if (!target) return { text: "일정을 찾지 못했어요.", schedules: [] };
 
+  if (!isMockScheduleMode(generation)) return blockedResponse();
   return {
     text: `${formatScheduleDateTime(target)} ${target.title}을 삭제할까요?`,
     schedules: [],
@@ -116,6 +134,7 @@ function runStandaloneMockScenario(input: string): {
   schedules: Schedule[];
   interaction?: AssistantInteraction;
 } | null {
+  if (!isMockScheduleMode()) return blockedResponse();
   switch (input) {
     case "작업장 안전 점검 삭제해 줘":
       return createMockDeleteConfirmation(SAFETY_INSPECTION_TARGET_ID);
@@ -211,13 +230,17 @@ export function resolveMockDeleteConfirmation(
   scheduleId: string,
   confirmed: boolean,
 ) {
+  const generation = scheduleDataModeStore.getState().generation;
+  if (!isMockScheduleMode(generation)) return blockedResponse();
   if (!confirmed) return { text: "삭제하지 않았어요." };
 
   const store = useScheduleStore.getState();
   const target = store.schedules.find((schedule) => schedule.id === scheduleId);
   if (!target) return { text: "일정을 찾지 못했어요." };
 
+  if (!isMockScheduleMode(generation)) return blockedResponse();
   store.deleteSchedule(scheduleId);
+  if (!isMockScheduleMode(generation)) return blockedResponse();
   return { text: "삭제했어요." };
 }
 
@@ -226,6 +249,8 @@ export function runMockAssistantScenario(
   input: string,
   pending: MockAssistantPending = null,
 ) {
+  const generation = scheduleDataModeStore.getState().generation;
+  if (!isMockScheduleMode(generation)) return blockedResponse();
   if (input === "내일 일정 추가해 줘") {
     return {
       text: "어떤 일정으로 추가할까요?",
@@ -294,6 +319,7 @@ export function runMockAssistantScenario(
   }
 
   const standaloneResult = runStandaloneMockScenario(input);
+  if (!isMockScheduleMode(generation)) return blockedResponse();
   if (standaloneResult !== null) {
     // 지원되는 독립 요청을 처리했으면 이전 정보 보완 질문은 더 이상 사용하지 않는다.
     return {

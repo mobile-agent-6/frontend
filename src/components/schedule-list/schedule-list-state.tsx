@@ -4,13 +4,14 @@ import { ThemedText } from "@/components/ui/themed-text";
 import { Spacing } from "@/constants/theme";
 import { useTheme } from "@/hooks/use-theme";
 
-export type ScheduleListViewState = "loading" | "success" | "empty" | "error";
+export type ScheduleListViewState = "loading" | "success" | "empty" | "error" | "notice";
 
 type ScheduleListStateProps = {
   state: Exclude<ScheduleListViewState, "success">;
   onRetry?: () => void;
   emptyText?: string;
   errorTitle?: string;
+  retryLabel?: string;
 };
 
 export function ScheduleListState({
@@ -18,6 +19,7 @@ export function ScheduleListState({
   onRetry,
   emptyText = "등록된 일정이 없어요.",
   errorTitle = "일정을 불러오지 못했어요.",
+  retryLabel = "다시 시도",
 }: ScheduleListStateProps) {
   const theme = useTheme();
 
@@ -48,18 +50,19 @@ export function ScheduleListState({
 
   return (
     <View
-      accessibilityRole="alert"
+      accessibilityRole={state === "error" ? "alert" : undefined}
+      accessibilityLiveRegion="polite"
       style={[styles.container, styles.errorContainer]}
     >
       <ThemedText style={styles.errorTitle}>
         {errorTitle}
       </ThemedText>
       <ThemedText type="small" themeColor="textSecondary">
-        잠시 후 다시 시도해 주세요.
+        {state === "notice" ? "GET으로 최신 상태를 확인할 수 있어요." : "잠시 후 다시 시도해 주세요."}
       </ThemedText>
       {onRetry && (
         <Pressable accessibilityRole="button" onPress={onRetry} hitSlop={Spacing.two} style={styles.retryButton}>
-          <ThemedText themeColor="primary">다시 시도</ThemedText>
+          <ThemedText themeColor="primary">{retryLabel}</ThemedText>
         </Pressable>
       )}
     </View>

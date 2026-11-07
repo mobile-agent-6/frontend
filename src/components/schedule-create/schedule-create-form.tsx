@@ -2,6 +2,7 @@ import { DateTimePicker } from "@expo/ui/community/datetime-picker";
 import * as Crypto from "expo-crypto";
 import { useRouter } from "expo-router";
 import { useRef, useState } from "react";
+import { useStore } from "zustand";
 import {
   Keyboard,
   KeyboardAvoidingView,
@@ -23,6 +24,8 @@ import { Spacing } from "@/constants/theme";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useTheme } from "@/hooks/use-theme";
 import { useScheduleStore } from "@/stores/scheduleStore";
+import { isMockScheduleMode, isScheduleRequestAllowed, scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
+import { SCHEDULE_CREATION_READ_ONLY_MESSAGE, useScheduleCreation } from "@/hooks/use-schedule-creation";
 import type { Schedule, ScheduleCategory } from "@/types/schedule";
 import {
   createDatePickerValue,
@@ -35,6 +38,9 @@ export function ScheduleCreateForm() {
   const theme = useTheme();
   const colorScheme = useColorScheme();
   const router = useRouter();
+  const serverMode = useStore(scheduleDataModeStore, (state) => state.mode === "server");
+  const creation = useScheduleCreation();
+  const readOnly = serverMode && !isScheduleRequestAllowed("POST", "/schedules");
   const addSchedule = useScheduleStore((state) => state.addSchedule);
   const [title, setTitle] = useState("");
   const [date, setDate] = useState<string | null>(null);
@@ -88,7 +94,19 @@ export function ScheduleCreateForm() {
     }
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
+    if (!isMockScheduleMode()) {
+      if (readOnly) { setFormError(SCHEDULE_CREATION_READ_ONLY_MESSAGE); return; }
+      if (date === null || time === null || category === null) { setFormError("필수 항목을 모두 입력해 주세요."); return; }
+      const generation = scheduleDataModeStore.getState().generation;
+      setFormError(null);
+      if (await creation.save({ title, date, time, category }) &&
+        generation === scheduleDataModeStore.getState().generation && !isMockScheduleMode()) {
+        try { router.back(); } catch { setFormError("일정은 저장되었습니다. 뒤로가기로 이전 화면으로 돌아가 주세요."); }
+      }
+      return;
+    }
+    const generation = scheduleDataModeStore.getState().generation;
     if (saveLockedRef.current) {
       return;
     }
@@ -114,6 +132,7 @@ export function ScheduleCreateForm() {
         completed: false,
       };
 
+      if (!isMockScheduleMode(generation)) return;
       addSchedule(newSchedule);
     } catch {
       setFormError("일정을 저장하지 못했습니다. 다시 시도해 주세요.");
@@ -125,9 +144,16 @@ export function ScheduleCreateForm() {
     // 화면 이동에 오류가 나더라도 이 화면을 벗어날 때까지 저장 잠금을 유지한다.
     // 이미 저장한 일정을 저장 실패로 간주해 다시 등록하지 않도록 한다.
     try {
-      router.back();
+      if (isMockScheduleMode(generation)) router.back();
     } catch {
       setFormError("일정은 저장되었습니다. 뒤로가기로 이전 화면으로 돌아가 주세요.");
+    }
+  };
+
+  const handleGetRetry = async () => {
+    const generation = scheduleDataModeStore.getState().generation;
+    if (await creation.retryGet() && generation === scheduleDataModeStore.getState().generation && !isMockScheduleMode()) {
+      try { router.back(); } catch { setFormError("일정은 저장되었습니다. 뒤로가기로 이전 화면으로 돌아가 주세요."); }
     }
   };
 
@@ -215,14 +241,17 @@ export function ScheduleCreateForm() {
             onSelectCategory={setCategory}
           />
 
-          {formError ? (
+          {formError || (serverMode && (creation.error || readOnly)) ? (
             <View accessibilityRole="alert" style={styles.formError}>
               <ThemedText
                 type="small"
                 style={[styles.formErrorText, { color: theme.primary }]}
               >
-                {formError}
+                {readOnly ? SCHEDULE_CREATION_READ_ONLY_MESSAGE : serverMode ? creation.error ?? formError : formError}
               </ThemedText>
+              {serverMode && creation.needsCheck && (
+                <Button label="목록 다시 불러오기" onPress={handleGetRetry} disabled={creation.busy} />
+              )}
             </View>
           ) : null}
         </ScrollView>
@@ -240,7 +269,7 @@ export function ScheduleCreateForm() {
           <Button
             label="저장"
             onPress={handleSave}
-            disabled={!canSave || saveLocked}
+            disabled={readOnly || !canSave || saveLocked || (serverMode && (creation.busy || creation.created))}
           />
         </SafeAreaView>
       </KeyboardAvoidingView>

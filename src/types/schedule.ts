@@ -17,7 +17,7 @@ export const SCHEDULE_CATEGORIES: ScheduleCategory[] = [
 
 export type Schedule = {
   /**
-   * 서버 일정 ID는 UUID v4 문자열이며 프론트에서는 string으로 보관한다.
+   * 서버에서 받은 일정 ID를 UUID 버전 검사 없이 string으로 보관한다.
    */
   id: string;
   title: string;
@@ -45,3 +45,7 @@ export type ScheduleDto = {
   createdAt: string;
   updatedAt: string;
 };
+
+export type ScheduleCreateInput = Pick<ScheduleDto, "title" | "scheduledAt" | "category">;
+
+export type ScheduleUpdateInput = Partial<Pick<ScheduleDto, "title" | "scheduledAt" | "category" | "completed">>;
