@@ -30,9 +30,11 @@ import {
 
 type ScheduleEditFormProps = {
   schedule: Schedule;
-  onSave: (updates: Partial<Schedule>) => void;
+  onSave: (updates: Partial<Schedule>, original: Schedule) => void;
   actionLocked: boolean;
   actionError: string | null;
+  onRetryRead?: () => void;
+  retryReadDisabled?: boolean;
 };
 
 export function ScheduleEditForm({
@@ -40,10 +42,13 @@ export function ScheduleEditForm({
   onSave,
   actionLocked,
   actionError,
+  onRetryRead,
+  retryReadDisabled,
 }: ScheduleEditFormProps) {
   const theme = useTheme();
   const colorScheme = useColorScheme();
   const [original] = useState(() => ({
+    ...schedule,
     title: schedule.title.trim(),
     date: schedule.date,
     time: schedule.time,
@@ -85,7 +90,7 @@ export function ScheduleEditForm({
 
     if (!isDirty) return;
 
-    onSave(updates);
+    onSave(updates, original);
   };
 
   const fieldBackground =
@@ -224,6 +229,7 @@ export function ScheduleEditForm({
                 >
                   {formError ?? actionError}
                 </ThemedText>
+                {onRetryRead && <Button label="서버 상태 다시 불러오기" onPress={onRetryRead} disabled={retryReadDisabled} />}
               </View>
             ) : null}
           </ScrollView>

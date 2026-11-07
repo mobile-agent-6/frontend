@@ -263,7 +263,19 @@ export function createServerScheduleStore({
     });
     return { ok: failedQueries.length === 0, failedQueries };
   }
-  return { store, syncServer, acquire, acquireDetail, invalidate, refreshLists,
+  /** 확인된 write 응답만 반영한다. 이전 GET은 취소하고 새 객체 버전 경계를 만든다. */
+  function applyScheduleResult(expectedServerId: string, schedule: Schedule) {
+    if (syncServer() !== expectedServerId) return false;
+    invalidate();
+    const version = ++sequence;
+    update(expectedServerId, (cache) => {
+      const merged = mergeEntities(cache, [schedule], version).cache;
+      merged.details[schedule.id] = { status: "success", hasSuccess: true, stale: false, error: null, sequence: version };
+      return merged;
+    });
+    return true;
+  }
+  return { store, syncServer, acquire, acquireDetail, invalidate, refreshLists, applyScheduleResult,
     retryDetail: (scheduleId: string) => fetchDetail(scheduleId, true),
     retry: (query: ScheduleListQuery) => fetchQuery(query, true) };
 }

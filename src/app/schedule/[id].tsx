@@ -11,7 +11,8 @@ import { ThemedView } from "@/components/ui/themed-view";
 import { Spacing } from "@/constants/theme";
 import { useTheme } from "@/hooks/use-theme";
 import { useScheduleStore } from "@/stores/scheduleStore";
-import { isMockScheduleMode, scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
+import { isMockScheduleMode, isScheduleRequestAllowed, scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
+import { useScheduleUpdate } from "@/hooks/use-schedule-update";
 import { useServerScheduleDetail } from "@/hooks/use-server-schedule-data";
 import { ScheduleListState } from "@/components/schedule-list/schedule-list-state";
 import type { Schedule } from "@/types/schedule";
@@ -35,6 +36,8 @@ function ScheduleEditContent({ id, serverMode, generation, detail }: {
 }) {
   const router = useRouter();
   const theme = useTheme();
+  const serverUpdate = useScheduleUpdate(id, detail.serverId);
+  const patchAllowed = serverMode && Boolean(id) && isScheduleRequestAllowed("PATCH", `/schedules/${encodeURIComponent(id ?? "")}`);
   const schedules = useScheduleStore((state) => state.schedules);
   const deleteSchedule = useScheduleStore((state) => state.deleteSchedule);
   const updateSchedule = useScheduleStore((state) => state.updateSchedule);
@@ -57,8 +60,8 @@ function ScheduleEditContent({ id, serverMode, generation, detail }: {
       ? schedules.find((item) => item.id === id)
       : undefined;
 
-  // 삭제 성공 직후에도 화면 이동 전까지 form을 유지해 not-found 깜빡임을 막는다.
-  const displayedSchedule = schedule ?? (!serverMode && actionLocked ? actionSchedule : null);
+  // 확정 성공 또는 결과 확인 중에는 원래 폼을 유지해 입력 유실·not-found 깜빡임을 막는다.
+  const displayedSchedule = schedule ?? ((serverMode ? serverUpdate.busy || serverUpdate.blocked : actionLocked) ? actionSchedule : null);
 
   const openDeleteModal = () => {
     if (!mountedRef.current || !isMockScheduleMode(generation)) return;
@@ -142,7 +145,19 @@ function ScheduleEditContent({ id, serverMode, generation, detail }: {
     navigateBack(kind);
   };
 
-  const handleSave = (updates: Partial<Schedule>) => {
+  const finishServerUpdate = () => {
+    if (!mountedRef.current || isMockScheduleMode() || generation !== scheduleDataModeStore.getState().generation) return;
+    try { router.back(); } catch { setActionError("일정은 수정되었습니다. 뒤로가기로 이전 화면으로 돌아가 주세요."); }
+  };
+  const retryServerRead = async () => { if (await serverUpdate.retryGet()) finishServerUpdate(); };
+  const handleSave = async (updates: Partial<Schedule>, original: Schedule) => {
+    if (serverMode) {
+      if (!mountedRef.current || isMockScheduleMode() || generation !== scheduleDataModeStore.getState().generation ||
+        !patchAllowed || detail.isFetching || !detail.hasDetailSuccess || detail.error) return;
+      setActionSchedule(schedule ?? original);
+      if (await serverUpdate.save(original, updates)) finishServerUpdate();
+      return;
+    }
     if (!mountedRef.current || !isMockScheduleMode(generation)) return;
     if (!schedule || deleteModalVisibleRef.current || Object.keys(updates).length === 0) return;
     runMutation("update", () => updateSchedule(schedule.id, updates));
@@ -201,8 +216,11 @@ function ScheduleEditContent({ id, serverMode, generation, detail }: {
           key={displayedSchedule.id}
           schedule={displayedSchedule}
           onSave={handleSave}
-          actionLocked={serverMode || actionLocked || isDeleteModalVisible || isDeleteModalDismissing}
-          actionError={serverMode ? "수정·삭제의 실제 서버 연동은 아직 준비 중입니다." : actionError}
+          actionLocked={(serverMode && (!patchAllowed || detail.isFetching || !detail.hasDetailSuccess || Boolean(detail.error) ||
+            serverUpdate.busy || serverUpdate.blocked)) || actionLocked || isDeleteModalVisible || isDeleteModalDismissing}
+          actionError={serverMode ? serverUpdate.error ?? actionError ?? (!patchAllowed ? "현재 정책에서는 일정 수정·삭제를 사용할 수 없어요." : null) : actionError}
+          onRetryRead={serverMode && serverUpdate.needsCheck ? retryServerRead : undefined}
+          retryReadDisabled={serverUpdate.busy}
         />
       ) : !serverMode ? (
         <ThemedView style={styles.notFound}>

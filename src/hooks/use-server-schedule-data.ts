@@ -81,6 +81,7 @@ export function useServerScheduleDetail(scheduleId: string | undefined, enabled 
   const notFound = error?.kind === "http" && error.status === 404 && error.problem?.code === "SCHEDULE_NOT_FOUND";
   const schedule = !localError && !notFound && scheduleId ? cache?.entities[scheduleId] : undefined;
   return { serverId, schedule, error, notFound,
+    hasDetailSuccess: entry?.hasSuccess ?? false,
     initialLoading: enabled && !schedule && !error,
     isFetching: entry?.status === "loading",
     hasSuccessfulRead: Boolean(schedule),

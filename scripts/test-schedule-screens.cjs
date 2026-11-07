@@ -8,7 +8,7 @@ const root = path.resolve(__dirname, "..");
 
 // 실제 화면·Hook·서비스를 실행하되 native 컴포넌트와 React 실행기만 메모리 대역으로 둔다.
 // native 렌더링·레이아웃·아이폰 통신을 검증하는 테스트는 아니다.
-function harness(initialMode, { allowCreation = false, writeScope } = {}) {
+function harness(initialMode, { allowCreation = false, writeScope, allowPatch = false } = {}) {
   const modules = new Map(), screens = [], calls = [], navigations = [];
   let current;
   const mark = (owner) => { owner.dirty = true; if (owner.root) owner.root.dirty = true; };
@@ -89,6 +89,12 @@ function harness(initialMode, { allowCreation = false, writeScope } = {}) {
   http.scheduleHttpClient = http.createScheduleHttpClient({ readConfig: () => config, fetchImpl: (url, options) =>
     new Promise((resolve, reject) => calls.push({ url, ...options, resolve, reject })) });
   const modeModule = source("src/stores/scheduleDataModeStore.ts");
+  // PATCH 화면 시험에만 정책을 주입한다. 제품 정책·실행 환경·실제 fetch는 바꾸지 않는다.
+  if (allowPatch) {
+    const originalPolicy = modeModule.isScheduleRequestAllowed;
+    modeModule.isScheduleRequestAllowed = (method, path) =>
+      (method === "PATCH" && /^\/schedules\/[^/]+$/.test(path)) || originalPolicy(method, path);
+  }
   // 테스트 전용 환경값으로 실제 정책을 사용한다. 네트워크는 항상 메모리 fetch다.
   const mode = modeModule.scheduleDataModeStore;
   const mock = source("src/stores/scheduleStore.ts").useScheduleStore;
@@ -706,5 +712,143 @@ test("create scope라도 수정·삭제·완료 및 Assistant UI 차단은 유�
     assert.strictEqual(h.mock.getState().schedules, before);
     const list = h.mount("index"); await h.settle(); h.respond(1, [dto("target")]); await h.settle();
     assert.equal(list.one("FlatList").renderItem({ item: list.one("FlatList").data[0] }).props.completionDisabled, true);
+  } finally { h.close(); }
+});
+
+async function editableDetail(h, id = "target") {
+  const screen = h.mount("detail", id); await h.settle();
+  h.detail(h.calls.length - 1, dto(id)); await h.settle(); return screen;
+}
+function editTitle(h, screen, title = "수정 입력") { screen.one("TextInput").onChangeText(title); h.flush(); }
+
+test("PATCH 제목만 전송·중복 저장 방지·동일 ID와 공유 entity 및 목록/캘린더 동기화", async () => {
+  const h = harness("server", { allowPatch: true }); try {
+    const list = h.mount("index"), calendar = h.mount("calendar"); await h.settle();
+    h.respond(0, [dto("target")]); h.respond(1, [dto("target")]); await h.settle();
+    const screen = await editableDetail(h); editTitle(h, screen);
+    saveButton(screen).onPress(); saveButton(screen).onPress(); await h.settle();
+    assert.equal(h.calls.length, 4); assert.equal(h.calls[3].method, "PATCH");
+    assert.deepEqual(JSON.parse(h.calls[3].body), { title: "수정 입력" }); assert.equal(h.calls[3].headers.has("Idempotency-Key"), false);
+    assert.deepEqual(h.navigations, []);
+    const updated = { ...dto("target"), title: "수정 입력" }; h.detail(3, updated); await h.settle();
+    assert.equal(list.one("FlatList").data[0].title, "수정 입력"); assert.equal(calendar.all("ScheduleCard")[0].schedule.title, "수정 입력");
+    assert.equal(h.calls.length, 6); h.respond(4, [updated]); h.respond(5, [updated]); await h.settle();
+    assert.deepEqual(h.navigations, ["back"]); assert.equal(h.calls.filter((c) => c.method === "PATCH").length, 1);
+  } finally { h.close(); }
+});
+test("변경 없음 PATCH 금지·카테고리만 변경하면 scheduledAt 제외", async () => {
+  const h = harness("server", { allowPatch: true }); try {
+    const screen = await editableDetail(h); assert.equal(saveButton(screen).disabled, true);
+    saveButton(screen).onPress(); await h.settle(); assert.equal(h.calls.length, 1);
+    screen.one("ScheduleCategorySelector").onSelectCategory("출고"); h.flush(); saveButton(screen).onPress(); await h.settle();
+    assert.deepEqual(JSON.parse(h.calls[1].body), { category: "OUTBOUND" });
+    h.detail(1, { ...dto("target"), category: "OUTBOUND" }); await h.settle(); h.respond(2, []); await h.settle();
+  } finally { h.close(); }
+});
+test("날짜·시간 변경 시 mapper로 scheduledAt만 직렬화", async () => {
+  const h = harness("server", { allowPatch: true }); try {
+    const screen = await editableDetail(h);
+    screen.one("ScheduleDateField").onPress(); h.flush();
+    screen.one("DateTimePicker").onValueChange(null, new Date(2026, 10, 20, 15, 40)); h.flush();
+    screen.one("ScheduleTimeField").onPress(); h.flush();
+    screen.one("DateTimePicker").onValueChange(null, new Date(2026, 10, 20, 15, 40)); h.flush();
+    saveButton(screen).onPress(); await h.settle(); assert.deepEqual(JSON.parse(h.calls[1].body), { scheduledAt: "2026-11-20T15:40:00+09:00" });
+  } finally { h.close(); }
+});
+test("PATCH 성공 후 GET 실패는 성공 유지·GET만 재시도", async () => {
+  const h = harness("server", { allowPatch: true }); try {
+    const screen = await editableDetail(h); editTitle(h, screen); saveButton(screen).onPress(); await h.settle();
+    h.detail(1, { ...dto("target"), title: "수정 입력" }); await h.settle(); h.respond(2, [], 500); await h.settle();
+    assert.match(formText(screen), /수정되었지만/); assert.equal(saveButton(screen).disabled, true);
+    saveButton(screen).onPress(); await h.settle(); assert.equal(h.calls.length, 3);
+    screen.all("Button").find((p) => p.label === "서버 상태 다시 불러오기").onPress(); await h.settle();
+    assert.equal(h.calls[3].method, "GET"); h.respond(3, [dto("target")]); await h.settle();
+    assert.deepEqual(h.navigations, ["back"]); assert.equal(h.calls.filter((c) => c.method === "PATCH").length, 1);
+  } finally { h.close(); }
+});
+test("PATCH 확정 404·422 오류는 입력과 원래 공유 데이터를 보존", async () => {
+  for (const [status, code, message] of [[404, "SCHEDULE_NOT_FOUND", /수정할 일정/], [422, "SCHEDULE_IN_THE_PAST", /과거 시각/],
+    [422, "VALIDATION_ERROR", /입력값/]]) {
+    const h = harness("server", { allowPatch: true }); try {
+      const screen = await editableDetail(h); editTitle(h, screen); saveButton(screen).onPress(); await h.settle();
+      h.detail(1, { type: "test", title: "test", detail: "변경 가능한 상세", instance: "/schedules", requestId: "r", status, code,
+        ...(code === "VALIDATION_ERROR" ? { errors: [{ location: "body", pointer: "/title", code: "TOO_LONG", detail: "test" }] } : {}) }, status, "application/problem+json");
+      await h.settle(); assert.match(formText(screen), message); assert.equal(screen.one("TextInput").value, "수정 입력");
+      assert.equal(Object.values(h.server.store.getState().servers)[0].entities.target.title, "target"); assert.deepEqual(h.navigations, []);
+    } finally { h.close(); }
+  }
+});
+test("PATCH 불확실 결과는 재저장 차단·고정 body 제한 retry·단건 GET 확인", async () => {
+  const h = harness("server", { allowPatch: true }); try {
+    const screen = await editableDetail(h); editTitle(h, screen); saveButton(screen).onPress(); await h.settle();
+    h.calls[1].reject(new Error("메모리 네트워크 오류")); await h.settle(); h.calls[2].reject(new Error("메모리 네트워크 오류")); await h.settle();
+    assert.equal(h.calls[1].body, h.calls[2].body); assert.equal(h.calls[1].url, h.calls[2].url);
+    assert.match(formText(screen), /수정 결과/); assert.equal(screen.one("TextInput").value, "수정 입력");
+    saveButton(screen).onPress(); await h.settle(); assert.equal(h.calls.length, 3);
+    screen.all("Button").find((p) => p.label === "서버 상태 다시 불러오기").onPress(); await h.settle();
+    assert.equal(h.calls[3].method, "GET"); h.detail(3, dto("target")); await h.settle();
+    assert.equal(screen.one("TextInput").value, "수정 입력"); assert.equal(h.calls.filter((c) => c.method === "PATCH").length, 2);
+    assert.deepEqual(h.navigations, []);
+  } finally { h.close(); }
+});
+test("PATCH 응답의 ID 불일치는 cache 반영·성공 navigation 금지", async () => {
+  const h = harness("server", { allowPatch: true }); try {
+    const screen = await editableDetail(h); editTitle(h, screen); saveButton(screen).onPress(); await h.settle();
+    h.detail(1, dto("wrong")); await h.settle(); assert.match(formText(screen), /ID가 일치하지/);
+    assert.equal(Object.values(h.server.store.getState().servers)[0].entities.wrong, undefined); assert.deepEqual(h.navigations, []);
+  } finally { h.close(); }
+});
+test("수정 중 GET 재조회는 입력·dirty-check 원본을 바꾸지 않음", async () => {
+  const h = harness("server", { allowPatch: true }); try {
+    const screen = await editableDetail(h); editTitle(h, screen); const refresh = h.server.retryDetail("target"); await h.settle();
+    h.detail(1, { ...dto("target"), title: "서버 새 제목" }); await refresh; await h.settle();
+    assert.equal(screen.one("TextInput").value, "수정 입력"); saveButton(screen).onPress(); await h.settle();
+    assert.deepEqual(JSON.parse(h.calls[2].body), { title: "수정 입력" });
+  } finally { h.close(); }
+});
+test("PATCH 중 route ID·모드·서버 변경·unmount는 이전 응답과 navigation 차단", async () => {
+  for (const change of ["route", "mode", "server", "unmount"]) {
+    const h = harness("server", { allowPatch: true }); try {
+      const screen = await editableDetail(h); editTitle(h, screen); saveButton(screen).onPress(); await h.settle();
+      if (change === "route") screen.route("other");
+      if (change === "mode") h.mode("mock");
+      if (change === "server") h.config("https://other.example.invalid");
+      if (change === "unmount") screen.close();
+      await h.settle(); assert.equal(h.calls[1].signal.aborted, true);
+      h.detail(1, { ...dto("target"), title: "늦은 수정" }); await h.settle(); assert.deepEqual(h.navigations, []);
+      if (change === "route" || change === "server") { h.detail(2, dto(change === "route" ? "other" : "target")); await h.settle(); }
+    } finally { h.close(); }
+  }
+});
+test("PATCH 이전 GET의 늦은 응답은 성공한 공유 객체를 덮지 않음", async () => {
+  const h = harness("server", { allowPatch: true }); try {
+    const screen = await editableDetail(h); const list = h.mount("index"); await h.settle();
+    h.respond(1, [dto("target")]); await h.settle();
+    const old = h.server.retry(h.source("src/utils/schedule-query.ts").getMainScheduleRange(new Date("2026-11-07T03:00:00Z"))); await h.settle();
+    editTitle(h, screen); saveButton(screen).onPress(); await h.settle(); assert.equal(h.calls[2].signal.aborted, true);
+    const updated = { ...dto("target"), title: "수정 입력" }; h.detail(3, updated); await h.settle();
+    h.respond(2, [{ ...dto("target"), title: "오래된 값" }]); await old; await h.settle();
+    assert.equal(list.one("FlatList").data[0].title, "수정 입력"); h.respond(4, [updated]); await h.settle();
+    assert.equal(list.one("FlatList").data[0].title, "수정 입력");
+  } finally { h.close(); }
+});
+
+test("PATCH 결과 확인 GET이 404여도 입력을 보존하고 조회 성공으로 안내하지 않음", async () => {
+  const h = harness("server", { allowPatch: true }); try {
+    const screen = await editableDetail(h); editTitle(h, screen); saveButton(screen).onPress(); await h.settle();
+    h.calls[1].reject(new Error("메모리 네트워크 오류")); await h.settle(); h.calls[2].reject(new Error("메모리 네트워크 오류")); await h.settle();
+    screen.all("Button").find((p) => p.label === "서버 상태 다시 불러오기").onPress(); await h.settle();
+    h.detail(3, notFoundProblem(), 404, "application/problem+json"); await h.settle();
+    assert.equal(screen.one("TextInput").value, "수정 입력"); assert.match(formText(screen), /서버 상태를 확인하지 못했/);
+    assert.equal(saveButton(screen).disabled, true); assert.deepEqual(h.navigations, []);
+  } finally { h.close(); }
+});
+test("PATCH timeout은 결과 불확실·입력 유지·새 PATCH 차단", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const h = harness("server", { allowPatch: true }); try {
+    const screen = await editableDetail(h); editTitle(h, screen); saveButton(screen).onPress(); await h.settle();
+    t.mock.timers.tick(10_000); await h.settle(); t.mock.timers.tick(10_000); await h.settle();
+    assert.match(formText(screen), /수정 결과/); assert.equal(screen.one("TextInput").value, "수정 입력");
+    saveButton(screen).onPress(); await h.settle(); assert.equal(h.calls.length, 3); assert.deepEqual(h.navigations, []);
   } finally { h.close(); }
 });
