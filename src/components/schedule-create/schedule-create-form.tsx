@@ -40,7 +40,7 @@ export function ScheduleCreateForm() {
   const router = useRouter();
   const serverMode = useStore(scheduleDataModeStore, (state) => state.mode === "server");
   const creation = useScheduleCreation();
-  const readOnly = serverMode && !isScheduleRequestAllowed("POST");
+  const readOnly = serverMode && !isScheduleRequestAllowed("POST", "/schedules");
   const addSchedule = useScheduleStore((state) => state.addSchedule);
   const [title, setTitle] = useState("");
   const [date, setDate] = useState<string | null>(null);

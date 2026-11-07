@@ -89,7 +89,7 @@ export function createScheduleHttpClient({
       kind: "request", policyReason: "read-only", requestState: attempts ? "unconfirmed" : "not-sent",
       unconfirmedAttempt: attempts > 0,
     } });
-    if (!isScheduleRequestAllowed(method)) return blocked(0);
+    if (!isScheduleRequestAllowed(method, options.path)) return blocked(0);
     const initial = readConfig();
     if (initial.status !== "ready") {
       return { ok: false, attempts: 0, error: {
@@ -159,7 +159,9 @@ export function createScheduleHttpClient({
 
       const receive = async (): Promise<HttpResult<unknown>> => {
         try {
-          const response = await fetchImpl(url, { method, headers: new Headers(headers), body, signal: controller.signal });
+          const response = await fetchImpl(url, { method, headers: new Headers(headers), body, signal: controller.signal,
+            // 쓰기 요청의 redirect로 허용되지 않은 endpoint에 재전송되는 것을 방지한다.
+            redirect: method === "GET" ? "follow" : "error" });
           status = response.status;
           requestId = response.headers.get("X-Request-ID");
           location = response.headers.get("Location");
@@ -196,7 +198,7 @@ export function createScheduleHttpClient({
     }
 
     for (let index = 0; index < 2; index++) {
-      if (!isScheduleRequestAllowed(method)) return blocked(attempts);
+      if (!isScheduleRequestAllowed(method, options.path)) return blocked(attempts);
       if (options.signal?.aborted || !isCurrentServer()) {
         return { ok: false, attempts, error: { kind: "aborted", requestState: attempts ? "unconfirmed" : "not-sent" } };
       }

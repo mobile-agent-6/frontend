@@ -8,7 +8,7 @@ const root = path.resolve(__dirname, "..");
 
 // 실제 화면·Hook·서비스를 실행하되 native 컴포넌트와 React 실행기만 메모리 대역으로 둔다.
 // native 렌더링·레이아웃·아이폰 통신을 검증하는 테스트는 아니다.
-function harness(initialMode, { allowCreation = false } = {}) {
+function harness(initialMode, { allowCreation = false, writeScope } = {}) {
   const modules = new Map(), screens = [], calls = [], navigations = [];
   let current;
   const mark = (owner) => { owner.dirty = true; if (owner.root) owner.root.dirty = true; };
@@ -78,7 +78,8 @@ function harness(initialMode, { allowCreation = false } = {}) {
     };
     new Function("require", "module", "exports", "fetch", "Date", "process", code)(resolve, module, module.exports,
       () => { throw new Error("실제 네트워크 요청 금지"); }, FixedDate,
-      { env: { EXPO_PUBLIC_SCHEDULE_DATA_MODE: initialMode } });
+      { env: { EXPO_PUBLIC_SCHEDULE_DATA_MODE: initialMode,
+        EXPO_PUBLIC_SCHEDULE_WRITE_SCOPE: writeScope ?? (allowCreation ? "create" : undefined) } });
     return module.exports;
   }
   const configModule = source("src/services/api/config.ts");
@@ -88,8 +89,7 @@ function harness(initialMode, { allowCreation = false } = {}) {
   http.scheduleHttpClient = http.createScheduleHttpClient({ readConfig: () => config, fetchImpl: (url, options) =>
     new Promise((resolve, reject) => calls.push({ url, ...options, resolve, reject })) });
   const modeModule = source("src/stores/scheduleDataModeStore.ts");
-  // 이 메모리 실행기에만 주입한다. 제품 정책·환경 설정·실제 fetch는 변경하지 않는다.
-  if (allowCreation) modeModule.isScheduleRequestAllowed = (method) => method === "GET" || method === "POST";
+  // 테스트 전용 환경값으로 실제 정책을 사용한다. 네트워크는 항상 메모리 fetch다.
   const mode = modeModule.scheduleDataModeStore;
   const mock = source("src/stores/scheduleStore.ts").useScheduleStore;
   const server = source("src/stores/serverScheduleStore.ts").serverScheduleStore;
@@ -629,5 +629,82 @@ test("생성 중 모드 변경은 요청 대기를 취소하고 가짜 navigatio
     const screen = h.mount("create"); fillCreation(h, screen); const pending = createButton(screen).onPress(); await h.settle();
     h.mode("mock"); await pending; await h.settle(); assert.equal(h.calls[0].signal.aborted, true);
     assert.deepEqual(h.navigations, []); assert.equal(h.mock.getState().schedules.length, 10);
+  } finally { h.close(); }
+});
+
+test("쓰기 scope 미설정·none·잘못된 값은 저장 버튼 및 직접 handler 차단", async () => {
+  for (const writeScope of [undefined, "none", "invalid", "CREATE", ""]) {
+    const h = harness("server", { writeScope }); try {
+      const screen = h.mount("create"); fillCreation(h, screen);
+      assert.equal(createButton(screen).disabled, true); await createButton(screen).onPress(); await h.settle();
+      assert.equal(h.calls.length, 0); assert.deepEqual(h.navigations, []);
+    } finally { h.close(); }
+  }
+});
+test("create scope는 정확한 Schedule POST만 허용하고 모든 다른 쓰기를 차단", async () => {
+  const h = harness("server", { writeScope: "create" }); try {
+    const screen = h.mount("create"); fillCreation(h, screen); assert.equal(createButton(screen).disabled, false);
+    const http = h.source("src/services/api/http.ts").scheduleHttpClient;
+    for (const [method, path] of [
+      ["PATCH", "/schedules/target"], ["DELETE", "/schedules/target"],
+      ["POST", "/system/time-sync"], ["POST", "/assistant/requests"],
+      ["POST", "/schedules/target"], ["POST", "/schedules/"], ["POST", "/schedules-extra"],
+      ["POST", "/other/schedules"], ["POST", "/api/v1/schedules"], ["POST", "/%73chedules"],
+      ["POST", "/schedules?other=1"], ["POST", "/schedules#fragment"],
+      ["POST", "/other/../schedules"], ["POST", "//schedules"],
+    ]) {
+      const result = await http.request({ method, path });
+      assert.equal(result.ok, false); assert.equal(result.attempts, 0); assert.equal(result.error.policyReason, "read-only");
+    }
+    assert.equal(h.calls.length, 0);
+    const policy = fs.readFileSync(path.join(root, "src/stores/scheduleDataModeStore.ts"), "utf8");
+    assert.match(policy, /process\.env\.EXPO_PUBLIC_SCHEDULE_WRITE_SCOPE/); assert.doesNotMatch(policy, /__DEV__/);
+  } finally { h.close(); }
+});
+test("Mock 모드에서는 create scope로도 기존 CRUD를 유지", async () => {
+  const h = harness("mock", { writeScope: "create" }); try {
+    const policy = h.source("src/stores/scheduleDataModeStore.ts");
+    assert.equal(policy.isScheduleRequestAllowed("PATCH", "/schedules/target"), true);
+    const screen = h.mount("create"); fillCreation(h, screen); await createButton(screen).onPress(); h.flush();
+    const added = h.mock.getState().schedules.at(-1);
+    h.mock.getState().updateSchedule(added.id, { title: "수정" }); h.mock.getState().toggleCompleted(added.id);
+    assert.equal(h.mock.getState().schedules.at(-1).completed, true);
+    h.mock.getState().deleteSchedule(added.id); assert.equal(h.mock.getState().schedules.length, 10);
+    assert.equal(h.calls.length, 0);
+  } finally { h.close(); }
+});
+test("create scope의 최초 201·실제 replay 전송·409 메타데이터를 검사할 수 있음", async () => {
+  const h = harness("server", { writeScope: "create" }); try {
+    const service = h.source("src/services/api/schedules.ts");
+    const op = service.prepareScheduleCreation({ title: "검증용 입력", scheduledAt: "2026-11-10T03:00:00Z", category: "INVENTORY" }).operation;
+    assert.match(op.idempotencyKey, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+    const first = op.submit(); await h.settle();
+    assert.equal(h.calls[0].redirect, "error"); h.detail(0, dto("created"), 201, "application/json", { "Location": "/api/v1/schedules/created" });
+    const initial = await first; assert.equal(initial.response.status, 201); assert.equal(initial.response.location, "/api/v1/schedules/created");
+    assert.equal(initial.response.idempotentReplayed, null);
+    // submit의 성공 캐시는 HTTP replay 검증과 다르다. 새 전송 없이 같은 결과를 반환한다.
+    await op.submit(); assert.equal(h.calls.length, 1);
+    const client = h.source("src/services/api/http.ts").scheduleHttpClient;
+    const replay = client.request({ method: "POST", path: "/schedules", headers: { "Idempotency-Key": op.idempotencyKey }, body: op.payload });
+    await h.settle(); assert.equal(h.calls[1].body, h.calls[0].body);
+    h.detail(1, dto("created"), 201, "application/json", { "Idempotent-Replayed": "true" });
+    const replayed = await replay; assert.equal(replayed.status, 201); assert.equal(replayed.idempotentReplayed, "true");
+    assert.equal(replayed.data.id, initial.response.data.id);
+    const conflict = client.request({ method: "POST", path: "/schedules", headers: { "Idempotency-Key": op.idempotencyKey }, body: { ...op.payload, title: "다른 검증용 입력" } });
+    await h.settle(); h.detail(2, { type: "test", title: "test", detail: "test", instance: "/schedules", requestId: "r", status: 409,
+      code: "IDEMPOTENCY_KEY_CONFLICT" }, 409, "application/problem+json");
+    const rejected = await conflict; assert.equal(rejected.error.status, 409); assert.equal(rejected.error.problem.code, "IDEMPOTENCY_KEY_CONFLICT");
+    assert.equal(h.calls.length, 3);
+  } finally { h.close(); }
+});
+test("create scope라도 수정·삭제·완료 및 Assistant UI 차단은 유지", async () => {
+  const h = harness("server", { writeScope: "create" }); try {
+    const screen = h.mount("detail", "target"); await h.settle(); h.detail(0, dto("target")); await h.settle();
+    assert.equal(saveButton(screen).disabled, true); assert.equal(screen.one("Stack.Screen").options.headerRight().props.disabled, true);
+    const before = h.mock.getState().schedules;
+    h.source("src/services/mock/assistant.ts").runMockAssistantScenario("내일 오후 3시 팀 회의 추가해 줘");
+    assert.strictEqual(h.mock.getState().schedules, before);
+    const list = h.mount("index"); await h.settle(); h.respond(1, [dto("target")]); await h.settle();
+    assert.equal(list.one("FlatList").renderItem({ item: list.one("FlatList").data[0] }).props.completionDisabled, true);
   } finally { h.close(); }
 });

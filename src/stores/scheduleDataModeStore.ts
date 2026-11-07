@@ -1,10 +1,18 @@
 import { createStore } from "zustand/vanilla";
 
 export type ScheduleDataMode = "mock" | "server";
+export type ScheduleWriteScope = "none" | "create";
 
 export function resolveScheduleDataMode(value: string | undefined): ScheduleDataMode {
   return value === "server" ? "server" : "mock";
 }
+
+export function resolveScheduleWriteScope(value: string | undefined): ScheduleWriteScope {
+  return value === "create" ? "create" : "none";
+}
+
+// 공개 실행 설정이며 앱 시작 시 결정한다. 변경 후에는 번들을 다시 로드한다.
+const writeScope = resolveScheduleWriteScope(process.env.EXPO_PUBLIC_SCHEDULE_WRITE_SCOPE);
 
 // 실행 환경 URL·Settings·요청 성공 여부와 독립적인 명시적 경계다.
 // 서버 화면과 모든 로컬 mutation 경로가 준비되기 전에는 기본값을 변경하지 않는다.
@@ -26,10 +34,11 @@ export function isMockScheduleMode(generation?: number) {
   return current.mode === "mock" && (generation === undefined || generation === current.generation);
 }
 
-// E-0의 백엔드 GET 전용 허용 범위다. CRUD 허용 후 이 정책과 화면 잠금을 함께 교체한다.
-// 서버 모드 자체는 개발/배포 빌드 모두 사용할 수 있다.
-export function isScheduleRequestAllowed(method: string) {
-  return method === "GET" || isMockScheduleMode();
+// HTTP client는 /api/v1을 제외한 경로를 전달한다. 부분 일치나 경로 정규화로 허용을 넓히지 않는다.
+// 생성 외 쓰기는 아직 허용하지 않으며 Mock 모드의 기존 서비스 시험 동작은 유지한다.
+export function isScheduleRequestAllowed(method: string, path: string) {
+  return isMockScheduleMode() || method === "GET" ||
+    (writeScope === "create" && method === "POST" && path === "/schedules");
 }
 
 export const ASSISTANT_NOT_CONNECTED_MESSAGE =

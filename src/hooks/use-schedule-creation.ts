@@ -31,7 +31,7 @@ export function useScheduleCreation() {
 
   async function save(input: { title: string; date: string; time: string; category: ScheduleCategory }): Promise<boolean> {
     if (locked.current || saved.current || !mounted.current) return false;
-    if (!isScheduleRequestAllowed("POST")) { setError(SCHEDULE_CREATION_READ_ONLY_MESSAGE); return false; }
+    if (!isScheduleRequestAllowed("POST", "/schedules")) { setError(SCHEDULE_CREATION_READ_ONLY_MESSAGE); return false; }
     let payload;
     try { payload = { title: input.title.trim(), scheduledAt: uiDateTimeToScheduledAt(input.date, input.time), category: toApiCategory(input.category) }; }
     catch { setError("날짜·시간과 카테고리를 확인해 주세요."); return false; }
