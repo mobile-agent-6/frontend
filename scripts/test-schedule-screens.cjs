@@ -8,7 +8,7 @@ const root = path.resolve(__dirname, "..");
 
 // 실제 화면·Hook·서비스를 실행하되 native 컴포넌트와 React 실행기만 메모리 대역으로 둔다.
 // native 렌더링·레이아웃·아이폰 통신을 검증하는 테스트는 아니다.
-function harness(initialMode, { allowCreation = false, writeScope, allowPatch = false } = {}) {
+function harness(initialMode, { allowCreation = false, writeScope, allowPatch = false, allowDelete = false } = {}) {
   const modules = new Map(), screens = [], calls = [], navigations = [];
   let current;
   const mark = (owner) => { owner.dirty = true; if (owner.root) owner.root.dirty = true; };
@@ -95,6 +95,13 @@ function harness(initialMode, { allowCreation = false, writeScope, allowPatch = 
     modeModule.isScheduleRequestAllowed = (method, path) =>
       (method === "PATCH" && (Array.isArray(allowPatch)
         ? allowPatch.some((id) => path === `/schedules/${encodeURIComponent(id)}`)
+        : /^\/schedules\/[^/]+$/.test(path))) || originalPolicy(method, path);
+  }
+  if (allowDelete) {
+    const originalPolicy = modeModule.isScheduleRequestAllowed;
+    modeModule.isScheduleRequestAllowed = (method, path) =>
+      (method === "DELETE" && (Array.isArray(allowDelete)
+        ? allowDelete.some((id) => path === `/schedules/${encodeURIComponent(id)}`)
         : /^\/schedules\/[^/]+$/.test(path))) || originalPolicy(method, path);
   }
   // 테스트 전용 환경값으로 실제 정책을 사용한다. 네트워크는 항상 메모리 fetch다.
@@ -1130,4 +1137,284 @@ test("H 서버·모드 왕복 전환 전의 토글 callback은 재사용 불가"
       stale(); await h.settle(); assert.equal(patches(h).length, 0);
     } finally { h.close(); }
   }
+});
+
+const deleteButton = (screen) => screen.one("Stack.Screen").options.headerRight()?.props;
+const deleteCalls = (h) => h.calls.filter((c) => c.method === "DELETE");
+const retryDeletion = (screen) => screen.all("Button").find((p) => p.label === "서버 상태 다시 불러오기")?.onPress ?? screen.one("ScheduleListState")?.onRetry;
+function confirmDelete(h, screen) {
+  deleteButton(screen).onPress(); h.flush();
+  assert.equal(screen.one("ConfirmationModal").visible, true);
+  screen.one("ConfirmationModal").onConfirm(); h.flush();
+}
+function noContent(h, index) {
+  h.calls[index].resolve({ status: 204, ok: true, headers: new Headers(),
+    text() { throw new Error("204 본문 파싱 금지"); }, json() { throw new Error("204 JSON 파싱 금지"); } });
+}
+
+test("I Mock 삭제 모달 취소·재확인·중복 확인·dismiss navigation 회귀와 HTTP 0회", async () => {
+  const h = harness("mock"); try {
+    const screen = h.mount("detail", mockId), before = h.mock.getState().schedules;
+    deleteButton(screen).onPress(); deleteButton(screen).onPress(); h.flush();
+    assert.equal(screen.one("ConfirmationModal").visible, true); screen.one("ConfirmationModal").onCancel(); h.flush();
+    screen.one("ConfirmationModal").onConfirm(); h.flush(); assert.strictEqual(h.mock.getState().schedules, before);
+    screen.one("ConfirmationModal").onDismiss(); h.flush();
+    deleteButton(screen).onPress(); h.flush(); const stale = screen.one("ConfirmationModal").onConfirm;
+    stale(); stale(); h.flush(); assert.equal(h.mock.getState().schedules.some((s) => s.id === mockId), false);
+    assert.deepEqual(h.navigations, []); screen.one("ConfirmationModal").onDismiss(); screen.one("ConfirmationModal").onDismiss(); h.flush();
+    assert.deepEqual(h.navigations, ["back"]); assert.equal(h.calls.length, 0);
+  } finally { h.close(); }
+});
+
+test("I 서버 삭제 모달 표시·취소와 확인 전 DELETE 0회", async () => {
+  const h = harness("server", { allowDelete: true }); try {
+    const screen = await editableDetail(h);
+    screen.one("ConfirmationModal").onConfirm(); await h.settle(); assert.equal(h.calls.length, 1);
+    deleteButton(screen).onPress(); deleteButton(screen).onPress(); h.flush();
+    assert.equal(screen.one("ConfirmationModal").visible, true); assert.equal(h.calls.length, 1);
+    screen.one("ConfirmationModal").onCancel(); h.flush(); screen.one("ConfirmationModal").onConfirm(); await h.settle();
+    assert.equal(screen.one("ConfirmationModal").visible, false); assert.equal(h.calls.length, 1); assert.deepEqual(h.navigations, []);
+  } finally { h.close(); }
+});
+
+test("I DELETE 원래 ID·body와 key 없음·204 본문 미파싱·성공 후 iOS 모달 dismiss 뒤 navigation", async () => {
+  const h = harness("server", { allowDelete: true }); try {
+    const id = "synthetic/id space", screen = await editableDetail(h, id), before = h.mock.getState().schedules;
+    confirmDelete(h, screen); const duplicate = screen.one("ConfirmationModal").onConfirm;
+    duplicate(); duplicate(); await h.settle(); assert.equal(h.calls.length, 2);
+    assert.equal(h.calls[1].method, "DELETE"); assert.match(h.calls[1].url, /\/schedules\/synthetic%2Fid%20space$/);
+    assert.equal(h.calls[1].body, undefined); assert.equal(h.calls[1].headers.has("Idempotency-Key"), false);
+    assert.deepEqual(h.navigations, []); noContent(h, 1); await h.settle(); assert.deepEqual(h.navigations, []);
+    assert.equal(Object.values(h.server.store.getState().servers)[0].entities[id], undefined);
+    h.respond(2, []); await h.settle(); assert.deepEqual(h.navigations, []);
+    screen.one("ConfirmationModal").onDismiss(); screen.one("ConfirmationModal").onDismiss(); h.flush();
+    assert.deepEqual(h.navigations, ["back"]); assert.strictEqual(h.mock.getState().schedules, before); assert.equal(deleteCalls(h).length, 1);
+  } finally { h.close(); }
+});
+
+test("I DELETE 204는 모든 query에서 대상만 제거하고 목록·캘린더 GET 및 dot 동기화", async () => {
+  const h = harness("server", { allowDelete: true }); try {
+    const { list, calendar } = await completionScreens(h, [dto("target"), { ...dto("other"), scheduledAt: "2026-11-08T03:00:00Z" }]);
+    const screen = await editableDetail(h); confirmDelete(h, screen); screen.one("ConfirmationModal").onDismiss(); await h.settle();
+    assert.equal(list.one("FlatList").data.length, 2); // 응답 전 삭제 표시 금지
+    noContent(h, 3); await h.settle();
+    assert.deepEqual(list.one("FlatList").data.map((s) => s.id), ["other"]); assert.equal(calendar.all("ScheduleCard").length, 0);
+    assert.deepEqual(calendar.one("MonthCalendar").scheduleDates, ["2026-11-08"]);
+    const cache = Object.values(h.server.store.getState().servers)[0];
+    assert.equal(cache.entities.target, undefined); assert.ok(Object.values(cache.queries).every((q) => !q.ids.includes("target")));
+    assert.equal(h.calls.length, 6); assert.deepEqual(h.calls.slice(4).map((c) => c.url), h.calls.slice(0, 2).map((c) => c.url));
+    await respondLists(h, 4, [{ ...dto("other"), scheduledAt: "2026-11-08T03:00:00Z" }]); assert.deepEqual(h.navigations, ["back"]);
+    const reopened = h.mount("detail", "target"); await h.settle(); h.detail(6, notFoundProblem(), 404, "application/problem+json"); await h.settle();
+    assert.equal(reopened.one("TextInput"), undefined); assert.match(reopened.one("ScheduleListState").errorTitle, /찾을 수 없/);
+  } finally { h.close(); }
+});
+
+test("I 삭제 전·처리 중 GET의 늦은 응답과 이후 상충 GET도 삭제 entity를 복원하지 않음", async () => {
+  const h = harness("server", { allowDelete: true }); try {
+    const { list } = await completionScreens(h); const screen = await editableDetail(h);
+    const query = h.source("src/utils/schedule-query.ts").getMainScheduleRange(new Date("2026-11-07T03:00:00Z"));
+    const old = h.server.retry(query); await h.settle(); confirmDelete(h, screen); await h.settle();
+    assert.equal(h.calls[3].signal.aborted, true);
+    const during = h.server.retry(query); await h.settle(); noContent(h, 4); await h.settle();
+    assert.equal(h.calls[5].signal.aborted, true);
+    h.respond(3, [dto("target")]); h.respond(5, [dto("target")]); await Promise.all([old, during]); await h.settle();
+    await respondLists(h, 6, []); assert.equal(list.one("FlatList").data.length, 0);
+    const inconsistent = h.server.retry(query); await h.settle(); h.respond(h.calls.length - 1, [dto("target")]); await inconsistent; await h.settle();
+    assert.equal(list.one("FlatList").data.length, 0); assert.equal(Object.values(h.server.store.getState().servers)[0].entities.target, undefined);
+  } finally { h.close(); }
+});
+
+test("I DELETE 성공 후 GET 실패는 폼·성공 상태 보존, 실패 목록 GET만 재시도", async () => {
+  const h = harness("server", { allowDelete: true }); try {
+    const { list } = await completionScreens(h); const screen = await editableDetail(h); editTitle(h, screen, "보존할 입력");
+    confirmDelete(h, screen); screen.one("ConfirmationModal").onDismiss(); await h.settle(); noContent(h, 3); await h.settle();
+    h.respond(4, [], 500); h.respond(5, []); await h.settle();
+    assert.match(formText(screen), /삭제되었지만/); assert.equal(screen.one("TextInput").value, "보존할 입력");
+    assert.equal(list.one("FlatList").data.length, 0); assert.deepEqual(h.navigations, []);
+    deleteButton(screen).onPress(); screen.one("ConfirmationModal").onConfirm(); retryDeletion(screen)(); retryDeletion(screen)(); await h.settle();
+    assert.equal(h.calls.length, 7); assert.equal(h.calls[6].url, h.calls[4].url); assert.equal(h.calls[6].method, "GET");
+    h.respond(6, []); await h.settle(); assert.deepEqual(h.navigations, ["back"]); assert.equal(deleteCalls(h).length, 1);
+  } finally { h.close(); }
+});
+
+test("I DELETE 확정 404·422는 삭제 성공/navigation 없이 입력과 entity 유지", async () => {
+  for (const [status, code] of [[404, "SCHEDULE_NOT_FOUND"], [422, "VALIDATION_ERROR"]]) {
+    const h = harness("server", { allowDelete: true }); try {
+      const screen = await editableDetail(h); editTitle(h, screen); confirmDelete(h, screen); await h.settle();
+      h.detail(1, { ...notFoundProblem(), status, code,
+        ...(code === "VALIDATION_ERROR" ? { errors: [{ location: "path", parameter: "scheduleId", code: "INVALID_UUID", detail: "test" }] } : {}) },
+        status, "application/problem+json"); await h.settle();
+      assert.equal(h.calls.length, 2); assert.equal(screen.one("TextInput").value, "수정 입력"); assert.deepEqual(h.navigations, []);
+      assert.match(formText(screen), code === "SCHEDULE_NOT_FOUND" ? /삭제할 일정/ : /삭제 요청이 거절/);
+      assert.ok(Object.values(h.server.store.getState().servers)[0].entities.target);
+    } finally { h.close(); }
+  }
+});
+
+test("I 네트워크 불확실은 기존 제한 retry만 적용하고 GET 404 확인은 삭제 성공으로 안내하지 않음", async () => {
+  const h = harness("server", { allowDelete: true }); try {
+    const { list, calendar } = await completionScreens(h); const screen = await editableDetail(h); confirmDelete(h, screen); await h.settle();
+    h.calls[3].reject(new Error("memory")); await h.settle(); h.calls[4].reject(new Error("memory")); await h.settle();
+    assert.equal(deleteCalls(h).length, 2); assert.equal(h.calls[3].url, h.calls[4].url); assert.match(formText(screen), /삭제 결과를 확인/);
+    deleteButton(screen).onPress(); screen.one("ConfirmationModal").onConfirm(); await h.settle(); assert.equal(h.calls.length, 5);
+    retryDeletion(screen)(); await h.settle(); h.detail(5, notFoundProblem(), 404, "application/problem+json"); await h.settle();
+    await respondLists(h, 6, []);
+    assert.equal(list.one("FlatList").data.length, 0); assert.equal(calendar.all("ScheduleCard").length, 0);
+    assert.match(formText(screen), /이전 삭제 요청의 성공 여부를 뜻하지/); assert.deepEqual(h.navigations, []); assert.equal(deleteCalls(h).length, 2);
+  } finally { h.close(); }
+});
+
+test("I 불확실 결과 확인 GET 200·다른 404·통신 실패는 자동 재삭제 및 성공 처리 금지", async () => {
+  for (const read of ["found", "other404", "network"]) {
+    const h = harness("server", { allowDelete: true }); try {
+      const screen = await editableDetail(h); confirmDelete(h, screen); await h.settle();
+      h.detail(1, {}, 200); await h.settle(); assert.match(formText(screen), /삭제 결과를 확인/);
+      screen.one("ConfirmationModal").onDismiss(); h.flush(); retryDeletion(screen)(); await h.settle();
+      if (read === "found") h.detail(2, dto("target"));
+      if (read === "other404") h.detail(2, notFoundProblem("ROUTE_NOT_FOUND"), 404, "application/problem+json");
+      if (read === "network") { h.calls[2].reject(new Error("memory")); await h.settle(); h.calls[3].reject(new Error("memory")); }
+      await h.settle(); assert.match(formText(screen), read === "found" ? /현재 일정이 조회/ : /존재 여부를 확인하지 못/);
+      assert.equal(deleteButton(screen).disabled, true); deleteButton(screen).onPress(); screen.one("ConfirmationModal").onConfirm(); await h.settle();
+      assert.equal(deleteCalls(h).length, 1); assert.deepEqual(h.navigations, []);
+    } finally { h.close(); }
+  }
+});
+
+test("I DELETE timeout과 500·503은 서비스의 불확실 판정을 유지하며 수동 DELETE 재전송 금지", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  for (const kind of ["timeout", "500", "503"]) {
+    const h = harness("server", { allowDelete: true }); try {
+      const screen = await editableDetail(h); confirmDelete(h, screen); await h.settle();
+      if (kind === "timeout") { t.mock.timers.tick(10_000); await h.settle(); t.mock.timers.tick(10_000); }
+      else {
+        const status = Number(kind), problem = { ...notFoundProblem(), status, code: "INTERNAL_ERROR" };
+        h.detail(1, problem, status, "application/problem+json"); await h.settle();
+        if (kind === "503") h.detail(2, problem, status, "application/problem+json");
+      }
+      await h.settle(); assert.match(formText(screen), /삭제 결과를 확인/); assert.deepEqual(h.navigations, []);
+      assert.equal(deleteCalls(h).length, kind === "500" ? 1 : 2);
+      deleteButton(screen).onPress(); screen.one("ConfirmationModal").onConfirm(); await h.settle();
+      assert.equal(deleteCalls(h).length, kind === "500" ? 1 : 2);
+    } finally { h.close(); }
+  }
+});
+
+test("I 수정·완료 PATCH와 DELETE는 양방향으로 같은 공유 잠금 사용", async () => {
+  for (const patch of ["edit", "completion"]) for (const first of ["patch", "delete"]) {
+    const h = harness("server", { allowDelete: true, allowPatch: true }); try {
+      const { list } = await completionScreens(h); const screen = await editableDetail(h); editTitle(h, screen);
+      if (first === "delete") { confirmDelete(h, screen); saveButton(screen).onPress(); listCard(list).onToggleCompleted(); }
+      else {
+        // 모달의 과거 callback도 Store 잠금을 우회하지 못한다.
+        deleteButton(screen).onPress(); h.flush(); const confirm = screen.one("ConfirmationModal").onConfirm;
+        if (patch === "edit") {
+          screen.one("ConfirmationModal").onCancel(); screen.one("ConfirmationModal").onDismiss(); h.flush(); saveButton(screen).onPress();
+        } else listCard(list).onToggleCompleted();
+        confirm();
+      }
+      await h.settle(); assert.equal(deleteCalls(h).length + patches(h).length, 1);
+      assert.equal(deleteCalls(h).length, first === "delete" ? 1 : 0);
+      assert.equal(deleteButton(screen).disabled, true); assert.equal(listCard(list).completionDisabled, true);
+    } finally { h.close(); }
+  }
+});
+
+test("I DELETE 중 route·모드·서버·unmount 변경은 이전 응답과 navigation 무효화", async () => {
+  for (const change of ["route", "mode", "server", "unmount"]) {
+    const h = harness("server", { allowDelete: true }); try {
+      const screen = await editableDetail(h); confirmDelete(h, screen); await h.settle();
+      if (change === "route") screen.route("other");
+      if (change === "mode") h.mode("mock");
+      if (change === "server") h.config("https://other.example.invalid");
+      if (change === "unmount") screen.close();
+      await h.settle(); assert.equal(h.calls[1].signal.aborted, true); noContent(h, 1); await h.settle();
+      assert.deepEqual(h.navigations, []);
+      assert.ok(Object.values(h.server.store.getState().servers).every((c) => !c.deletedIds.target));
+      if (change === "route" || change === "server") { h.detail(2, dto(change === "route" ? "other" : "target")); await h.settle(); }
+    } finally { h.close(); }
+  }
+});
+
+test("I 불확실 삭제는 재진입에도 공유 잠금 유지하며 복구 버튼에서 GET만 실행", async () => {
+  const h = harness("server", { allowDelete: true, allowPatch: true }); try {
+    const screen = await editableDetail(h); confirmDelete(h, screen); await h.settle(); screen.close(); await h.settle();
+    const reopened = h.mount("detail", "target"); await h.settle(); h.detail(2, dto("target")); await h.settle();
+    assert.equal(deleteButton(reopened).disabled, true); assert.ok(retryDeletion(reopened));
+    editTitle(h, reopened); saveButton(reopened).onPress(); deleteButton(reopened).onPress(); await h.settle(); assert.equal(h.calls.length, 3);
+    retryDeletion(reopened)(); await h.settle(); assert.equal(h.calls[3].method, "GET"); h.detail(3, notFoundProblem(), 404, "application/problem+json"); await h.settle();
+    await respondLists(h, 4, []); assert.deepEqual(h.navigations, []); assert.equal(deleteCalls(h).length, 1);
+  } finally { h.close(); }
+});
+
+test("I create 정책은 삭제 버튼·모달 handler·Store·직접 서비스 DELETE 모두 차단", async () => {
+  const h = harness("server", { writeScope: "create" }); try {
+    const screen = await editableDetail(h); assert.equal(deleteButton(screen).disabled, true);
+    deleteButton(screen).onPress(); h.flush(); assert.equal(screen.one("ConfirmationModal").visible, false);
+    screen.one("ConfirmationModal").onConfirm();
+    const id = h.source("src/services/api/http.ts").scheduleHttpClient.getServerId();
+    assert.equal(await h.server.deleteSchedule(id, "target"), false);
+    const result = await h.source("src/services/api/schedules.ts").prepareScheduleDeletion("target").operation.submit();
+    assert.equal(result.outcome, "not-sent"); assert.equal(result.error.policyReason, "read-only");
+    await h.settle(); assert.equal(h.calls.length, 1); assert.deepEqual(h.navigations, []);
+  } finally { h.close(); }
+});
+
+test("I 특정 ID만 허용하는 시험 정책에서도 나머지 DELETE와 PATCH는 차단", async () => {
+  const h = harness("server", { writeScope: "create", allowDelete: ["target"] }); try {
+    const other = await editableDetail(h, "other"); assert.equal(deleteButton(other).disabled, true); deleteButton(other).onPress(); h.flush();
+    assert.equal(other.one("ConfirmationModal").visible, false);
+    const screen = await editableDetail(h); assert.equal(saveButton(screen).disabled, true); confirmDelete(h, screen); await h.settle();
+    assert.equal(deleteCalls(h).length, 1); assert.match(deleteCalls(h)[0].url, /\/target$/); assert.equal(patches(h).length, 0);
+  } finally { h.close(); }
+});
+
+test("I 두 상세 화면의 동시 확인은 DELETE 1회이며 다른 일정 삭제는 독립 실행", async () => {
+  const h = harness("server", { allowDelete: true }); try {
+    const first = await editableDetail(h), second = h.mount("detail", "target"), other = await editableDetail(h, "other");
+    deleteButton(first).onPress(); deleteButton(second).onPress(); h.flush();
+    const staleConfirm = second.one("ConfirmationModal").onConfirm;
+    first.one("ConfirmationModal").onConfirm(); staleConfirm(); confirmDelete(h, other); await h.settle();
+    assert.equal(deleteCalls(h).length, 2); assert.notEqual(deleteCalls(h)[0].url, deleteCalls(h)[1].url);
+    noContent(h, 2); noContent(h, 3); await h.settle(); await respondLists(h, 4, []);
+    assert.equal(Object.values(h.server.store.getState().servers)[0].entities.target, undefined);
+    assert.equal(Object.values(h.server.store.getState().servers)[0].entities.other, undefined);
+  } finally { h.close(); }
+});
+
+test("I 204 후 목록 실패 상태로 재진입해도 GET-only 복구와 삭제 상태 유지", async () => {
+  const h = harness("server", { allowDelete: true }); try {
+    const screen = await editableDetail(h); confirmDelete(h, screen); await h.settle(); noContent(h, 1); await h.settle();
+    h.respond(2, [], 500); await h.settle(); screen.close();
+    const reopened = h.mount("detail", "target"); await h.settle(); h.detail(3, notFoundProblem(), 404, "application/problem+json"); await h.settle();
+    assert.equal(reopened.one("TextInput"), undefined); assert.match(reopened.one("ScheduleListState").errorTitle, /삭제되었지만/);
+    retryDeletion(reopened)(); await h.settle(); assert.equal(h.calls[4].method, "GET");
+    h.respond(4, []); await h.settle(); assert.deepEqual(h.navigations, ["back"]); assert.equal(deleteCalls(h).length, 1);
+  } finally { h.close(); }
+});
+
+test("I 삭제 복구 GET 도중 route·모드·서버 변경은 이전 404와 navigation 차단", async () => {
+  for (const change of ["route", "mode", "server"]) {
+    const h = harness("server", { allowDelete: true }); try {
+      const screen = await editableDetail(h); confirmDelete(h, screen); await h.settle(); h.detail(1, {}, 200); await h.settle();
+      screen.one("ConfirmationModal").onDismiss(); h.flush(); retryDeletion(screen)(); await h.settle();
+      if (change === "route") screen.route("other");
+      if (change === "mode") h.mode("mock");
+      if (change === "server") h.config("https://other.example.invalid");
+      await h.settle(); h.detail(2, notFoundProblem(), 404, "application/problem+json"); await h.settle();
+      assert.deepEqual(h.navigations, []); assert.ok(Object.values(h.server.store.getState().servers).every((c) => !c.deletedIds.target));
+      if (change === "route" || change === "server") { h.detail(3, dto(change === "route" ? "other" : "target")); await h.settle(); }
+      assert.equal(deleteCalls(h).length, 1);
+    } finally { h.close(); }
+  }
+});
+
+test("I 앞선 응답 유실 뒤 DELETE 404는 확정 거절로 단정하지 않고 GET-only 확인", async () => {
+  const h = harness("server", { allowDelete: true }); try {
+    const screen = await editableDetail(h); confirmDelete(h, screen); await h.settle(); h.calls[1].reject(new Error("memory")); await h.settle();
+    h.detail(2, notFoundProblem(), 404, "application/problem+json"); await h.settle();
+    assert.match(formText(screen), /삭제 결과를 확인/); assert.equal(deleteButton(screen).disabled, true);
+    retryDeletion(screen)(); await h.settle(); assert.equal(h.calls[3].method, "GET");
+    h.detail(3, notFoundProblem(), 404, "application/problem+json"); await h.settle(); await respondLists(h, 4, []);
+    assert.match(formText(screen), /이전 삭제 요청의 성공 여부를 뜻하지/); assert.deepEqual(h.navigations, []); assert.equal(deleteCalls(h).length, 2);
+  } finally { h.close(); }
 });

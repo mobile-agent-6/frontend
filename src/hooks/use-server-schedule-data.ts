@@ -105,11 +105,12 @@ export function useServerScheduleDetail(scheduleId: string | undefined, enabled 
     kind: "configuration" as const, configurationStatus: config.status, requestState: "not-sent" as const,
   } : !scheduleId ? { kind: "request" as const, requestState: "not-sent" as const } : null);
   const error = localError || entry?.error || null;
-  const notFound = error?.kind === "http" && error.status === 404 && error.problem?.code === "SCHEDULE_NOT_FOUND";
+  const notFound = Boolean(scheduleId && Object.hasOwn(cache?.deletedIds ?? {}, scheduleId)) ||
+    (error?.kind === "http" && error.status === 404 && error.problem?.code === "SCHEDULE_NOT_FOUND");
   const schedule = !localError && !notFound && scheduleId ? cache?.entities[scheduleId] : undefined;
   return { serverId, schedule, error, notFound,
     hasDetailSuccess: entry?.hasSuccess ?? false,
-    initialLoading: enabled && !schedule && !error,
+    initialLoading: enabled && !schedule && !error && !notFound,
     isFetching: entry?.status === "loading",
     hasSuccessfulRead: Boolean(schedule),
     stale: entry?.stale ?? true,

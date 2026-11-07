@@ -13,6 +13,7 @@ import { useTheme } from "@/hooks/use-theme";
 import { useScheduleStore } from "@/stores/scheduleStore";
 import { isMockScheduleMode, isScheduleRequestAllowed, scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
 import { useScheduleUpdate } from "@/hooks/use-schedule-update";
+import { useScheduleDeletion } from "@/hooks/use-schedule-deletion";
 import { useServerScheduleDetail } from "@/hooks/use-server-schedule-data";
 import { ScheduleListState } from "@/components/schedule-list/schedule-list-state";
 import type { Schedule } from "@/types/schedule";
@@ -37,7 +38,11 @@ function ScheduleEditContent({ id, serverMode, generation, detail }: {
   const router = useRouter();
   const theme = useTheme();
   const serverUpdate = useScheduleUpdate(id, detail.serverId);
+  const serverDeletion = useScheduleDeletion(id, detail.serverId);
   const patchAllowed = serverMode && Boolean(id) && isScheduleRequestAllowed("PATCH", `/schedules/${encodeURIComponent(id ?? "")}`);
+  const deleteAllowed = serverMode && Boolean(id) && isScheduleRequestAllowed("DELETE", `/schedules/${encodeURIComponent(id ?? "")}`);
+  const deleteDisabled = serverMode && (!deleteAllowed || detail.isFetching || !detail.hasDetailSuccess || Boolean(detail.error) ||
+    serverUpdate.busy || serverUpdate.blocked || serverDeletion.busy || serverDeletion.blocked);
   const schedules = useScheduleStore((state) => state.schedules);
   const deleteSchedule = useScheduleStore((state) => state.deleteSchedule);
   const updateSchedule = useScheduleStore((state) => state.updateSchedule);
@@ -46,6 +51,7 @@ function ScheduleEditContent({ id, serverMode, generation, detail }: {
   const deleteModalDismissingRef = useRef(false);
   const [isDeleteModalDismissing, setIsDeleteModalDismissing] = useState(false);
   const pendingDeleteNavigationRef = useRef(false);
+  const serverDeleteNavigatedRef = useRef(false);
   const actionLockedRef = useRef(false);
   const [actionLocked, setActionLocked] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -61,13 +67,26 @@ function ScheduleEditContent({ id, serverMode, generation, detail }: {
       : undefined;
 
   // 확정 성공 또는 결과 확인 중에는 원래 폼을 유지해 입력 유실·not-found 깜빡임을 막는다.
-  const displayedSchedule = schedule ?? ((serverMode ? serverUpdate.busy || serverUpdate.blocked : actionLocked) ? actionSchedule : null);
+  const displayedSchedule = schedule ?? ((serverMode ? serverUpdate.busy || serverUpdate.blocked || serverDeletion.active : actionLocked) ? actionSchedule : null);
 
   const openDeleteModal = () => {
-    if (!mountedRef.current || !isMockScheduleMode(generation)) return;
+    if (!mountedRef.current || generation !== scheduleDataModeStore.getState().generation) return;
+    if (serverMode ? isMockScheduleMode() || deleteDisabled || !id ||
+      !isScheduleRequestAllowed("DELETE", `/schedules/${encodeURIComponent(id)}`) : !isMockScheduleMode(generation)) return;
     if (actionLockedRef.current || deleteModalDismissingRef.current || !schedule) return;
     deleteModalVisibleRef.current = true;
     setIsDeleteModalVisible(true);
+  };
+
+  const navigateServerDelete = () => {
+    if (!mountedRef.current || isMockScheduleMode() || generation !== scheduleDataModeStore.getState().generation || serverDeleteNavigatedRef.current) return;
+    serverDeleteNavigatedRef.current = true;
+    try { router.back(); } catch { setActionError("일정은 삭제되었습니다. 뒤로가기로 이전 화면으로 돌아가 주세요."); }
+  };
+  const finishServerDelete = () => {
+    if (!mountedRef.current) return;
+    if (deleteModalDismissingRef.current) pendingDeleteNavigationRef.current = true;
+    else navigateServerDelete();
   };
   const closeDeleteModal = () => {
     if (actionLockedRef.current || !deleteModalVisibleRef.current) return;
@@ -98,7 +117,7 @@ function ScheduleEditContent({ id, serverMode, generation, detail }: {
     setIsDeleteModalDismissing(false);
     if (!pendingDeleteNavigationRef.current) return;
     pendingDeleteNavigationRef.current = false;
-    navigateBack("delete");
+    if (serverMode) navigateServerDelete(); else navigateBack("delete");
   };
 
   const runMutation = (kind: "update" | "delete", mutate: () => void) => {
@@ -150,10 +169,11 @@ function ScheduleEditContent({ id, serverMode, generation, detail }: {
     try { router.back(); } catch { setActionError("일정은 수정되었습니다. 뒤로가기로 이전 화면으로 돌아가 주세요."); }
   };
   const retryServerRead = async () => { if (await serverUpdate.retryGet()) finishServerUpdate(); };
+  const retryDeletionRead = async () => { if (await serverDeletion.retryGet()) finishServerDelete(); };
   const handleSave = async (updates: Partial<Schedule>, original: Schedule) => {
     if (serverMode) {
       if (!mountedRef.current || isMockScheduleMode() || generation !== scheduleDataModeStore.getState().generation ||
-        !patchAllowed || detail.isFetching || !detail.hasDetailSuccess || detail.error) return;
+        !patchAllowed || detail.isFetching || !detail.hasDetailSuccess || detail.error || deleteModalVisibleRef.current || deleteModalDismissingRef.current) return;
       setActionSchedule(schedule ?? original);
       if (await serverUpdate.save(original, updates)) finishServerUpdate();
       return;
@@ -163,7 +183,16 @@ function ScheduleEditContent({ id, serverMode, generation, detail }: {
     runMutation("update", () => updateSchedule(schedule.id, updates));
   };
 
-  const handleDelete = () => {
+  const handleDelete = async () => {
+    if (serverMode) {
+      if (!mountedRef.current || isMockScheduleMode() || generation !== scheduleDataModeStore.getState().generation ||
+        !id || !schedule || !deleteModalVisibleRef.current || deleteDisabled ||
+        !isScheduleRequestAllowed("DELETE", `/schedules/${encodeURIComponent(id)}`)) return;
+      setActionSchedule(schedule);
+      closeDeleteModal();
+      if (await serverDeletion.remove()) finishServerDelete();
+      return;
+    }
     if (!mountedRef.current || !isMockScheduleMode(generation)) return;
     if (!schedule || !deleteModalVisibleRef.current) return;
     runMutation("delete", () => deleteSchedule(schedule.id));
@@ -178,8 +207,8 @@ function ScheduleEditContent({ id, serverMode, generation, detail }: {
               <Pressable
                 accessibilityLabel="일정 삭제"
                 accessibilityRole="button"
-                disabled={serverMode || actionLocked || isDeleteModalDismissing}
-                accessibilityState={{ disabled: serverMode || actionLocked || isDeleteModalDismissing }}
+                disabled={deleteDisabled || actionLocked || isDeleteModalDismissing}
+                accessibilityState={{ disabled: deleteDisabled || actionLocked || isDeleteModalDismissing }}
                 onPress={openDeleteModal}
                 style={({ pressed }) => [
                   styles.deleteButton,
@@ -206,7 +235,7 @@ function ScheduleEditContent({ id, serverMode, generation, detail }: {
       />
 
       {serverMode && (detail.initialLoading || detail.isFetching) && <ScheduleListState state="loading" />}
-      {serverMode && detail.error && (
+      {serverMode && (detail.error || detail.notFound) && !serverDeletion.active && (
         <ScheduleListState state="error" onRetry={detail.retryRead}
           errorTitle={detail.notFound ? "일정을 찾을 수 없어요." : detail.hasSuccessfulRead
             ? "최신 정보를 불러오지 못했어요. 이전 정보를 표시하고 있어요." : "일정을 불러오지 못했어요."} />
@@ -217,19 +246,24 @@ function ScheduleEditContent({ id, serverMode, generation, detail }: {
           schedule={displayedSchedule}
           onSave={handleSave}
           actionLocked={(serverMode && (!patchAllowed || detail.isFetching || !detail.hasDetailSuccess || Boolean(detail.error) ||
-            serverUpdate.busy || serverUpdate.blocked)) || actionLocked || isDeleteModalVisible || isDeleteModalDismissing}
-          actionError={serverMode ? serverUpdate.error ?? actionError ?? (!patchAllowed ? "현재 정책에서는 일정 수정·삭제를 사용할 수 없어요." : null) : actionError}
-          onRetryRead={serverMode && serverUpdate.needsCheck ? retryServerRead : undefined}
-          retryReadDisabled={serverUpdate.busy}
+            serverUpdate.busy || serverUpdate.blocked || serverDeletion.busy || serverDeletion.blocked)) || actionLocked || isDeleteModalVisible || isDeleteModalDismissing}
+          actionError={serverMode ? serverDeletion.error ?? serverUpdate.error ?? actionError ?? (!patchAllowed && !deleteAllowed ? "현재 정책에서는 일정 수정·삭제를 사용할 수 없어요." : null) : actionError}
+          onRetryRead={serverMode && serverDeletion.needsCheck ? retryDeletionRead : serverMode && serverUpdate.needsCheck ? retryServerRead : undefined}
+          retryReadDisabled={serverUpdate.busy || serverDeletion.busy}
         />
       ) : !serverMode ? (
         <ThemedView style={styles.notFound}>
           <ThemedText>일정을 찾을 수 없어요.</ThemedText>
         </ThemedView>
       ) : null}
+      {serverMode && !displayedSchedule && serverDeletion.active && (
+        <ScheduleListState state={serverDeletion.busy ? "loading" : "error"}
+          errorTitle={serverDeletion.error ?? (detail.notFound ? "일정을 찾을 수 없어요." : "일정 삭제 결과를 확인하고 있어요.")}
+          onRetry={serverDeletion.busy ? undefined : retryDeletionRead} />
+      )}
 
       <ConfirmationModal
-        visible={!serverMode && isDeleteModalVisible && Boolean(schedule)}
+        visible={isDeleteModalVisible && Boolean(schedule) && (!serverMode || deleteAllowed)}
         message="삭제할까요?"
         cancelLabel="아니요"
         confirmLabel="예"
