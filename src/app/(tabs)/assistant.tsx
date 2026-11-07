@@ -20,6 +20,7 @@ import {
 } from "@/services/mock/assistant";
 import type { AssistantInteraction, AssistantStatus } from "@/types/assistant";
 import { useScheduleStore } from "@/stores/scheduleStore";
+import { ASSISTANT_NOT_CONNECTED_MESSAGE, isMockScheduleMode, scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
 
 // processing UI를 보여주기 위한 Mock 지연이며, 실제 API timeout이 아니다.
 const MOCK_PROCESSING_DELAY_MS = 700;
@@ -47,6 +48,7 @@ export default function AssistantScreen() {
   const activeInteractionIdRef = useRef<string | null>(null);
   const resolvedInteractionIdsRef = useRef(new Set<string>());
   const conversationListRef = useRef<ConversationListHandle>(null);
+  const processingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const invalidateActiveInteraction = useCallback(() => {
     const id = activeInteractionIdRef.current;
@@ -89,6 +91,21 @@ export default function AssistantScreen() {
     setStatus(pendingMockRef.current === null ? "idle" : "need-more-info");
   }, []);
 
+  const clearMockOperation = useCallback((notify: boolean) => {
+    if (!mountedRef.current) return;
+    operationVersionRef.current += 1;
+    if (processingTimerRef.current !== null) clearTimeout(processingTimerRef.current);
+    processingTimerRef.current = null;
+    pendingMockRef.current = null;
+    invalidateActiveInteraction();
+    finishOperation();
+    if (notify) reportError(ASSISTANT_NOT_CONNECTED_MESSAGE);
+  }, [finishOperation, invalidateActiveInteraction, reportError]);
+
+  useEffect(() => scheduleDataModeStore.subscribe((current, previous) => {
+    if (current.generation !== previous.generation) clearMockOperation(current.mode === "server");
+  }), [clearMockOperation]);
+
   useEffect(() => {
     mountedRef.current = true;
     return () => {
@@ -96,6 +113,8 @@ export default function AssistantScreen() {
       operationVersionRef.current += 1;
       sendLockedRef.current = false;
       pendingInputRef.current = "";
+      if (processingTimerRef.current !== null) clearTimeout(processingTimerRef.current);
+      processingTimerRef.current = null;
     };
   }, []);
 
@@ -104,14 +123,16 @@ export default function AssistantScreen() {
 
     const version = operationVersionRef.current;
     const submittedText = pendingInputRef.current;
+    const generation = scheduleDataModeStore.getState().generation;
     let cancelled = false;
     const timer = setTimeout(() => {
-      if (cancelled || operationVersionRef.current !== version) return;
+      if (!mountedRef.current || cancelled || operationVersionRef.current !== version) return;
+      if (!isMockScheduleMode(generation)) { clearMockOperation(true); return; }
       const before = useScheduleStore.getState().schedules;
       let handled = false;
       try {
         const result = runMockAssistantScenario(submittedText, pendingMockRef.current);
-        if (operationVersionRef.current !== version) return;
+        if (operationVersionRef.current !== version || !isMockScheduleMode(generation)) return;
         pendingMockRef.current = result.pending;
         handled = result.handled;
         publishResponse({
@@ -135,12 +156,14 @@ export default function AssistantScreen() {
         if (!cancelled && operationVersionRef.current === version) finishOperation();
       }
     }, MOCK_PROCESSING_DELAY_MS);
+    processingTimerRef.current = timer;
 
     return () => {
       cancelled = true;
       clearTimeout(timer);
+      if (processingTimerRef.current === timer) processingTimerRef.current = null;
     };
-  }, [status, finishOperation, invalidateActiveInteraction, publishResponse, reportError, restoreInput]);
+  }, [status, finishOperation, invalidateActiveInteraction, publishResponse, reportError, restoreInput, clearMockOperation]);
 
   const handleSend = () => {
     const text = inputTextRef.current.trim();
@@ -159,6 +182,7 @@ export default function AssistantScreen() {
       setMessages((current) => [...current, message]);
       inputTextRef.current = "";
       setInputText("");
+      if (!isMockScheduleMode()) { clearMockOperation(true); return; }
       setStatus("processing");
     } catch {
       restoreInput(text);
@@ -171,6 +195,8 @@ export default function AssistantScreen() {
     messageId: string,
     action: { type: "candidate"; scheduleId: string } | { type: "confirmation"; confirmed: boolean },
   ) => {
+    if (!mountedRef.current) return;
+    if (!isMockScheduleMode()) { clearMockOperation(true); return; }
     if (
       !mountedRef.current || sendLockedRef.current || status === "processing" ||
       activeInteractionIdRef.current !== messageId ||
@@ -191,6 +217,7 @@ export default function AssistantScreen() {
     sendLockedRef.current = true;
     setIsBusy(true);
     const version = ++operationVersionRef.current;
+    const generation = scheduleDataModeStore.getState().generation;
     const before = useScheduleStore.getState().schedules;
     let confirmationHandled = false;
     try {
@@ -200,7 +227,7 @@ export default function AssistantScreen() {
           (interaction as Extract<typeof interaction, { type: "delete-confirmation" }>).scheduleId,
           action.confirmed,
         );
-      if (operationVersionRef.current !== version) return;
+      if (operationVersionRef.current !== version || !isMockScheduleMode(generation)) return;
       confirmationHandled = action.type === "confirmation";
       publishResponse({
         id: Crypto.randomUUID(),
