@@ -27,10 +27,15 @@ export type HttpError = {
   status?: number;
   requestId?: string | null;
   problem?: ProblemDetails;
+  location?: string | null;
+  idempotentReplayed?: string | null;
+  // 이전 자동 시도에서 처리 결과를 확인하지 못했는지 보존한다.
+  unconfirmedAttempt?: boolean;
 };
 
 export type HttpResult<T> =
-  | { ok: true; data: T; status: number; requestId: string | null; serverId: string; attempts: number }
+  | { ok: true; data: T; status: number; requestId: string | null; serverId: string; attempts: number;
+      location: string | null; idempotentReplayed: string | null }
   | { ok: false; error: HttpError; attempts: number };
 
 export type ScheduleHttpRequest = {
@@ -41,6 +46,8 @@ export type ScheduleHttpRequest = {
   headers?: HeadersInit;
   body?: unknown;
   signal?: AbortSignal;
+  // 수동 재시도에서도 원래 서버에만 요청하도록 하는 선택적 경계다.
+  expectedServerId?: string;
 };
 
 const SCHEDULE_TIMEOUT_MS = 10_000;
@@ -81,6 +88,9 @@ export function createScheduleHttpClient({
       } };
     }
     const config = { ...initial.config };
+    if (options.expectedServerId !== undefined && options.expectedServerId !== config.serverId) {
+      return { ok: false, attempts: 0, error: { kind: "aborted", requestState: "not-sent" } };
+    }
     const isCurrentServer = () => {
       const current = readConfig();
       return current.status === "ready" && current.config.serverId === config.serverId &&
@@ -112,13 +122,16 @@ export function createScheduleHttpClient({
 
     // URL·header·JSON body는 논리 요청마다 한 번만 확정하고 retry에서 재생성하지 않는다.
     let attempts = 0;
+    let unconfirmedAttempt = false;
     async function attempt(): Promise<HttpResult<unknown>> {
       const controller = new AbortController();
       let status: number | undefined;
       let requestId: string | null = null;
+      let location: string | null = null;
+      let idempotentReplayed: string | null = null;
       const failure = (kind: HttpError["kind"], problem?: ProblemDetails): HttpResult<never> => ({
         ok: false, attempts, error: {
-          kind, status, requestId, problem,
+          kind, status, requestId, problem, location, idempotentReplayed,
           requestState: status === undefined ? "unconfirmed" : "response-received",
         },
       });
@@ -141,8 +154,11 @@ export function createScheduleHttpClient({
           const response = await fetchImpl(url, { method, headers: new Headers(headers), body, signal: controller.signal });
           status = response.status;
           requestId = response.headers.get("X-Request-ID");
+          location = response.headers.get("Location");
+          idempotentReplayed = response.headers.get("Idempotent-Replayed");
           const success = (data: unknown): HttpResult<unknown> => ({
             ok: true, data, status: response.status, requestId, serverId: config.serverId, attempts,
+            location, idempotentReplayed,
           });
           // 204는 Content-Type과 관계없이 본문을 읽지 않는다.
           if (status === 204) return success(undefined);
@@ -179,10 +195,14 @@ export function createScheduleHttpClient({
       const result = await attempt();
       if (options.signal?.aborted || !isCurrentServer()) {
         return { ok: false, attempts, error: result.ok
-          ? { kind: "aborted", status: result.status, requestId: result.requestId, requestState: "response-received" }
-          : { ...result.error, kind: "aborted" } };
+          ? { kind: "aborted", status: result.status, requestId: result.requestId, location: result.location,
+              idempotentReplayed: result.idempotentReplayed, requestState: "response-received", unconfirmedAttempt: true }
+          : { ...result.error, kind: "aborted", unconfirmedAttempt: true } };
       }
-      if (result.ok || result.error.kind === "aborted") return result;
+      if (result.ok) return result;
+      if (result.error.kind !== "http" || (result.error.status ?? 0) >= 500) unconfirmedAttempt = true;
+      result.error.unconfirmedAttempt = unconfirmedAttempt;
+      if (result.error.kind === "aborted") return result;
       const { kind, status } = result.error;
       // 4xx·500 등 이미 받은 HTTP 응답은 본문 수신 timeout이 있어도 자동 재전송하지 않는다.
       const retryable = status !== undefined && status >= 400
@@ -193,7 +213,11 @@ export function createScheduleHttpClient({
     }
     throw new Error("도달할 수 없는 요청 상태입니다.");
   }
-  return { request };
+  function getServerId(): string | null {
+    const current = readConfig();
+    return current.status === "ready" ? current.config.serverId : null;
+  }
+  return { request, getServerId };
 }
 
 export type ScheduleHttpClient = ReturnType<typeof createScheduleHttpClient>;

@@ -5,6 +5,20 @@ import type {
   ScheduleDto,
 } from "@/types/schedule";
 
+/** API 요청 datetime을 검증하고 소수초 최대 6자리 정밀도를 보존해 UTC로 정규화한다. */
+export function parseScheduleApiDateTime(value: string) {
+  const match = /^(\d{4}-\d{2}-\d{2})T([01]\d|2[0-3]):([0-5]\d):([0-5]\d)(?:\.(\d{1,6}))?(Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.exec(value);
+  if (!match || match[0] !== value) throw new RangeError("시간대가 포함된 날짜·시간이 필요합니다.");
+  const [, date, hour, minute, second, fraction = "", zone] = match;
+  validateDate(date);
+  const milliseconds = Date.parse(`${date}T${hour}:${minute}:${second}.${fraction.padEnd(3, "0").slice(0, 3)}${zone}`);
+  if (!Number.isFinite(milliseconds)) throw new RangeError("유효한 날짜·시간이 필요합니다.");
+  const utc = new Date(milliseconds).toISOString();
+  if (!/^\d{4}-/.test(utc) || utc.startsWith("0000")) throw new RangeError("날짜·시간이 처리 가능한 범위를 벗어났습니다.");
+  const microseconds = Number(fraction.padEnd(6, "0").slice(3));
+  return { milliseconds, microseconds, utc: `${utc.slice(0, -1)}${fraction.length > 3 ? fraction.padEnd(6, "0").slice(3) : ""}Z` };
+}
+
 const API_CATEGORIES: Record<ScheduleCategory, ScheduleApiCategory> = {
   입고: "INBOUND",
   재고: "INVENTORY",

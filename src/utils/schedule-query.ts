@@ -1,29 +1,12 @@
 import type { ScheduleApiCategory } from "@/types/schedule";
-import { scheduledAtToUiDateTime, toUiCategory, uiDateTimeToScheduledAt } from "@/utils/schedule-mapper";
+import { parseScheduleApiDateTime, scheduledAtToUiDateTime, toUiCategory, uiDateTimeToScheduledAt } from "@/utils/schedule-mapper";
 
 export type ScheduleDateRange = { from: string; to: string };
 export type ScheduleListQuery = ScheduleDateRange & { category?: ScheduleApiCategory; completed?: boolean };
 
-/** offset이 필수인 계약 날짜를 UTC로 정규화하고 소수초 최대 6자리 정밀도를 보존한다. */
-function parseQueryDateTime(value: string) {
-  const match = /^(\d{4}-\d{2}-\d{2})T([01]\d|2[0-3]):([0-5]\d):([0-5]\d)(?:\.(\d{1,6}))?(Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.exec(value);
-  if (!match || match[0] !== value) throw new RangeError("시간대가 포함된 날짜·시간이 필요합니다.");
-  const [, date, hour, minute, second, fraction = "", zone] = match;
-  const calendarDate = new Date(`${date}T00:00:00Z`);
-  if (date.startsWith("0000") || !Number.isFinite(calendarDate.getTime()) || calendarDate.toISOString().slice(0, 10) !== date) {
-    throw new RangeError("유효한 날짜가 필요합니다.");
-  }
-  const milliseconds = Date.parse(`${date}T${hour}:${minute}:${second}.${fraction.padEnd(3, "0").slice(0, 3)}${zone}`);
-  if (!Number.isFinite(milliseconds)) throw new RangeError("유효한 날짜·시간이 필요합니다.");
-  const utc = new Date(milliseconds).toISOString();
-  if (!/^\d{4}-/.test(utc) || utc.startsWith("0000")) throw new RangeError("날짜·시간이 처리 가능한 범위를 벗어났습니다.");
-  const microseconds = Number(fraction.padEnd(6, "0").slice(3));
-  return { milliseconds, microseconds, utc: `${utc.slice(0, -1)}${fraction.length > 3 ? fraction.padEnd(6, "0").slice(3) : ""}Z` };
-}
-
 export function buildScheduleListQuery(query: ScheduleListQuery): URLSearchParams {
-  const from = parseQueryDateTime(query.from);
-  const to = parseQueryDateTime(query.to);
+  const from = parseScheduleApiDateTime(query.from);
+  const to = parseScheduleApiDateTime(query.to);
   const difference = to.milliseconds - from.milliseconds;
   const remainder = to.microseconds - from.microseconds;
   const maxRange = 92 * 24 * 60 * 60 * 1000;

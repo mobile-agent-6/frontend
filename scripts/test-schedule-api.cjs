@@ -23,6 +23,8 @@ function loadSource(file, timers = { setTimeout, clearTimeout }) {
       fileName: filename,
     }).outputText;
     const resolve = (name) => {
+      // Expo native 모듈을 로드하지 않고 기존 UUID API만 Node 구현으로 대체한다.
+      if (name === "expo-crypto") return { randomUUID: require("node:crypto").randomUUID };
       assert.ok(name.startsWith("@/"), "앱 내부 순수 모듈만 로드한다.");
       return load(path.join(root, "src", `${name.slice(2)}.ts`));
     };
@@ -93,8 +95,8 @@ function harness(fetchImpl, timers) {
   });
   return { ...http, state, client };
 }
-const createService = (client) =>
-  loadSource("src/services/api/schedules.ts").createScheduleService(client);
+const createService = (client, options) =>
+  loadSource("src/services/api/schedules.ts").createScheduleService(client, options);
 const flush = () => new Promise(setImmediate);
 function fakeTimers() {
   let sequence = 0;
@@ -637,4 +639,264 @@ test("HTTP: 응답 본문 수신 중 호출자 취소와 늦은 응답 무시", 
   await flush();
   assert.equal(result.ok, false);
   assert.equal(h.state.calls.length, 1);
+});
+
+const createInput = { title: "  test  ", scheduledAt: "2026-11-07T00:00:00+09:00", category: "INVENTORY" };
+function prepared(service, input = createInput) {
+  const result = service.prepareScheduleCreation(input);
+  assert.equal(result.ok, true);
+  return result.operation;
+}
+function createdResponse(replayed = false, body = dto) {
+  const response = json(body, 201);
+  response.headers.set("Location", `/api/v1/schedules/${dto.id}`);
+  if (replayed) response.headers.set("Idempotent-Replayed", "true");
+  return response;
+}
+
+test("POST: 허용 필드만 전송·서버 ID·201·응답 메타데이터·mapper 연결", async () => {
+  const h = harness(async () => createdResponse());
+  const input = { ...createInput, id: "local", completed: true, createdAt: "bad", updatedAt: "bad",
+    reminderAt: "bad", reminderMinutesBefore: 10, notificationEnabled: true };
+  const op = prepared(createService(h.client), input);
+  assert.match(op.idempotencyKey, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  const result = await op.submit();
+  assert.equal(result.outcome, "created");
+  assert.equal(result.response.status, 201);
+  assert.equal(result.response.data.id, dto.id);
+  assert.equal(result.response.data.date, "2026-11-08");
+  assert.equal(result.response.location, `/api/v1/schedules/${dto.id}`);
+  assert.equal(result.response.idempotentReplayed, null);
+  assert.equal(result.response.requestId, "header-request-id");
+  assert.equal(h.state.calls.length, 1);
+  const [url, init] = h.state.calls[0];
+  assert.equal(url, "https://example.invalid/api/v1/schedules");
+  assert.equal(init.method, "POST");
+  assert.equal(init.headers.get("Content-Type"), "application/json");
+  assert.equal(init.headers.get("Idempotency-Key"), op.idempotencyKey);
+  assert.deepEqual(JSON.parse(init.body), { ...createInput, title: "test" });
+  assert.deepEqual(await op.submit(), result);
+  assert.equal(h.state.calls.length, 1, "성공한 생성 작업을 다시 실행하지 않는다.");
+});
+
+test("POST: 새 작업은 새 key·동일 작업의 변경 불가 snapshot·동시 submit 중복 방지", async () => {
+  let resolve;
+  const h = harness(() => new Promise((done) => { resolve = done; }));
+  const service = createService(h.client);
+  const input = { ...createInput };
+  const first = prepared(service, input);
+  const second = prepared(service);
+  assert.notEqual(first.idempotencyKey, second.idempotencyKey);
+  input.title = "edited";
+  input.scheduledAt = "2027-01-01T00:00:00Z";
+  assert.equal(Reflect.set(first.payload, "title", "other"), false);
+  assert.equal(Reflect.set(first, "idempotencyKey", second.idempotencyKey), false);
+  const pending = first.submit();
+  assert.equal(first.submit(), pending);
+  assert.equal(h.state.calls.length, 1);
+  resolve(createdResponse());
+  assert.equal((await pending).outcome, "created");
+  assert.deepEqual(JSON.parse(h.state.calls[0][1].body), { ...createInput, title: "test" });
+});
+
+test("POST: 네트워크 자동 retry와 미확인 작업 수동 retry에서 key·body 유지", async () => {
+  let count = 0;
+  let keyCalls = 0;
+  const h = harness(async () => {
+    if (++count <= 2) throw new TypeError("유실");
+    return createdResponse(true);
+  });
+  const op = prepared(createService(h.client, {
+    createIdempotencyKey: () => { keyCalls++; return require("node:crypto").randomUUID(); },
+  }));
+  const first = await op.submit();
+  assert.equal(first.outcome, "uncertain");
+  assert.equal(first.error.kind, "network");
+  assert.equal(first.requiresReconciliation, true);
+  assert.equal(first.attempts, 2);
+  const second = await op.submit();
+  assert.equal(second.outcome, "replayed");
+  assert.equal(second.response.idempotentReplayed, "true");
+  assert.equal(keyCalls, 1);
+  assert.equal(h.state.calls.length, 3);
+  for (const [, init] of h.state.calls) {
+    assert.equal(init.headers.get("Idempotency-Key"), op.idempotencyKey);
+    assert.equal(init.body, h.state.calls[0][1].body);
+  }
+});
+
+test("POST: 단일 자동 retry 뒤 replay 201이면 성공 확정", async () => {
+  let count = 0;
+  const h = harness(async () => {
+    if (++count === 1) throw new TypeError();
+    return createdResponse(true);
+  });
+  const result = await prepared(createService(h.client)).submit();
+  assert.equal(result.outcome, "replayed");
+  assert.equal(result.response.attempts, 2);
+  assert.equal(result.response.data.id, dto.id);
+});
+
+test("POST: 409·422·그 외 4xx 거절 뒤 새 key 발급·POST 재실행 금지", async () => {
+  for (const [status, code] of [[409, "IDEMPOTENCY_KEY_CONFLICT"], [422, "SCHEDULE_IN_THE_PAST"],
+    [422, "VALIDATION_ERROR"], [400, "MALFORMED_REQUEST"], [404, "ROUTE_NOT_FOUND"]]) {
+    let keys = 0;
+    const body = problem(status, code);
+    if (code === "VALIDATION_ERROR") body.errors = [{ location: "body", pointer: "/title", code: "UNKNOWN_FIELD", detail: "test" }];
+    const h = harness(async () => json(body, status, "application/problem+json"));
+    const op = prepared(createService(h.client, { createIdempotencyKey: () => {
+      keys++; return require("node:crypto").randomUUID();
+    } }));
+    const result = await op.submit();
+    assert.equal(result.outcome, "rejected");
+    assert.equal(result.error.problem.code, code);
+    assert.equal(result.requiresReconciliation, status === 409 || status === 422);
+    assert.deepEqual(await op.submit(), result);
+    assert.equal(h.state.calls.length, 1);
+    assert.equal(keys, 1);
+  }
+});
+
+test("POST: 앞선 유실 뒤 4xx가 와도 이전 write 미실행으로 단정하지 않음", async () => {
+  let count = 0;
+  const h = harness(async () => {
+    if (++count === 1) throw new TypeError();
+    return json(problem(422, "SCHEDULE_IN_THE_PAST"), 422, "application/problem+json");
+  });
+  const op = prepared(createService(h.client));
+  const result = await op.submit();
+  assert.equal(result.outcome, "uncertain");
+  assert.equal(result.error.unconfirmedAttempt, true);
+  assert.equal(result.error.problem.code, "SCHEDULE_IN_THE_PAST");
+  await op.submit();
+  assert.equal(h.state.calls.length, 2);
+});
+
+test("POST: timeout 및 503은 최대 2회 뒤에도 결과 불확실", async () => {
+  const clock = fakeTimers();
+  const h = harness(() => new Promise(() => {}), clock);
+  const pending = prepared(createService(h.client)).submit();
+  clock.fire(); await flush(); clock.fire();
+  const result = await pending;
+  assert.equal(result.outcome, "uncertain");
+  assert.equal(result.error.kind, "timeout");
+  assert.equal(result.attempts, 2);
+  const down = harness(async () => json(problem(503, "DATABASE_UNAVAILABLE"), 503, "application/problem+json"));
+  const unavailable = await prepared(createService(down.client)).submit();
+  assert.equal(unavailable.outcome, "uncertain");
+  assert.equal(unavailable.attempts, 2);
+  const serverError = harness(async () => json(problem(500, "INTERNAL_ERROR"), 500, "application/problem+json"));
+  assert.equal((await prepared(createService(serverError.client)).submit()).outcome, "uncertain");
+  assert.equal(serverError.state.calls.length, 1);
+});
+
+test("POST: 전송 전 Abort는 미전송, 전송 후 Abort는 미확인", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  const h = harness(() => new Promise(() => {}));
+  const op = prepared(createService(h.client));
+  assert.equal((await op.submit(controller.signal)).outcome, "not-sent");
+  assert.equal(op.firstAttemptAt, null);
+  assert.equal(h.state.calls.length, 0);
+  const running = new AbortController();
+  const pending = op.submit(running.signal);
+  running.abort();
+  assert.equal((await pending).outcome, "uncertain");
+  assert.equal(h.state.calls.length, 1);
+});
+
+test("POST: 원래 서버에 묶인 수동 retry와 설정 누락 구분", async () => {
+  const h = harness(async () => { throw new TypeError(); });
+  const op = prepared(createService(h.client));
+  assert.equal((await op.submit()).outcome, "uncertain");
+  const count = h.state.calls.length;
+  h.state.config = configModule.parseDevelopmentServerConfig("https://other.invalid");
+  const retry = await op.submit();
+  assert.equal(retry.outcome, "uncertain");
+  assert.equal(retry.error.kind, "aborted");
+  assert.equal(retry.attempts, 0);
+  assert.equal(h.state.calls.length, count);
+  const missing = harness(async () => createdResponse());
+  missing.state.config = { status: "missing" };
+  const unsent = prepared(createService(missing.client));
+  const result = await unsent.submit();
+  assert.equal(result.outcome, "not-sent");
+  assert.equal(result.error.kind, "configuration");
+  assert.equal(unsent.firstAttemptAt, null);
+});
+
+test("POST: 서버 설정이 전송 중 바뀌면 결과 확인 필요", async () => {
+  const h = harness(async () => {
+    h.state.config = configModule.parseDevelopmentServerConfig("https://other.invalid");
+    return createdResponse();
+  });
+  const result = await prepared(createService(h.client)).submit();
+  assert.equal(result.outcome, "uncertain");
+  assert.equal(result.error.kind, "aborted");
+  assert.equal(result.error.status, 201);
+  assert.equal(result.error.location, `/api/v1/schedules/${dto.id}`);
+});
+
+test("POST: 24시간 뒤 무기한 멱등성을 가정해 재전송하지 않음", async () => {
+  let timestamp = 100;
+  const h = harness(async () => { throw new TypeError(); });
+  const op = prepared(createService(h.client, { now: () => timestamp }));
+  await op.submit();
+  assert.equal(op.firstAttemptAt, 100);
+  timestamp += 24 * 60 * 60 * 1000;
+  const result = await op.submit();
+  assert.equal(result.outcome, "review-required");
+  assert.equal(result.error.reason, "retention-window");
+  assert.equal(h.state.calls.length, 2);
+});
+
+test("POST: 201 DTO·status·replay header 오류는 별도 확인 필요", async () => {
+  for (const response of [
+    () => createdResponse(false, {}), () => json(dto, 200), () => createdResponse(false, { ...dto, completed: "false" }),
+    () => createdResponse(false, { ...dto, scheduledAt: "bad" }),
+    () => { const value = createdResponse(); value.headers.set("Idempotent-Replayed", "false"); return value; },
+  ]) {
+    const h = harness(async () => response());
+    const result = await prepared(createService(h.client)).submit();
+    assert.equal(result.outcome, "review-required");
+    assert.equal(result.error.kind, "response");
+    assert.equal(result.requiresReconciliation, true);
+    assert.equal(h.state.calls.length, 1);
+  }
+});
+
+test("POST 입력: Unicode code point·trim·제어문자·날짜·category 검증", () => {
+  let keys = 0;
+  const h = harness(async () => createdResponse());
+  const service = createService(h.client, { createIdempotencyKey: () => {
+    keys++; return require("node:crypto").randomUUID();
+  } });
+  const emoji = String.fromCodePoint(0x1f600);
+  assert.equal(prepared(service, { ...createInput, title: emoji.repeat(100) }).payload.title.length, 200);
+  for (const title of [" ", "a".repeat(101), emoji.repeat(101), "a\nb", "a\tb", "a\0b", "a\u0085b"]) {
+    const result = service.prepareScheduleCreation({ ...createInput, title });
+    assert.equal(result.error.kind, "validation");
+    assert.ok(result.error.fields.title);
+  }
+  for (const scheduledAt of ["2026-11-07T00:00:00", "2026-02-30T00:00:00Z", "2026-11-07T00:00:00.1234567Z", "2026-11-07 00:00:00+09:00"]) {
+    assert.ok(service.prepareScheduleCreation({ ...createInput, scheduledAt }).error.fields.scheduledAt);
+  }
+  for (const category of ["PICKING", "MEETING", "PERSONAL", "inbound"]) {
+    assert.ok(service.prepareScheduleCreation({ ...createInput, category }).error.fields.category);
+  }
+  assert.equal(keys, 1, "입력 검증 실패 시 key를 생성하지 않는다.");
+  assert.equal(h.state.calls.length, 0);
+  // 과거 여부는 서버가 판정한다. 전화기 현재 시각으로 차단하지 않는다.
+  assert.equal(service.prepareScheduleCreation({ ...createInput, scheduledAt: "2025-01-01T00:00:00.123456-03:00" }).ok, true);
+});
+
+test("POST: key 생성 예외·서버 validation·직렬화 오류를 구분", async () => {
+  const h = harness(async () => createdResponse());
+  const service = createService(h.client, { createIdempotencyKey: () => { throw new Error(); } });
+  assert.equal(service.prepareScheduleCreation(createInput).error.kind, "key-generation");
+  const circular = {}; circular.self = circular;
+  const serialized = await h.client.request({ method: "POST", path: "/schedules", body: circular });
+  assert.equal(serialized.error.kind, "request");
+  assert.equal(serialized.error.requestState, "not-sent");
+  assert.equal(h.state.calls.length, 0);
 });

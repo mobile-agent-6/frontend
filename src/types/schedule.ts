@@ -45,3 +45,5 @@ export type ScheduleDto = {
   createdAt: string;
   updatedAt: string;
 };
+
+export type ScheduleCreateInput = Pick<ScheduleDto, "title" | "scheduledAt" | "category">;
