@@ -8,7 +8,7 @@ const root = path.resolve(__dirname, "..");
 
 // 실제 화면·Hook·서비스를 실행하되 native 컴포넌트와 React 실행기만 메모리 대역으로 둔다.
 // native 렌더링·레이아웃·아이폰 통신을 검증하는 테스트는 아니다.
-function harness(initialMode) {
+function harness(initialMode, { allowCreation = false } = {}) {
   const modules = new Map(), screens = [], calls = [], navigations = [];
   let current;
   const mark = (owner) => { owner.dirty = true; if (owner.root) owner.root.dirty = true; };
@@ -87,7 +87,10 @@ function harness(initialMode) {
   const http = source("src/services/api/http.ts");
   http.scheduleHttpClient = http.createScheduleHttpClient({ readConfig: () => config, fetchImpl: (url, options) =>
     new Promise((resolve, reject) => calls.push({ url, ...options, resolve, reject })) });
-  const mode = source("src/stores/scheduleDataModeStore.ts").scheduleDataModeStore;
+  const modeModule = source("src/stores/scheduleDataModeStore.ts");
+  // 이 메모리 실행기에만 주입한다. 제품 정책·환경 설정·실제 fetch는 변경하지 않는다.
+  if (allowCreation) modeModule.isScheduleRequestAllowed = (method) => method === "GET" || method === "POST";
+  const mode = modeModule.scheduleDataModeStore;
   const mock = source("src/stores/scheduleStore.ts").useScheduleStore;
   const server = source("src/stores/serverScheduleStore.ts").serverScheduleStore;
   function expand(node, rootScreen, trail, seen) {
@@ -138,8 +141,8 @@ function harness(initialMode) {
     async settle() { for (let i = 0; i < 4; i++) { await new Promise(setImmediate); flush(); } },
     respond(index, items, status = 200) { calls[index].resolve(new Response(JSON.stringify({ items }), { status,
       headers: { "Content-Type": "application/json" } })); },
-    detail(index, value, status = 200, media = "application/json") { calls[index].resolve(new Response(JSON.stringify(value), {
-      status, headers: { "Content-Type": media } })); },
+    detail(index, value, status = 200, media = "application/json", headers = {}) { calls[index].resolve(new Response(JSON.stringify(value), {
+      status, headers: { "Content-Type": media, ...headers } })); },
     close() { for (const s of screens) { s.closed = true; s.slots.forEach((slot) => slot?.cleanup?.());
       s.children.forEach((child) => child.slots.forEach((slot) => slot?.cleanup?.())); } mode.getState().setMode("mock"); },
   };
@@ -516,5 +519,115 @@ test("쓰기 첫 시도 후 서버 모드로 변경되면 자동 retry 차단 �
     h.mode("server"); h.calls[0].reject(new Error("메모리 네트워크 오류")); await pending;
     const result = await pending; assert.equal(result.outcome, "uncertain"); assert.equal(result.requiresReconciliation, true);
     assert.equal(h.calls.length, 1);
+  } finally { h.close(); }
+});
+
+function fillCreation(h, screen, title = "새 일정") {
+  screen.one("TextInput").onChangeText(title);
+  screen.one("ScheduleCategorySelector").onSelectCategory("재고");
+  screen.one("ScheduleDateField").onPress(); h.flush();
+  screen.one("DateTimePicker").onValueChange(null, new Date(2026, 10, 10, 12, 30)); h.flush();
+  screen.one("ScheduleTimeField").onPress(); h.flush();
+  screen.one("DateTimePicker").onValueChange(null, new Date(2026, 10, 10, 12, 30)); h.flush();
+}
+const createButton = (screen) => screen.all("Button").find((p) => p.label === "저장");
+const formText = (screen) => screen.all("ThemedText").map((p) => p.children).filter((s) => typeof s === "string").join(" ");
+
+test("생성 폼 POST DTO·key·중복 제출 방지·성공 후 현재 목록 GET과 navigation", async () => {
+  const h = harness("server", { allowCreation: true }); try {
+    const list = h.mount("index"); await h.settle(); h.respond(0, []); await h.settle();
+    const screen = h.mount("create"); fillCreation(h, screen, " 새 일정 ");
+    const before = h.mock.getState().schedules;
+    const first = createButton(screen).onPress(); createButton(screen).onPress(); await h.settle();
+    assert.equal(h.calls.length, 2); assert.equal(h.calls[1].method, "POST");
+    assert.deepEqual(JSON.parse(h.calls[1].body), { title: "새 일정", scheduledAt: "2026-11-10T12:30:00+09:00", category: "INVENTORY" });
+    assert.match(h.calls[1].headers.get("Idempotency-Key"), /^[0-9a-f-]{36}$/);
+    assert.deepEqual(h.navigations, []); h.detail(1, dto("created"), 201); await h.settle();
+    assert.equal(h.calls[2].method, "GET"); assert.equal(h.calls[2].url, h.calls[0].url);
+    h.respond(2, [dto("created")]); await first; await h.settle();
+    assert.deepEqual(h.navigations, ["back"]); assert.equal(list.one("FlatList").data[0].id, "created");
+    assert.strictEqual(h.mock.getState().schedules, before);
+  } finally { h.close(); }
+});
+test("생성 성공 후 GET 실패는 POST 재실행 없이 실패 GET만 retry", async () => {
+  const h = harness("server", { allowCreation: true }); try {
+    h.mount("index"); await h.settle(); h.respond(0, []); await h.settle();
+    const screen = h.mount("create"); fillCreation(h, screen); const pending = createButton(screen).onPress(); await h.settle();
+    h.detail(1, dto("created"), 201); await h.settle(); h.respond(2, [], 500); await pending; await h.settle();
+    assert.match(formText(screen), /저장되었지만/); assert.equal(createButton(screen).disabled, true);
+    createButton(screen).onPress(); await h.settle(); assert.equal(h.calls.length, 3);
+    const retry = screen.all("Button").find((p) => p.label === "목록 다시 불러오기").onPress(); await h.settle();
+    assert.equal(h.calls[3].method, "GET"); h.respond(3, [dto("created")]); await retry; await h.settle();
+    assert.equal(h.calls.filter((c) => c.method === "POST").length, 1); assert.deepEqual(h.navigations, ["back"]);
+  } finally { h.close(); }
+});
+test("생성 503 자동 retry·불확실 후 수동 retry는 같은 key/body 유지", async () => {
+  const h = harness("server", { allowCreation: true }); try {
+    const screen = h.mount("create"); fillCreation(h, screen); const pending = createButton(screen).onPress(); await h.settle();
+    const failure = { type: "test", title: "test", detail: "test", instance: "/schedules", requestId: "r", status: 503, code: "DATABASE_UNAVAILABLE" };
+    h.detail(0, failure, 503, "application/problem+json"); await h.settle();
+    h.detail(1, failure, 503, "application/problem+json"); await pending; await h.settle();
+    assert.match(formText(screen), /등록 결과/); assert.equal(screen.one("TextInput").value, "새 일정");
+    const retry = createButton(screen).onPress(); await h.settle();
+    for (const call of h.calls) { assert.equal(call.body, h.calls[0].body); assert.equal(call.headers.get("Idempotency-Key"), h.calls[0].headers.get("Idempotency-Key")); }
+    h.detail(2, dto("created"), 201); await h.settle(); h.respond(3, [dto("created")]); await retry; await h.settle();
+    assert.deepEqual(h.navigations, ["back"]);
+  } finally { h.close(); }
+});
+test("불확실 작업의 입력 변경은 새 key 생성·재등록을 하지 않음", async () => {
+  const h = harness("server", { allowCreation: true }); try {
+    const screen = h.mount("create"); fillCreation(h, screen); const pending = createButton(screen).onPress(); await h.settle();
+    h.calls[0].reject(new Error("메모리 연결 오류")); await h.settle(); h.calls[1].reject(new Error("메모리 연결 오류")); await pending; await h.settle();
+    screen.one("TextInput").onChangeText("다른 입력"); h.flush(); await createButton(screen).onPress(); await h.settle();
+    assert.equal(h.calls.length, 2); assert.match(formText(screen), /이전 등록 결과/); assert.deepEqual(h.navigations, []);
+  } finally { h.close(); }
+});
+test("과거 일정·validation·멱등성 충돌은 code로 안내하고 입력/key 보존", async () => {
+  for (const [status, code, message] of [[422, "SCHEDULE_IN_THE_PAST", /과거 시각/], [422, "VALIDATION_ERROR", /입력값/], [409, "IDEMPOTENCY_KEY_CONFLICT", /충돌/]]) {
+    const h = harness("server", { allowCreation: true }); try {
+      const screen = h.mount("create"); fillCreation(h, screen); const pending = createButton(screen).onPress(); await h.settle();
+      h.detail(0, { type: "test", title: "test", detail: "변경 가능한 상세", instance: "/schedules", requestId: "r", status, code,
+        ...(code === "VALIDATION_ERROR" ? { errors: [{ location: "body", pointer: "/title", code: "TOO_LONG", detail: "test" }] } : {}) }, status, "application/problem+json");
+      await pending; await h.settle(); assert.match(formText(screen), message); assert.equal(screen.one("TextInput").value, "새 일정");
+      await createButton(screen).onPress(); await h.settle(); assert.equal(h.calls.length, 1);
+      assert.deepEqual(h.navigations, []); assert.equal(h.mock.getState().schedules.length, 10);
+    } finally { h.close(); }
+  }
+});
+test("서버 폼 제목 검증·불완전 입력은 전송 없이 값을 유지", async () => {
+  const h = harness("server", { allowCreation: true }); try {
+    const screen = h.mount("create"); await createButton(screen).onPress(); h.flush(); assert.equal(h.calls.length, 0);
+    fillCreation(h, screen, "가".repeat(101)); await createButton(screen).onPress(); h.flush();
+    assert.equal(h.calls.length, 0); assert.match(formText(screen), /1~100/); assert.equal(screen.one("TextInput").value.length, 101);
+  } finally { h.close(); }
+});
+
+test("확정 거절 후 변경된 새 논리 입력은 새 key 사용하고 replay 성공도 동기화", async () => {
+  const h = harness("server", { allowCreation: true }); try {
+    const screen = h.mount("create"); fillCreation(h, screen); let pending = createButton(screen).onPress(); await h.settle();
+    h.detail(0, { type: "test", title: "test", detail: "test", instance: "/schedules", requestId: "r", status: 400, code: "MALFORMED_REQUEST" },
+      400, "application/problem+json"); await pending; await h.settle();
+    screen.one("TextInput").onChangeText("새 논리 작업"); h.flush(); pending = createButton(screen).onPress(); await h.settle();
+    assert.notEqual(h.calls[0].headers.get("Idempotency-Key"), h.calls[1].headers.get("Idempotency-Key"));
+    assert.equal(JSON.parse(h.calls[1].body).title, "새 논리 작업");
+    h.detail(1, dto("replayed"), 201, "application/json", { "Idempotent-Replayed": "true" }); await h.settle();
+    h.respond(2, [dto("replayed")]); await pending; await h.settle(); assert.deepEqual(h.navigations, ["back"]);
+  } finally { h.close(); }
+});
+test("생성 timeout 뒤에도 입력과 원래 key를 유지하며 가짜 성공 없음", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const h = harness("server", { allowCreation: true }); try {
+    const screen = h.mount("create"); fillCreation(h, screen); const pending = createButton(screen).onPress(); await h.settle();
+    t.mock.timers.tick(10_000); await h.settle(); t.mock.timers.tick(10_000); await pending; await h.settle();
+    assert.match(formText(screen), /등록 결과/); assert.equal(screen.one("TextInput").value, "새 일정");
+    assert.equal(h.calls[0].body, h.calls[1].body); assert.equal(h.calls[0].headers.get("Idempotency-Key"), h.calls[1].headers.get("Idempotency-Key"));
+    assert.deepEqual(h.navigations, []); assert.equal(h.mock.getState().schedules.length, 10);
+  } finally { h.close(); }
+});
+test("생성 중 모드 변경은 요청 대기를 취소하고 가짜 navigation을 하지 않음", async () => {
+  const h = harness("server", { allowCreation: true }); try {
+    const screen = h.mount("create"); fillCreation(h, screen); const pending = createButton(screen).onPress(); await h.settle();
+    h.mode("mock"); await pending; await h.settle(); assert.equal(h.calls[0].signal.aborted, true);
+    assert.deepEqual(h.navigations, []); assert.equal(h.mock.getState().schedules.length, 10);
   } finally { h.close(); }
 });

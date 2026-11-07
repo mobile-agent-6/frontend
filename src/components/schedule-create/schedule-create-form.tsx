@@ -24,7 +24,8 @@ import { Spacing } from "@/constants/theme";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useTheme } from "@/hooks/use-theme";
 import { useScheduleStore } from "@/stores/scheduleStore";
-import { isMockScheduleMode, scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
+import { isMockScheduleMode, isScheduleRequestAllowed, scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
+import { SCHEDULE_CREATION_READ_ONLY_MESSAGE, useScheduleCreation } from "@/hooks/use-schedule-creation";
 import type { Schedule, ScheduleCategory } from "@/types/schedule";
 import {
   createDatePickerValue,
@@ -38,6 +39,8 @@ export function ScheduleCreateForm() {
   const colorScheme = useColorScheme();
   const router = useRouter();
   const serverMode = useStore(scheduleDataModeStore, (state) => state.mode === "server");
+  const creation = useScheduleCreation();
+  const readOnly = serverMode && !isScheduleRequestAllowed("POST");
   const addSchedule = useScheduleStore((state) => state.addSchedule);
   const [title, setTitle] = useState("");
   const [date, setDate] = useState<string | null>(null);
@@ -91,9 +94,16 @@ export function ScheduleCreateForm() {
     }
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     if (!isMockScheduleMode()) {
-      setFormError("현재 서버 조회만 지원합니다. 일정 추가는 아직 사용할 수 없어요.");
+      if (readOnly) { setFormError(SCHEDULE_CREATION_READ_ONLY_MESSAGE); return; }
+      if (date === null || time === null || category === null) { setFormError("필수 항목을 모두 입력해 주세요."); return; }
+      const generation = scheduleDataModeStore.getState().generation;
+      setFormError(null);
+      if (await creation.save({ title, date, time, category }) &&
+        generation === scheduleDataModeStore.getState().generation && !isMockScheduleMode()) {
+        try { router.back(); } catch { setFormError("일정은 저장되었습니다. 뒤로가기로 이전 화면으로 돌아가 주세요."); }
+      }
       return;
     }
     const generation = scheduleDataModeStore.getState().generation;
@@ -137,6 +147,13 @@ export function ScheduleCreateForm() {
       if (isMockScheduleMode(generation)) router.back();
     } catch {
       setFormError("일정은 저장되었습니다. 뒤로가기로 이전 화면으로 돌아가 주세요.");
+    }
+  };
+
+  const handleGetRetry = async () => {
+    const generation = scheduleDataModeStore.getState().generation;
+    if (await creation.retryGet() && generation === scheduleDataModeStore.getState().generation && !isMockScheduleMode()) {
+      try { router.back(); } catch { setFormError("일정은 저장되었습니다. 뒤로가기로 이전 화면으로 돌아가 주세요."); }
     }
   };
 
@@ -224,14 +241,17 @@ export function ScheduleCreateForm() {
             onSelectCategory={setCategory}
           />
 
-          {formError || serverMode ? (
+          {formError || (serverMode && (creation.error || readOnly)) ? (
             <View accessibilityRole="alert" style={styles.formError}>
               <ThemedText
                 type="small"
                 style={[styles.formErrorText, { color: theme.primary }]}
               >
-                {serverMode ? "현재 서버 조회만 지원합니다. 일정 추가는 아직 사용할 수 없어요." : formError}
+                {readOnly ? SCHEDULE_CREATION_READ_ONLY_MESSAGE : serverMode ? creation.error ?? formError : formError}
               </ThemedText>
+              {serverMode && creation.needsCheck && (
+                <Button label="목록 다시 불러오기" onPress={handleGetRetry} disabled={creation.busy} />
+              )}
             </View>
           ) : null}
         </ScrollView>
@@ -249,7 +269,7 @@ export function ScheduleCreateForm() {
           <Button
             label="저장"
             onPress={handleSave}
-            disabled={serverMode || !canSave || saveLocked}
+            disabled={readOnly || !canSave || saveLocked || (serverMode && (creation.busy || creation.created))}
           />
         </SafeAreaView>
       </KeyboardAvoidingView>

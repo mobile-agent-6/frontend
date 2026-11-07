@@ -4,7 +4,7 @@ import { scheduleHttpClient, type HttpError } from "@/services/api/http";
 import { getSchedule, listSchedules } from "@/services/api/schedules";
 import type { Schedule } from "@/types/schedule";
 import { parseScheduleApiDateTime } from "@/utils/schedule-mapper";
-import { buildScheduleListQuery, type ScheduleListQuery } from "@/utils/schedule-query";
+import { buildScheduleListQuery, getMainScheduleRange, type ScheduleListQuery } from "@/utils/schedule-query";
 
 export type ScheduleQueryEntry = {
   query: ScheduleListQuery;
@@ -246,7 +246,24 @@ export function createServerScheduleStore({
         if (owners?.size === 0) { consumers.delete(key); cancel(key); }
       } };
   }
-  return { store, syncServer, acquire, acquireDetail, invalidate,
+  /** 성공 write와 GET 실패를 분리한다. 재시도 인자가 있으면 실패한 GET만 실행한다. */
+  async function refreshLists(expectedServerId: string, retryQueries?: ScheduleListQuery[]) {
+    if (syncServer() !== expectedServerId) return { ok: false,
+      failedQueries: retryQueries?.length ? retryQueries : [getMainScheduleRange(new Date())] };
+    const cache = store.getState().servers[expectedServerId];
+    const active = Object.entries(cache?.queries ?? {}).filter(([key]) => consumers.has(key)).map(([, entry]) => entry.query);
+    const queries = retryQueries ?? (active.length ? active : [getMainScheduleRange(new Date())]);
+    if (!retryQueries) invalidate();
+    await Promise.all(queries.map((query) => fetchQuery(query, true)));
+    if (syncServer() !== expectedServerId) return { ok: false, failedQueries: queries };
+    const current = store.getState().servers[expectedServerId];
+    const failedQueries = queries.filter((query) => {
+      const entry = current?.queries[scheduleQueryKey(expectedServerId, query)];
+      return entry?.status !== "success" || entry.stale;
+    });
+    return { ok: failedQueries.length === 0, failedQueries };
+  }
+  return { store, syncServer, acquire, acquireDetail, invalidate, refreshLists,
     retryDetail: (scheduleId: string) => fetchDetail(scheduleId, true),
     retry: (query: ScheduleListQuery) => fetchQuery(query, true) };
 }
