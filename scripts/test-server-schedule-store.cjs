@@ -165,8 +165,8 @@ test("네트워크 오류는 Abort와 구분하고 기존 제한 retry만 사용
   const h = harness({ timeout: true }); const a = h.cache.acquire(query); await a.promise;
   assert.equal(h.entry().error.kind, "network"); assert.equal(h.entry().hasSuccess, false);
 });
-test("기존 화면과 Mock Hook은 서버 Hook을 사용하지 않음", () => {
-  for (const file of ["src/app/(tabs)/index.tsx", "src/app/(tabs)/calendar.tsx", "src/hooks/use-schedule-data.ts",
+test("Mock Hook과 서비스는 서버 cache에 직접 접근하지 않음", () => {
+  for (const file of ["src/hooks/use-schedule-data.ts",
     "src/services/mock/assistant.ts", "src/stores/scheduleStore.ts"]) {
     assert.doesNotMatch(fs.readFileSync(path.join(root, file), "utf8"), /serverScheduleStore|useServerScheduleData/);
   }

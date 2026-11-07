@@ -17,6 +17,7 @@ type ScheduleCardProps = {
   onPress: () => void;
   onToggleCompleted: () => void;
   showDate?: boolean;
+  completionDisabled?: boolean;
 };
 
 function formatScheduleDate(date: string) {
@@ -32,13 +33,14 @@ export function ScheduleCard({
   onPress,
   onToggleCompleted,
   showDate = true,
+  completionDisabled = false,
 }: ScheduleCardProps) {
   const theme = useTheme();
   const colorScheme = useColorScheme();
 
   const handleToggle = (event: GestureResponderEvent) => {
     event.stopPropagation();
-    onToggleCompleted();
+    if (!completionDisabled) onToggleCompleted();
   };
 
   return (
@@ -60,7 +62,9 @@ export function ScheduleCard({
             : `${schedule.title} 완료`
         }
         accessibilityRole="checkbox"
-        accessibilityState={{ checked: schedule.completed }}
+        accessibilityState={{ checked: schedule.completed, disabled: completionDisabled }}
+        accessibilityHint={completionDisabled ? "서버 완료 상태 변경은 아직 준비 중입니다." : undefined}
+        disabled={completionDisabled}
         hitSlop={Spacing.two}
         onPress={handleToggle}
         style={[

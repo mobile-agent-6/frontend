@@ -1,6 +1,7 @@
 import { SymbolView } from "expo-symbols";
 import { useRouter } from "expo-router";
 import { useMemo, useState } from "react";
+import { useStore } from "zustand";
 import { FlatList, Pressable, StyleSheet, View } from "react-native";
 
 import {
@@ -16,6 +17,9 @@ import { BottomTabInset, Spacing } from "@/constants/theme";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useTheme } from "@/hooks/use-theme";
 import { useScheduleData } from "@/hooks/use-schedule-data";
+import { useServerScheduleData } from "@/hooks/use-server-schedule-data";
+import { isMockScheduleMode, scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
+import { getMainScheduleRange } from "@/utils/schedule-query";
 
 export default function ScheduleListScreen() {
   const theme = useTheme();
@@ -23,10 +27,18 @@ export default function ScheduleListScreen() {
   const router = useRouter();
   const [selectedCategory, setSelectedCategory] =
     useState<ScheduleCategoryFilter>("전체");
-  const {
-    schedules, readError, hasSuccessfulRead, retryRead, completionError,
-    retryCompletion, toggleCompleted, canOpenSchedule,
-  } = useScheduleData();
+  const serverMode = useStore(scheduleDataModeStore, (state) => state.mode === "server");
+  const mock = useScheduleData(!serverMode);
+  const server = useServerScheduleData(getMainScheduleRange(new Date()), serverMode);
+  const schedules = serverMode ? server.schedules : mock.schedules;
+  const needsRefresh = serverMode && server.hasSuccessfulRead && server.stale && !server.isFetching && !server.error;
+  const readError = serverMode ? Boolean(server.error) || needsRefresh : mock.readError;
+  const hasSuccessfulRead = serverMode ? server.hasSuccessfulRead : mock.hasSuccessfulRead;
+  const retryRead = serverMode ? server.retryRead : mock.retryRead;
+  const { retryCompletion, toggleCompleted, canOpenSchedule } = mock;
+  const completionError = serverMode ? null : mock.completionError;
+  const loading = serverMode && (server.initialLoading || server.isFetching);
+  const canShowEmpty = serverMode ? server.success : !readError || hasSuccessfulRead;
 
   const visibleSchedules = useMemo(
     () => {
@@ -37,11 +49,11 @@ export default function ScheduleListScreen() {
               (schedule) => schedule.category === selectedCategory,
             );
 
-      return filteredSchedules.sort(
+      return serverMode ? filteredSchedules : filteredSchedules.sort(
         (a, b) => a.date.localeCompare(b.date) || a.time.localeCompare(b.time),
       );
     },
-    [schedules, selectedCategory],
+    [schedules, selectedCategory, serverMode],
   );
 
   return (
@@ -71,7 +83,7 @@ export default function ScheduleListScreen() {
         ]}
         ItemSeparatorComponent={ScheduleSeparator}
         ListEmptyComponent={
-          readError && !hasSuccessfulRead ? undefined : (
+          !canShowEmpty ? undefined : (
             <ScheduleListState
               state="empty"
               emptyText={selectedCategory === "전체" ? undefined : `${selectedCategory} 일정이 없어요.`}
@@ -79,14 +91,15 @@ export default function ScheduleListScreen() {
           )
         }
         ListHeaderComponent={
-          readError || completionError ? (
+          readError || completionError || loading ? (
             <View style={((readError && hasSuccessfulRead) || completionError) && visibleSchedules.length > 0
               ? styles.errorHeader
               : undefined}>
+              {loading && <ScheduleListState state="loading" />}
               {readError && (
                 <ScheduleListState
                   state="error"
-                  errorTitle={hasSuccessfulRead
+                  errorTitle={needsRefresh ? "일정 정보를 다시 확인해 주세요." : hasSuccessfulRead
                     ? "최신 정보를 불러오지 못했어요. 이전 정보를 표시하고 있어요."
                     : undefined}
                   onRetry={retryRead}
@@ -105,8 +118,9 @@ export default function ScheduleListScreen() {
         renderItem={({ item }) => (
           <ScheduleCard
             schedule={item}
-            onToggleCompleted={() => toggleCompleted(item)}
-            onPress={() => canOpenSchedule() &&
+            completionDisabled={serverMode}
+            onToggleCompleted={() => isMockScheduleMode() && toggleCompleted(item)}
+            onPress={() => (serverMode || canOpenSchedule()) &&
               router.push({
                 pathname: "/schedule/[id]",
                 params: { id: item.id },
