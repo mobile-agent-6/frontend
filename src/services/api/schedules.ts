@@ -1,7 +1,7 @@
 import * as Crypto from "expo-crypto";
 
 import { scheduleHttpClient, type HttpError, type HttpResult, type ScheduleHttpClient } from "@/services/api/http";
-import type { Schedule, ScheduleCreateInput, ScheduleDto } from "@/types/schedule";
+import type { Schedule, ScheduleCreateInput, ScheduleDto, ScheduleUpdateInput } from "@/types/schedule";
 import { parseScheduleApiDateTime, scheduleDtoToSchedule, scheduledAtToUiDateTime, toUiCategory } from "@/utils/schedule-mapper";
 import { buildScheduleListQuery, type ScheduleListQuery } from "@/utils/schedule-query";
 
@@ -52,20 +52,80 @@ export type ScheduleCreationPreparation =
   | { ok: false; error: { kind: "validation"; fields: Partial<Record<keyof ScheduleCreateInput, string>> } }
   | { ok: false; error: { kind: "key-generation" } };
 
+function validateTitle(value: unknown): { title: string; error?: string } {
+  const title = typeof value === "string" ? value.trim() : "";
+  if (typeof value !== "string" || [...title].length < 1 || [...title].length > 100) {
+    return { title, error: "제목은 공백 정리 후 1~100 Unicode code point여야 합니다." };
+  }
+  if (/\p{Cc}/u.test(title)) return { title, error: "제목에 제어문자를 사용할 수 없습니다." };
+  return { title };
+}
+
 function validateCreation(input: ScheduleCreateInput) {
   const fields: Partial<Record<keyof ScheduleCreateInput, string>> = {};
-  const title = typeof input?.title === "string" ? input.title.trim() : "";
-  if (typeof input?.title !== "string" || [...title].length < 1 || [...title].length > 100) {
-    fields.title = "제목은 공백 정리 후 1~100 Unicode code point여야 합니다.";
-  } else if (/\p{Cc}/u.test(title)) {
-    fields.title = "제목에 제어문자를 사용할 수 없습니다.";
-  }
+  const { title, error } = validateTitle(input?.title);
+  if (error) fields.title = error;
   try {
     if (typeof input?.scheduledAt !== "string") throw new Error();
     parseScheduleApiDateTime(input.scheduledAt);
   } catch { fields.scheduledAt = "시간대가 포함된 유효한 날짜·시간이 필요합니다."; }
   try { toUiCategory(input?.category); } catch { fields.category = "허용된 API 카테고리가 필요합니다."; }
   return { title, fields };
+}
+
+export type ScheduleMutationResult<T, Outcome extends "updated" | "deleted"> =
+  | { outcome: Outcome; response: Extract<HttpResult<T>, { ok: true }> }
+  | { outcome: "not-sent" | "rejected" | "uncertain" | "review-required";
+      attempts: number; requiresReconciliation: boolean;
+      error: HttpError | { kind: "operation"; reason: "schedule-busy" } };
+
+type ScheduleMutationOperation<T, Outcome extends "updated" | "deleted", Payload> = {
+  readonly scheduleId: string;
+  readonly payload: Payload;
+  readonly serverId: string | null;
+  submit: (signal?: AbortSignal) => Promise<ScheduleMutationResult<T, Outcome>>;
+};
+export type ScheduleUpdateOperation = ScheduleMutationOperation<Schedule, "updated", Readonly<ScheduleUpdateInput>>;
+export type ScheduleDeleteOperation = ScheduleMutationOperation<undefined, "deleted", undefined>;
+
+type MutationFields = Partial<Record<keyof ScheduleUpdateInput | "scheduleId" | "updates", string>>;
+export type ScheduleMutationPreparation<Operation> =
+  | { ok: true; operation: Operation }
+  | { ok: false; error: { kind: "validation"; fields: MutationFields } };
+
+function schedulePath(scheduleId: string): string {
+  if (typeof scheduleId !== "string" || !scheduleId || [".", ".."].includes(scheduleId)) throw new Error();
+  return `/schedules/${encodeURIComponent(scheduleId)}`;
+}
+
+function validateUpdate(input: ScheduleUpdateInput) {
+  const payload: ScheduleUpdateInput = {};
+  const fields: MutationFields = {};
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    return { payload, fields: { updates: "수정할 필드 객체가 필요합니다." } as MutationFields };
+  }
+  if (input.title !== undefined) {
+    const { title, error } = validateTitle(input.title);
+    if (error) fields.title = error;
+    else payload.title = title;
+  }
+  if (input.scheduledAt !== undefined) {
+    try {
+      if (typeof input.scheduledAt !== "string") throw new Error();
+      parseScheduleApiDateTime(input.scheduledAt);
+      payload.scheduledAt = input.scheduledAt;
+    } catch { fields.scheduledAt = "시간대가 포함된 유효한 날짜·시간이 필요합니다."; }
+  }
+  if (input.category !== undefined) {
+    try { toUiCategory(input.category); payload.category = input.category; }
+    catch { fields.category = "허용된 API 카테고리가 필요합니다."; }
+  }
+  if (input.completed !== undefined) {
+    if (typeof input.completed !== "boolean") fields.completed = "완료 상태는 boolean이어야 합니다.";
+    else payload.completed = input.completed;
+  }
+  if (!Object.keys(payload).length && !Object.keys(fields).length) fields.updates = "변경할 필드가 없습니다.";
+  return { payload, fields };
 }
 
 /** 서버 설정은 HTTP 계층에 맡기며 navigation·form·store를 변경하지 않는 서비스. */
@@ -76,6 +136,8 @@ export function createScheduleService(
     now?: () => number;
   } = {},
 ) {
+  // 기본 서비스 인스턴스를 공유하는 호출자의 동일 일정 PATCH/DELETE 동시 실행을 차단한다.
+  const pendingScheduleIds = new Set<string>();
   async function listSchedules(query: ScheduleListQuery, signal?: AbortSignal): Promise<HttpResult<Schedule[]>> {
     let params: URLSearchParams;
     try { params = buildScheduleListQuery(query); } catch { return invalidRequest(); }
@@ -90,8 +152,7 @@ export function createScheduleService(
   async function getSchedule(scheduleId: string, signal?: AbortSignal): Promise<HttpResult<Schedule>> {
     let path: string;
     try {
-      if (typeof scheduleId !== "string" || !scheduleId || [".", ".."].includes(scheduleId)) return invalidRequest();
-      path = `/schedules/${encodeURIComponent(scheduleId)}`;
+      path = schedulePath(scheduleId);
     } catch { return invalidRequest(); }
     return mapResponse(await client.request({ path, signal }), readSchedule);
   }
@@ -168,7 +229,71 @@ export function createScheduleService(
     return { ok: true, operation };
   }
 
-  return { listSchedules, getSchedule, prepareScheduleCreation };
+  function prepareMutation<T, Outcome extends "updated" | "deleted", Payload>(
+    scheduleId: string, payload: Payload, method: "PATCH" | "DELETE",
+    expectedStatus: number, decode: (data: unknown) => T, outcome: Outcome,
+  ): ScheduleMutationPreparation<ScheduleMutationOperation<T, Outcome, Payload>> {
+    let path: string;
+    try { path = schedulePath(scheduleId); }
+    catch { return { ok: false, error: { kind: "validation", fields: { scheduleId: "일정 ID 문자열이 필요합니다." } } }; }
+    let serverId: string | null = null;
+    let sent = false;
+    let uncertain = false;
+    let pending: Promise<ScheduleMutationResult<T, Outcome>> | null = null;
+    let terminal: ScheduleMutationResult<T, Outcome> | null = null;
+
+    async function send(signal?: AbortSignal): Promise<ScheduleMutationResult<T, Outcome>> {
+      if (serverId === null) serverId = client.getServerId();
+      const result = mapResponse(await client.request({
+        method, path, body: payload, signal, expectedServerId: serverId ?? undefined,
+      }), decode, expectedStatus);
+      if (result.attempts > 0) sent = true;
+      else if (!sent) serverId = null;
+      if (result.ok) {
+        terminal = { outcome, response: result };
+        return terminal;
+      }
+      const { error, attempts } = result;
+      uncertain ||= error.unconfirmedAttempt === true;
+      if (error.kind === "http" && error.status !== undefined && error.status >= 400 && error.status < 500) {
+        terminal = { outcome: uncertain ? "uncertain" : "rejected", error, attempts, requiresReconciliation: uncertain };
+        return terminal;
+      }
+      if (error.requestState === "not-sent" && !uncertain) {
+        return { outcome: "not-sent", error, attempts, requiresReconciliation: false };
+      }
+      uncertain = true;
+      return { outcome: error.kind === "response" ? "review-required" : "uncertain",
+        error, attempts, requiresReconciliation: true };
+    }
+
+    function submit(signal?: AbortSignal): Promise<ScheduleMutationResult<T, Outcome>> {
+      if (terminal) return Promise.resolve(terminal);
+      if (pending) return pending;
+      if (pendingScheduleIds.has(scheduleId)) return Promise.resolve({
+        outcome: "not-sent", attempts: 0, requiresReconciliation: false,
+        error: { kind: "operation", reason: "schedule-busy" },
+      });
+      pendingScheduleIds.add(scheduleId);
+      pending = send(signal).finally(() => { pendingScheduleIds.delete(scheduleId); pending = null; });
+      return pending;
+    }
+    // 결과 불확실 시 다음 조작 허용 여부는 호출자가 GET 확인 후 판단한다. 별도 작업을 자동 시작하지 않는다.
+    return { ok: true, operation: Object.freeze({ scheduleId, payload, get serverId() { return serverId; }, submit }) };
+  }
+
+  /** 변경 감지가 끝난 API 필드를 받아 허용된 필드만 고정한다. */
+  function prepareScheduleUpdate(scheduleId: string, input: ScheduleUpdateInput): ScheduleMutationPreparation<ScheduleUpdateOperation> {
+    const { payload, fields } = validateUpdate(input);
+    if (Object.keys(fields).length) return { ok: false, error: { kind: "validation", fields } };
+    return prepareMutation(scheduleId, Object.freeze(payload), "PATCH", 200, readSchedule, "updated");
+  }
+
+  function prepareScheduleDeletion(scheduleId: string): ScheduleMutationPreparation<ScheduleDeleteOperation> {
+    return prepareMutation(scheduleId, undefined, "DELETE", 204, () => undefined, "deleted");
+  }
+
+  return { listSchedules, getSchedule, prepareScheduleCreation, prepareScheduleUpdate, prepareScheduleDeletion };
 }
 
-export const { listSchedules, getSchedule, prepareScheduleCreation } = createScheduleService();
+export const { listSchedules, getSchedule, prepareScheduleCreation, prepareScheduleUpdate, prepareScheduleDeletion } = createScheduleService();

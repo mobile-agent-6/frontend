@@ -47,3 +47,5 @@ export type ScheduleDto = {
 };
 
 export type ScheduleCreateInput = Pick<ScheduleDto, "title" | "scheduledAt" | "category">;
+
+export type ScheduleUpdateInput = Partial<Pick<ScheduleDto, "title" | "scheduledAt" | "category" | "completed">>;

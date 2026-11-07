@@ -3,6 +3,7 @@ import type {
   ScheduleApiCategory,
   ScheduleCategory,
   ScheduleDto,
+  ScheduleUpdateInput,
 } from "@/types/schedule";
 
 /** API 요청 datetime을 검증하고 소수초 최대 6자리 정밀도를 보존해 UTC로 정규화한다. */
@@ -110,4 +111,24 @@ export function scheduleDtoToSchedule(dto: ScheduleDto): Schedule {
     category: toUiCategory(dto.category),
     completed: dto.completed,
   };
+}
+
+/** 기존 폼의 변경값을 원본과 비교한다. HTTP 필드 검증·전송은 서비스가 담당한다. */
+export function buildScheduleUpdate(
+  original: Schedule,
+  updates: Partial<Pick<Schedule, "title" | "date" | "time" | "category" | "completed">>,
+): ScheduleUpdateInput {
+  const result: ScheduleUpdateInput = {};
+  if (updates.title !== undefined && updates.title.trim() !== original.title.trim()) {
+    result.title = updates.title.trim();
+  }
+  if (updates.category !== undefined && updates.category !== original.category) {
+    result.category = toApiCategory(updates.category);
+  }
+  const date = updates.date === undefined ? original.date : updates.date;
+  const time = updates.time === undefined ? original.time : updates.time;
+  // 분 단위 UI 값이 그대로라면 서버의 기존 초·소수초를 재생성하지 않는다.
+  if (date !== original.date || time !== original.time) result.scheduledAt = uiDateTimeToScheduledAt(date, time);
+  if (updates.completed !== undefined && updates.completed !== original.completed) result.completed = updates.completed;
+  return result;
 }

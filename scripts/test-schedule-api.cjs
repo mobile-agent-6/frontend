@@ -900,3 +900,308 @@ test("POST: key 생성 예외·서버 validation·직렬화 오류를 구분", a
   assert.equal(serialized.error.requestState, "not-sent");
   assert.equal(h.state.calls.length, 0);
 });
+
+const mapperModule = loadSource("src/utils/schedule-mapper.ts");
+function preparedUpdate(service, updates, id = dto.id) {
+  const result = service.prepareScheduleUpdate(id, updates);
+  assert.equal(result.ok, true);
+  return result.operation;
+}
+function preparedDelete(service, id = dto.id) {
+  const result = service.prepareScheduleDeletion(id);
+  assert.equal(result.ok, true);
+  return result.operation;
+}
+function noContent() {
+  return { status: 204, ok: true, headers: new Headers({ "X-Request-ID": "delete-trace" }),
+    text() { throw new Error("204 본문을 읽으면 안 됩니다."); } };
+}
+
+test("PATCH mapper: 제목·카테고리만 변경하면 scheduledAt 제외·원복은 빈 변경", () => {
+  const original = mapperModule.scheduleDtoToSchedule({ ...dto, scheduledAt: "2026-11-07T15:00:32.123456Z" });
+  assert.deepEqual(mapperModule.buildScheduleUpdate(original, { title: "  renamed  " }), { title: "renamed" });
+  assert.deepEqual(mapperModule.buildScheduleUpdate(original, { category: mapperModule.toUiCategory("RETURN") }), { category: "RETURN" });
+  assert.deepEqual(mapperModule.buildScheduleUpdate(original, { ...original, title: ` ${original.title} ` }), {});
+  assert.deepEqual(mapperModule.buildScheduleUpdate(original, { completed: true }), { completed: true });
+  assert.equal(original.time, "00:00");
+});
+
+test("PATCH mapper: 날짜 또는 시간 변경 시 최종 두 값을 결합·월말/연말/윤년 처리", () => {
+  const original = { ...mapperModule.scheduleDtoToSchedule(dto), date: "2026-12-31", time: "23:59" };
+  for (const [updates, expected] of [
+    [{ date: "2027-01-01" }, "2027-01-01T23:59:00+09:00"],
+    [{ time: "00:01" }, "2026-12-31T00:01:00+09:00"],
+    [{ date: "2024-02-29", time: "00:00" }, "2024-02-29T00:00:00+09:00"],
+  ]) assert.deepEqual(mapperModule.buildScheduleUpdate(original, updates), { scheduledAt: expected });
+  assert.throws(() => mapperModule.buildScheduleUpdate(original, { date: "2026-02-29" }), RangeError);
+});
+
+test("PATCH: 빈 변경·금지 필드만 있는 객체·null·잘못된 형식은 전송 전 차단", () => {
+  const h = harness(async () => json(dto));
+  const service = createService(h.client);
+  for (const updates of [{}, { id: "other", createdAt: "bad", updatedAt: "bad", reminderAt: "bad" },
+    { title: undefined }, { title: null }, { scheduledAt: null }, { category: null }, { completed: null },
+    { completed: "true" }, { category: "MEETING" }, { scheduledAt: "2026-11-07T00:00:00" }, [], null]) {
+    const result = service.prepareScheduleUpdate(dto.id, updates);
+    assert.equal(result.ok, false);
+    assert.equal(result.error.kind, "validation");
+  }
+  const original = mapperModule.scheduleDtoToSchedule(dto);
+  assert.equal(service.prepareScheduleUpdate(dto.id, mapperModule.buildScheduleUpdate(original, original)).ok, false);
+  assert.equal(h.state.calls.length, 0);
+});
+
+test("PATCH: POST 제목 규칙 재사용·과거 일정의 제목/카테고리/완료 수정 준비 허용", () => {
+  const service = createService(harness(async () => json(dto)).client);
+  const emoji = String.fromCodePoint(0x1f600);
+  assert.equal(preparedUpdate(service, { title: emoji.repeat(100) }).payload.title.length, 200);
+  for (const title of [" ", emoji.repeat(101), "a\nb", "a\tb", "a\0b", "a\u0085b"]) {
+    assert.ok(service.prepareScheduleUpdate(dto.id, { title }).error.fields.title);
+    assert.ok(service.prepareScheduleCreation({ ...createInput, title }).error.fields.title);
+  }
+  for (const input of [{ title: "renamed" }, { category: "OTHER" }, { completed: false },
+    { scheduledAt: "2025-01-01T00:00:00Z" }]) assert.equal(service.prepareScheduleUpdate(dto.id, input).ok, true);
+});
+
+test("PATCH: method·안전한 ID 인코딩·허용 필드·200 DTO 변환·멱등성 key 없음", async () => {
+  const h = harness(async () => json({ ...dto, title: "renamed", completed: true }));
+  const service = createService(h.client);
+  const op = preparedUpdate(service, { title: "  renamed  ", completed: true,
+    id: "forbidden", createdAt: "bad", updatedAt: "bad", reminderMinutesBefore: 10, reminderAt: "bad" }, "a/b ?#%");
+  const result = await op.submit();
+  assert.equal(result.outcome, "updated");
+  assert.equal(result.response.status, 200);
+  assert.equal(result.response.data.date, "2026-11-08");
+  assert.equal(result.response.data.title, "renamed");
+  assert.equal(result.response.requestId, "header-request-id");
+  const [url, init] = h.state.calls[0];
+  assert.equal(url, "https://example.invalid/api/v1/schedules/a%2Fb%20%3F%23%25");
+  assert.equal(init.method, "PATCH");
+  assert.equal(init.headers.get("Content-Type"), "application/json");
+  assert.equal(init.headers.get("Idempotency-Key"), null);
+  assert.deepEqual(JSON.parse(init.body), { title: "renamed", completed: true });
+  assert.deepEqual(await op.submit(), result);
+  assert.equal(h.state.calls.length, 1);
+});
+
+test("DELETE: 204·재삭제 204·본문 미파싱·body와 Idempotency-Key 없음", async () => {
+  const h = harness(async () => noContent());
+  const service = createService(h.client);
+  const first = preparedDelete(service);
+  const result = await first.submit();
+  assert.equal(result.outcome, "deleted");
+  assert.equal(result.response.status, 204);
+  assert.equal(result.response.data, undefined);
+  assert.equal(result.response.requestId, "delete-trace");
+  await first.submit();
+  assert.equal(h.state.calls.length, 1);
+  assert.equal((await preparedDelete(service).submit()).outcome, "deleted");
+  assert.equal(h.state.calls.length, 2);
+  for (const [url, init] of h.state.calls) {
+    assert.equal(url, `https://example.invalid/api/v1/schedules/${dto.id}`);
+    assert.equal(init.method, "DELETE");
+    assert.equal(init.body, undefined);
+    assert.equal(init.headers.get("Content-Type"), null);
+    assert.equal(init.headers.get("Idempotency-Key"), null);
+  }
+});
+
+test("PATCH/DELETE: 404·422 등의 Problem Details 거절과 자동 retry 금지", async () => {
+  for (const method of ["PATCH", "DELETE"]) for (const [status, code] of [
+    [404, "SCHEDULE_NOT_FOUND"], [404, "ROUTE_NOT_FOUND"], [422, "VALIDATION_ERROR"], [409, "test"],
+  ]) {
+    const body = problem(status, code);
+    if (code === "VALIDATION_ERROR") body.errors = [{ location: "body", pointer: "/title", code: "TOO_LONG", detail: "test" }];
+    const h = harness(async () => json(body, status, "application/problem+json"));
+    const service = createService(h.client);
+    const op = method === "PATCH" ? preparedUpdate(service, { title: "renamed" }) : preparedDelete(service);
+    const result = await op.submit();
+    assert.equal(result.outcome, "rejected");
+    assert.equal(result.error.problem.code, code);
+    assert.equal(result.requiresReconciliation, false);
+    assert.equal(result.error.requestId, "header-request-id");
+    await op.submit();
+    assert.equal(h.state.calls.length, 1);
+  }
+});
+
+test("PATCH: 자동·수동 retry에서 ID·body·목표 completed 고정", async () => {
+  let calls = 0;
+  const input = { title: "renamed", completed: true };
+  const h = harness(async () => {
+    input.title = "edited"; input.completed = false;
+    if (++calls <= 2) throw new TypeError();
+    return json(dto);
+  });
+  const op = preparedUpdate(createService(h.client), input);
+  assert.equal(Reflect.set(op.payload, "title", "mutated"), false);
+  assert.equal(Reflect.set(op, "scheduleId", "other"), false);
+  const first = await op.submit();
+  assert.equal(first.outcome, "uncertain");
+  assert.equal(first.attempts, 2);
+  assert.equal((await op.submit()).outcome, "updated");
+  assert.equal(h.state.calls.length, 3);
+  for (const [url, init] of h.state.calls) {
+    assert.equal(url, `https://example.invalid/api/v1/schedules/${dto.id}`);
+    assert.deepEqual(JSON.parse(init.body), { title: "renamed", completed: true });
+  }
+});
+
+test("DELETE: 503 retry에서도 같은 ID 유지·body 생략", async () => {
+  let calls = 0;
+  const h = harness(async () => ++calls === 1
+    ? json(problem(503, "DATABASE_UNAVAILABLE"), 503, "application/problem+json") : noContent());
+  const result = await preparedDelete(createService(h.client), "id/with ?#%").submit();
+  assert.equal(result.outcome, "deleted");
+  assert.equal(result.response.attempts, 2);
+  assert.equal(h.state.calls[0][0], h.state.calls[1][0]);
+  assert.match(h.state.calls[0][0], /id%2Fwith%20%3F%23%25$/);
+  assert.equal(h.state.calls[1][1].body, undefined);
+});
+
+test("PATCH/DELETE: timeout·network·503은 최대 1회 retry 후에도 불확실·500 재전송 금지", async () => {
+  for (const method of ["PATCH", "DELETE"]) {
+    const clock = fakeTimers();
+    const h = harness(() => new Promise(() => {}), clock);
+    const service = createService(h.client);
+    const op = method === "PATCH" ? preparedUpdate(service, { completed: false }) : preparedDelete(service);
+    const pending = op.submit();
+    clock.fire(); await flush(); clock.fire();
+    const result = await pending;
+    assert.equal(result.outcome, "uncertain");
+    assert.equal(result.error.kind, "timeout");
+    assert.equal(result.attempts, 2);
+    assert.equal(result.requiresReconciliation, true);
+    assert.equal(clock.pending.size, 0);
+    for (const status of [null, 503, 500]) {
+      const failure = harness(async () => {
+        if (status === null) throw new TypeError();
+        return json(problem(status, status === 503 ? "DATABASE_UNAVAILABLE" : "INTERNAL_ERROR"), status, "application/problem+json");
+      });
+      const s = createService(failure.client);
+      const failed = await (method === "PATCH" ? preparedUpdate(s, { title: "renamed" }) : preparedDelete(s)).submit();
+      assert.equal(failed.outcome, "uncertain");
+      assert.equal(failure.state.calls.length, status === 500 ? 1 : 2);
+    }
+  }
+});
+
+test("PATCH/DELETE: 동일 작업 submit 공유·동일 ID 병렬 조작 차단·다른 ID 허용", async () => {
+  const resolves = [];
+  const h = harness(() => new Promise((resolve) => { resolves.push(resolve); }));
+  const service = createService(h.client);
+  const update = preparedUpdate(service, { completed: true });
+  const deletion = preparedDelete(service);
+  const other = preparedDelete(service, "other");
+  const pending = update.submit();
+  assert.equal(update.submit(), pending);
+  const blocked = await deletion.submit();
+  assert.equal(blocked.outcome, "not-sent");
+  assert.equal(blocked.error.reason, "schedule-busy");
+  const otherPending = other.submit();
+  assert.equal(h.state.calls.length, 2);
+  resolves[0](json(dto)); resolves[1](noContent());
+  await pending; await otherPending;
+  const deleting = deletion.submit();
+  resolves[2](noContent());
+  assert.equal((await deleting).outcome, "deleted");
+});
+
+test("PATCH/DELETE: Abort・서버 변경은 retry하지 않고 수동 retry도 원래 서버로 제한", async () => {
+  for (const method of ["PATCH", "DELETE"]) {
+    const h = harness(() => new Promise(() => {}));
+    const service = createService(h.client);
+    const op = method === "PATCH" ? preparedUpdate(service, { title: "renamed" }) : preparedDelete(service);
+    const cancelled = new AbortController(); cancelled.abort();
+    assert.equal((await op.submit(cancelled.signal)).outcome, "not-sent");
+    assert.equal(h.state.calls.length, 0);
+    const controller = new AbortController();
+    const pending = op.submit(controller.signal); controller.abort();
+    assert.equal((await pending).outcome, "uncertain");
+    assert.equal(h.state.calls.length, 1);
+    h.state.config = configModule.parseDevelopmentServerConfig("https://other.invalid");
+    const retry = await op.submit();
+    assert.equal(retry.outcome, "uncertain");
+    assert.equal(retry.error.kind, "aborted");
+    assert.equal(retry.attempts, 0);
+    assert.equal(h.state.calls.length, 1);
+    const changed = harness(async () => {
+      changed.state.config = configModule.parseDevelopmentServerConfig("https://other.invalid");
+      return method === "PATCH" ? json(dto) : noContent();
+    });
+    const s = createService(changed.client);
+    assert.equal((await (method === "PATCH" ? preparedUpdate(s, { title: "renamed" }) : preparedDelete(s)).submit()).outcome, "uncertain");
+    assert.equal(changed.state.calls.length, 1);
+  }
+});
+
+test("PATCH/DELETE: 성공 status·DTO 형식 오류는 확인 필요", async () => {
+  for (const response of [() => json({}, 200), () => json(dto, 201),
+    () => json({ ...dto, scheduledAt: "bad" }), () => noContent()]) {
+    const h = harness(async () => response());
+    const result = await preparedUpdate(createService(h.client), { title: "renamed" }).submit();
+    assert.equal(result.outcome, "review-required");
+    assert.equal(result.error.kind, "response");
+    assert.equal(result.requiresReconciliation, true);
+    assert.equal(h.state.calls.length, 1);
+  }
+  const h = harness(async () => json({}, 200));
+  assert.equal((await preparedDelete(createService(h.client)).submit()).outcome, "review-required");
+});
+
+test("PATCH/DELETE: 앞선 미확인 시도 뒤 404를 받아도 원래 적용 실패로 단정하지 않음", async () => {
+  for (const method of ["PATCH", "DELETE"]) {
+    let calls = 0;
+    const h = harness(async () => {
+      if (++calls === 1) throw new TypeError();
+      return json(problem(404, "SCHEDULE_NOT_FOUND"), 404, "application/problem+json");
+    });
+    const s = createService(h.client);
+    const op = method === "PATCH" ? preparedUpdate(s, { title: "renamed" }) : preparedDelete(s);
+    const result = await op.submit();
+    assert.equal(result.outcome, "uncertain");
+    assert.equal(result.error.problem.code, "SCHEDULE_NOT_FOUND");
+    assert.equal(result.requiresReconciliation, true);
+    await op.submit();
+    assert.equal(h.state.calls.length, 2);
+  }
+});
+
+test("PATCH/DELETE: ID 검사·설정 누락 구분·UUID v4/v5 문자열 그대로 사용", async () => {
+  const h = harness(async () => json(dto));
+  const s = createService(h.client);
+  for (const id of ["", ".", "..", 123, null, "\ud800"]) {
+    assert.equal(s.prepareScheduleUpdate(id, { title: "renamed" }).ok, false);
+    assert.equal(s.prepareScheduleDeletion(id).ok, false);
+  }
+  for (const id of [dto.id, dto.id.replace("5111", "4111")]) {
+    await preparedUpdate(s, { title: "renamed" }, id).submit();
+    assert.equal(h.state.calls.at(-1)[0], `https://example.invalid/api/v1/schedules/${id}`);
+  }
+  h.state.config = { status: "missing" };
+  for (const op of [preparedUpdate(s, { title: "renamed" }), preparedDelete(s)]) {
+    const result = await op.submit();
+    assert.equal(result.outcome, "not-sent");
+    assert.equal(result.error.kind, "configuration");
+    assert.equal(op.serverId, null);
+  }
+});
+
+test("DELETE: 미확인 작업의 수동 retry도 같은 ID·서버를 유지하며 204로 확정", async () => {
+  let calls = 0;
+  const h = harness(async () => {
+    if (++calls <= 2) throw new TypeError();
+    return noContent();
+  });
+  const op = preparedDelete(createService(h.client));
+  const first = await op.submit();
+  assert.equal(first.outcome, "uncertain");
+  assert.equal(first.requiresReconciliation, true);
+  assert.equal((await op.submit()).outcome, "deleted");
+  assert.equal(h.state.calls.length, 3);
+  for (const [url, init] of h.state.calls) {
+    assert.equal(url, `https://example.invalid/api/v1/schedules/${dto.id}`);
+    assert.equal(init.method, "DELETE");
+    assert.equal(init.body, undefined);
+  }
+});
