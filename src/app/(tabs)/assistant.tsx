@@ -30,6 +30,7 @@ import { upsertAssistantExecutionMessage } from "@/utils/assistant-recovery-mess
 import { createAssistantTextQuestionContext, type AssistantCandidateQuestion, type AssistantConfirmationQuestion, type AssistantTextQuestion } from "@/utils/assistant-text-question";
 import { assistantCandidateToDisplay } from "@/utils/assistant-mapper";
 import { getAssistantErrorRecoveryTarget, type AssistantErrorRecoveryNotice } from "@/utils/assistant-errors";
+import { createAssistantUncertainContext, type AssistantUncertainView } from "@/utils/assistant-uncertain";
 
 // processing UI를 보여주기 위한 Mock 지연이며, 실제 API timeout이 아니다.
 const MOCK_PROCESSING_DELAY_MS = 700;
@@ -52,6 +53,9 @@ export default function AssistantScreen() {
     selections: Readonly<Record<string, string>>; confirmations: Readonly<Record<string, boolean>>;
     expiredConfirmations: readonly string[] } | null>(null);
   const [recoverySnapshot, setRecoverySnapshot] = useState(assistantLifecycle.getSnapshot);
+  const [uncertainUi, setUncertainUi] = useState<{ serverId: string; generation: number; held: boolean;
+    views: AssistantUncertainView[] } | null>(null);
+  const uncertainRef = useRef<ReturnType<typeof createAssistantUncertainContext> | null>(null);
   const sendLockedRef = useRef(false);
   const inputTextRef = useRef("");
   const inputRevisionRef = useRef(0);
@@ -82,6 +86,19 @@ export default function AssistantScreen() {
       active: context.getCandidateQuestion(now), confirmation: context.getConfirmationQuestion(now),
       selections: context.getSelections(), confirmations: context.getConfirmations(), expiredConfirmations: context.getExpiredConfirmations(now) };
     setQuestionUi(previous => JSON.stringify(previous) === JSON.stringify(next) ? previous : next);
+  }, []);
+
+  const getUncertainContext = useCallback((serverId: string) => {
+    const generation = scheduleDataModeStore.getState().generation;
+    if (uncertainRef.current?.serverId !== serverId || uncertainRef.current.generation !== generation) {
+      uncertainRef.current = createAssistantUncertainContext(serverId, generation);
+    }
+    return uncertainRef.current;
+  }, []);
+  const syncUncertainUi = useCallback((context: ReturnType<typeof createAssistantUncertainContext>) => {
+    if (!mountedRef.current) return;
+    const next = { serverId: context.serverId, generation: context.generation, held: context.isHeld(), views: context.views() };
+    setUncertainUi(previous => JSON.stringify(previous) === JSON.stringify(next) ? previous : next);
   }, []);
 
   const invalidateActiveInteraction = useCallback(() => {
@@ -152,6 +169,8 @@ export default function AssistantScreen() {
     serverTaskRef.current = null;
     textQuestionRef.current = null;
     setQuestionUi(null);
+    uncertainRef.current = null;
+    setUncertainUi(null);
     if (processingTimerRef.current !== null) clearTimeout(processingTimerRef.current);
     processingTimerRef.current = null;
     pendingMockRef.current = null;
@@ -192,16 +211,23 @@ export default function AssistantScreen() {
       }
       if (serverId) {
         const context = getTextQuestionContext(serverId);
+        const uncertain = getUncertainContext(serverId);
         for (const entry of snapshot.results) {
           if (entry.reference.serverId !== serverId) continue;
           if (entry.latestResult && entry.latestResult.reference.requestId.toLowerCase() === entry.reference.requestId.toLowerCase()) {
             context.observeExecution(entry.latestResult, "recovery");
+            uncertain.observe(entry.latestResult, "recovery");
           } else if (!entry.latestResult && entry.phase === "status" && entry.lastResponse &&
             entry.lastResponse.data.requestId.toLowerCase() === entry.reference.requestId.toLowerCase()) {
             context.observeResponse(entry.lastResponse.data, "recovery");
+            const response = entry.lastResponse, data = response.data;
+            uncertain.observe(data.status === "completed"
+              ? { kind: "completed", reference: entry.reference, response: { ...response, data } }
+              : { kind: "observed", reference: entry.reference, response: { ...response, data } }, "recovery");
           }
         }
         syncQuestionUi(context);
+        syncUncertainUi(uncertain);
       }
       setMessages(current => {
         let next = snapshot.initialCheck === "checked" && !snapshot.issue && !snapshot.initialization
@@ -232,7 +258,7 @@ export default function AssistantScreen() {
     const unsubscribe = assistantLifecycle.subscribe(consume);
     consume();
     return () => { subscribed = false; unsubscribe(); };
-  }, [getTextQuestionContext, reportRecoveryIssue, syncQuestionUi]);
+  }, [getTextQuestionContext, getUncertainContext, reportRecoveryIssue, syncQuestionUi, syncUncertainUi]);
 
   useEffect(() => {
     if (status !== "processing" || serverTaskRef.current !== null || !isMockScheduleMode()) return;
@@ -292,6 +318,7 @@ export default function AssistantScreen() {
     const generation = scheduleDataModeStore.getState().generation;
     const text = inputTextRef.current, revision = inputRevisionRef.current;
     let completed = false;
+    let acknowledgmentAttempt = false, postAccepted = false;
     let clearInputExpiry: (() => void) | undefined;
     const isCurrent = () => mountedRef.current && operationVersionRef.current === version &&
       scheduleDataModeStore.getState().mode === "server" && scheduleDataModeStore.getState().generation === generation;
@@ -311,6 +338,13 @@ export default function AssistantScreen() {
       };
       if (!canStart()) return;
       const context = getTextQuestionContext(serverId);
+      const uncertain = getUncertainContext(serverId);
+      const acknowledgedId = !action ? uncertain.acknowledgmentForNewText() : undefined;
+      acknowledgmentAttempt = acknowledgedId !== undefined;
+      if (uncertain.isHeld() && (!acknowledgedId || action)) {
+        reportError("결과가 확인되지 않은 작업이 있어요. 결과를 확인하고 위험을 명시적으로 인지한 뒤 새 text 작업을 입력해 주세요.");
+        return;
+      }
       const currentQuestion = context.getQuestion();
       let question: AssistantTextQuestion | undefined, label = text;
       const resolveSelection = () => {
@@ -347,18 +381,22 @@ export default function AssistantScreen() {
         if (!confirmed) return;
         question = confirmed;
         label = confirmation.approved ? "예" : "아니요";
+      } else if (acknowledgedId) {
+        // 인지 버튼은 다음 입력을 새 독립 작업으로 시작하겠다는 명시적 의사다. 과거 질문에 인지 ID를 붙이지 않는다.
+        question = undefined;
       } else if (typeof currentQuestion === "string") {
         reportError(currentQuestion === "unsupported" ? "현재 질문은 후보 선택 또는 확인이 필요해요."
           : "현재 질문을 확인하지 못했어요. 원래 요청의 결과 확인이 필요해요.");
         return;
       } else question = currentQuestion;
       const requestId = Crypto.randomUUID();
-      if (!action) {
+      if (!action && !acknowledgedId) {
         const latest = context.getQuestion();
         if (typeof latest === "string") return;
         question = latest;
       }
       const body = parseAssistantRequestCreate({ requestId,
+        ...(acknowledgedId ? { acknowledgedUncertainRequestId: acknowledgedId } : {}),
         ...(question ? { conversationId: question.conversationId } : {}),
         input: confirmation ? { type: "confirmation", questionId: question?.questionId, approved: confirmation.approved }
           : selection ? { type: "selection", questionId: question?.questionId, candidateId: selection.candidateId }
@@ -370,9 +408,10 @@ export default function AssistantScreen() {
       if (!isCurrent() || assistantHttpClient.getServerId() !== serverId) return;
       if (!canStart()) return;
       // 본문을 만든 사이 질문이 바뀌었으면 오래된 ID로 보내지 않고 입력을 남긴다.
-      if (selection ? JSON.stringify(selected?.question) !== JSON.stringify(resolveSelection()?.question)
+      if (acknowledgedId ? uncertain.acknowledgmentForNewText() !== acknowledgedId
+        : uncertain.isHeld() || (selection ? JSON.stringify(selected?.question) !== JSON.stringify(resolveSelection()?.question)
         : confirmation ? JSON.stringify(confirmed) !== JSON.stringify(resolveConfirmation())
-          : JSON.stringify(question) !== JSON.stringify(context.getQuestion())) return;
+          : JSON.stringify(question) !== JSON.stringify(context.getQuestion()))) return;
       const timedQuestion = selected?.question ?? confirmed;
       const inputController = action ? new AbortController() : undefined;
       if (inputController && timedQuestion) {
@@ -389,14 +428,21 @@ export default function AssistantScreen() {
       if (!action) { inputTextRef.current = ""; setInputText(""); }
       setStatus("processing");
       context.beginRequest(requestId, question, selection?.candidateId, confirmation?.approved);
+      if (acknowledgedId) uncertain.begin(requestId, acknowledgedId);
+      syncUncertainUi(uncertain);
       syncQuestionUi(context);
       // 저장 장벽·GET-first·polling·재전송은 기존 orchestration에만 맡긴다.
       const task = assistantOrchestrator.startRequest(body, { expectedServerId: serverId, signal: inputController?.signal, onUpdate: event => {
         if (!isCurrent() || assistantHttpClient.getServerId() !== serverId || event.reference.serverId !== serverId ||
           event.reference.requestId.toLowerCase() !== requestId.toLowerCase()) return;
         if (event.phase === "status") {
+          postAccepted = true;
           clearInputExpiry?.();
           context.observeResponse(event.response.data, "request", question);
+          const response = event.response, data = response.data;
+          uncertain.observe(data.status === "completed" ? { kind: "completed", reference: event.reference, response: { ...response, data } }
+            : { kind: "observed", reference: event.reference, response: { ...response, data } }, "request");
+          syncUncertainUi(uncertain);
           syncQuestionUi(context);
         }
       } });
@@ -406,6 +452,12 @@ export default function AssistantScreen() {
       clearInputExpiry?.();
       if (!isCurrent() || assistantHttpClient.getServerId() !== serverId) return;
       context.observeExecution(execution, "request", question);
+      if (acknowledgedId && assistantHttpClient.hasAcceptanceEvidence({ serverId, requestId })) {
+        postAccepted = true; uncertain.accepted(requestId);
+      }
+      uncertain.observe(execution, "request");
+      uncertain.finish(execution);
+      syncUncertainUi(uncertain);
       syncQuestionUi(context);
       if (execution.kind === "completed") {
         completed = true;
@@ -413,7 +465,7 @@ export default function AssistantScreen() {
         setMessages(current => upsertAssistantExecutionMessage(current, execution, "request"));
       } else {
         reportError("요청 결과를 확인하지 못했어요. 원래 요청의 확인이 필요해요.", execution);
-        const target = getAssistantErrorRecoveryTarget(execution);
+        const target = getAssistantErrorRecoveryTarget(execution, acknowledgedId);
         if (target) {
           const token = context.getRecoveryToken();
           const updateRecovery = (status: AssistantErrorRecoveryNotice["status"], result?: AssistantExecutionResult) => {
@@ -434,6 +486,9 @@ export default function AssistantScreen() {
             updateRecovery("busy", recovered);
           } else {
             setMessages(current => upsertAssistantExecutionMessage(current, recovered, "recovery"));
+            if (target.kind === "uncertain") uncertain.observe(recovered, "manual");
+            else uncertain.observe(recovered, "recovery");
+            syncUncertainUi(uncertain);
             const restored = target.kind === "question" && target.questionId && body.conversationId &&
               context.restoreActiveQuestion(recovered, { requestId: target.requestId, questionId: target.questionId,
                 conversationId: body.conversationId }, token, Date.now());
@@ -452,11 +507,51 @@ export default function AssistantScreen() {
       clearInputExpiry?.();
       if (mountedRef.current && operationVersionRef.current === version) {
         // 새로 작성했다가 지운 초안도 이전 요청의 실패 입력으로 덮어쓰지 않는다.
-        if (!action && !completed && inputRevisionRef.current === revision) restoreInput(text);
+        if (!action && !completed && (!acknowledgmentAttempt || !postAccepted) && inputRevisionRef.current === revision) restoreInput(text);
         serverTaskRef.current = null;
         finishOperation();
       }
     }
+  };
+
+  const checkUncertain = async (requestId: string, expectedServerId?: string, expectedGeneration?: number) => {
+    if (!mountedRef.current || sendLockedRef.current || isMockScheduleMode() || !expectedServerId ||
+      assistantHttpClient.getServerId() !== expectedServerId || scheduleDataModeStore.getState().generation !== expectedGeneration) return;
+    const recovery = assistantLifecycle.getSnapshot();
+    if (recovery.serverId !== expectedServerId || recovery.initialCheck === "pending") {
+      reportRecoveryIssue(recovery, expectedServerId); return;
+    }
+    const uncertain = getUncertainContext(expectedServerId), targetId = uncertain.getCheckTarget(requestId);
+    if (!targetId) return;
+    sendLockedRef.current = true; setIsBusy(true); setStatus("processing");
+    const version = ++operationVersionRef.current, token = uncertain.token(requestId);
+    const current = () => mountedRef.current && operationVersionRef.current === version && !isMockScheduleMode() &&
+      assistantHttpClient.getServerId() === expectedServerId && scheduleDataModeStore.getState().generation === expectedGeneration;
+    try {
+      const task = assistantOrchestrator.queryRequestOnce({ serverId: expectedServerId, requestId: targetId });
+      serverTaskRef.current = task;
+      const result = await task.completion;
+      if (!current() || token !== uncertain.token(requestId)) return;
+      if (result.kind === "needs-attention" && result.reason === "busy") {
+        reportError("기존 조회가 진행 중이에요. 중복 조회하지 않고 결과를 기다려 주세요."); return;
+      }
+      uncertain.observe(result, "manual");
+      const context = getTextQuestionContext(expectedServerId);
+      context.observeExecution(result, "recovery");
+      syncQuestionUi(context); syncUncertainUi(uncertain);
+      setMessages(messages => upsertAssistantExecutionMessage(messages, result, "recovery", { uncertainRecheck: true }));
+    } catch {
+      if (current()) reportError("원래 요청을 확인하지 못했어요. 기존 요청을 다시 보내지 않고 결과 확인이 필요해요.");
+    } finally {
+      if (mountedRef.current && operationVersionRef.current === version) { serverTaskRef.current = null; finishOperation(); }
+    }
+  };
+
+  const acknowledgeUncertain = (requestId: string, expectedServerId?: string, expectedGeneration?: number) => {
+    if (!mountedRef.current || sendLockedRef.current || isMockScheduleMode() || !expectedServerId ||
+      assistantHttpClient.getServerId() !== expectedServerId || scheduleDataModeStore.getState().generation !== expectedGeneration) return;
+    const context = getUncertainContext(expectedServerId);
+    if (context.arm(requestId)) syncUncertainUi(context);
   };
 
   const handleSend = () => {
@@ -560,6 +655,8 @@ export default function AssistantScreen() {
     questionUi.generation === scheduleDataModeStore.getState().generation ? questionUi : null;
   const activeCandidate = questionView?.active;
   const activeConfirmation = questionView?.confirmation;
+  const uncertainView = !mockMode && uncertainUi?.serverId === currentServerId &&
+    uncertainUi.generation === scheduleDataModeStore.getState().generation ? uncertainUi : null;
   const timedQuestion = activeCandidate ?? activeConfirmation;
   const timedRequestId = timedQuestion?.requestId, timedExpiresAt = timedQuestion?.expiresAt;
   useEffect(() => {
@@ -592,13 +689,16 @@ export default function AssistantScreen() {
           messages={visibleMessages.length === messages.length ? messages : visibleMessages}
           isProcessing={status === "processing" || recoveryPending || recoveryProcessing}
           interactionsDisabled={isBusy || status === "processing"}
-          activeApiCandidate={!recoveryPending && !isBusy ? activeCandidate : undefined}
+          activeApiCandidate={!recoveryPending && !isBusy && !uncertainView?.held ? activeCandidate : undefined}
           apiCandidateSelections={questionView?.selections}
           onApiCandidateSelection={(messageId, candidateId) => { if (!isMockScheduleMode()) void sendServerInput({ type: "selection", messageId, candidateId }); }}
-          activeApiConfirmation={!recoveryPending && !isBusy ? activeConfirmation : undefined}
+          activeApiConfirmation={!recoveryPending && !isBusy && !uncertainView?.held ? activeConfirmation : undefined}
           apiConfirmations={questionView?.confirmations}
           expiredApiConfirmations={questionView?.expiredConfirmations}
           onApiConfirmation={(messageId, approved) => { if (!isMockScheduleMode()) void sendServerInput({ type: "confirmation", messageId, approved }); }}
+          uncertainViews={uncertainView?.views}
+          onUncertainCheck={requestId => { void checkUncertain(requestId, uncertainView?.serverId, uncertainView?.generation); }}
+          onUncertainAcknowledge={requestId => acknowledgeUncertain(requestId, uncertainView?.serverId, uncertainView?.generation)}
           onDeleteConfirmation={(messageId, confirmed) =>
             handleInteraction(messageId, { type: "confirmation", confirmed })}
           onCandidateSelection={(messageId, scheduleId) =>

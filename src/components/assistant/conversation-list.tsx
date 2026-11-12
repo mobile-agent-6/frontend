@@ -12,7 +12,8 @@ import type { AssistantInteraction } from "@/types/assistant";
 import type { Schedule } from "@/types/schedule";
 import { assistantResultToDisplay } from "@/utils/assistant-mapper";
 import type { AssistantCandidateQuestion, AssistantConfirmationQuestion } from "@/utils/assistant-text-question";
-import { assistantErrorRecoveryNotice, type AssistantErrorRecoveryNotice } from "@/utils/assistant-errors";
+import { assistantErrorRecoveryNotice, assistantHttpErrorNotice, getAssistantExecutionError, type AssistantErrorRecoveryNotice } from "@/utils/assistant-errors";
+import type { AssistantUncertainView } from "@/utils/assistant-uncertain";
 
 // 화면 메시지와 공개 API 결과를 구분하며 API 원형은 현재 실행 세션에만 보관한다.
 export type ConversationMessage = {
@@ -29,6 +30,7 @@ export type ConversationMessage = {
       apiExecution?: AssistantExecutionResult;
       apiSource?: "request" | "recovery";
       apiErrorRecovery?: AssistantErrorRecoveryNotice;
+      apiUncertain?: Extract<AssistantExecutionResult, { kind: "completed" }>;
       recoveryIssue?: Pick<AssistantLifecycleSnapshot, "serverId" | "phase" | "initialCheck" | "initialization" | "issue">;
     }
 );
@@ -54,6 +56,9 @@ type ConversationListProps = {
   apiConfirmations?: Readonly<Record<string, boolean>>;
   expiredApiConfirmations?: readonly string[];
   onApiConfirmation?: (messageId: string, approved: boolean) => void;
+  uncertainViews?: readonly AssistantUncertainView[];
+  onUncertainCheck?: (requestId: string) => void;
+  onUncertainAcknowledge?: (requestId: string) => void;
 };
 
 export function ConversationList({
@@ -70,6 +75,9 @@ export function ConversationList({
   apiConfirmations,
   expiredApiConfirmations,
   onApiConfirmation,
+  uncertainViews,
+  onUncertainCheck,
+  onUncertainAcknowledge,
 }: ConversationListProps) {
   const listRef = useRef<FlatList<ConversationMessage>>(null);
   const messageCount = messages.length;
@@ -227,6 +235,12 @@ export function ConversationList({
           <AssistantMessage
             text={item.text}
             apiRecoveryText={item.apiErrorRecovery ? assistantErrorRecoveryNotice(item.apiErrorRecovery) : undefined}
+            uncertainView={item.apiExecution ? uncertainViews?.find(view => view.requestId.toLowerCase() === item.apiExecution?.reference.requestId.toLowerCase()) : undefined}
+            uncertainErrorText={item.apiUncertain && item.apiExecution && getAssistantExecutionError(item.apiExecution)
+              ? assistantHttpErrorNotice(getAssistantExecutionError(item.apiExecution)!) : undefined}
+            uncertainActionsDisabled={interactionsDisabled}
+            onUncertainCheck={item.apiExecution && onUncertainCheck ? () => onUncertainCheck(item.apiExecution!.reference.requestId) : undefined}
+            onUncertainAcknowledge={item.apiExecution && onUncertainAcknowledge ? () => onUncertainAcknowledge(item.apiExecution!.reference.requestId) : undefined}
             apiResult={item.apiExecution?.kind === "completed"
               ? assistantResultToDisplay(item.apiExecution.response.data.result) : undefined}
             schedules={item.apiExecution ? undefined : item.schedules}

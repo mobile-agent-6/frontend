@@ -293,7 +293,7 @@ for (const kind of Object.keys(results)) test(`실제 목록→메시지→카�
       assert.ok(textOf(view.rows).includes(kind === "failure" ? "처리 실패" : "결과 미확인")); assert.equal(Object.hasOwn(props.apiResult, "schedulesChanged"), false);
     }
     for (const button of nodes(view.rows, "Pressable")) {
-      const candidate = kind === "candidate_selection", interactive = candidate || kind === "confirmation";
+      const candidate = kind === "candidate_selection", interactive = candidate || kind === "confirmation" || kind === "uncertain";
       assert.equal(button.props.disabled, !interactive); assert.equal(button.props.accessibilityState.disabled, !interactive);
       if (interactive) { if (candidate) assert.equal(button.props.accessibilityState.selected, false); assert.equal(typeof button.props.onPress, "function"); }
       else { assert.equal(button.props.onPress, undefined); }
@@ -443,7 +443,10 @@ for (const kind of Object.keys(results)) test(`초기 복구 ${kind}: 실제 상
     await h.settle(); assert.equal(h.messages().length, 1); assert.equal(h.messages()[0].role, "assistant");
     assert.deepEqual(h.messages()[0].apiExecution, execution); const view = h.renderConversation();
     assert.equal(nodes(view.rows, "Text")[0].props.children, results[kind].text); assert.equal(h.state.calls.length, 0); assert.equal(h.state.uuidCalls, 0); assert.equal(h.state.cleanup, 0);
-    for (const button of nodes(view.rows, "Pressable")) { assert.equal(button.props.disabled, true); assert.equal(button.props.onPress, undefined); }
+    for (const button of nodes(view.rows, "Pressable")) {
+      assert.equal(button.props.disabled, kind !== "uncertain");
+      if (kind === "uncertain") assert.equal(typeof button.props.onPress, "function"); else assert.equal(button.props.onPress, undefined);
+    }
     assert.equal(h.state.initializations, 0); assert.equal(h.state.recoveryListeners.size, 1);
   } finally { h.close(); }
 });
@@ -605,8 +608,8 @@ test("uncertain 복구 수신은 위험 인지가 아니며 새 text에도 ackno
   h.state.handle = async () => ({ status: 409, headers: new Headers({ "Content-Type": "application/problem+json", "X-Request-ID": id(900) }), text: async () => JSON.stringify({ type: "https://example.invalid/problem", title: "보류", status: 409, detail: "문구 파싱 금지", instance: "/api/v1/assistant/requests", requestId: id(900), code: "UNRESOLVED_UNCERTAIN", blockingRequestId: id(600) }) });
   try {
     assert.equal(h.messages()[0].apiExecution.response.data.result.kind, "uncertain"); assert.equal(h.state.calls.length, 0); h.send("새 독립 작업"); await h.settle();
-    assert.equal(h.state.calls.length, 1); const body = JSON.parse(h.state.calls[0].init.body); assert.equal(Object.hasOwn(body, "acknowledgedUncertainRequestId"), false); assert.equal(Object.hasOwn(body, "conversationId"), false);
-    assert.equal(h.messages().at(-1).apiExecution.recoveryResult.postResult.error.problem.code, "UNRESOLVED_UNCERTAIN"); assert.equal(h.find("MessageInput").value, "새 독립 작업"); assert.equal(h.state.cleanup, 0);
+    assert.equal(h.state.calls.length, 0); assert.equal(h.state.starts.length, 0); assert.equal(h.state.uuidCalls, 0);
+    assert.equal(h.messages()[0].apiExecution.response.data.result.kind, "uncertain"); assert.equal(h.find("MessageInput").value, "새 독립 작업"); assert.equal(h.state.cleanup, 0);
   } finally { h.close(); }
 });
 
@@ -668,8 +671,9 @@ for (const kind of ["outcome", "failure", "uncertain"]) test(`후속 완료 ${ki
   try {
     h.send("회의 등록"); await h.settle(); h.state.handle = responseWith({ ...results[kind], text: "몇 시로 등록할까요?" });
     h.send("오후 3시"); await h.settle(); h.send("다음 작업"); await h.settle();
-    const body = postedBodies(h).at(-1); assert.equal(Object.hasOwn(body, "conversationId"), false); assert.equal(Object.hasOwn(body.input, "questionId"), false);
-    assert.equal(Object.hasOwn(body, "acknowledgedUncertainRequestId"), false); assert.equal(h.messages().at(-1).apiExecution.response.data.result.kind, kind);
+    if (kind === "uncertain") { assert.equal(postedBodies(h).length, 2); assert.equal(lastPostExecution(h).response.data.result.kind, kind); }
+    else { const body = postedBodies(h).at(-1); assert.equal(Object.hasOwn(body, "conversationId"), false); assert.equal(Object.hasOwn(body.input, "questionId"), false);
+      assert.equal(Object.hasOwn(body, "acknowledgedUncertainRequestId"), false); assert.equal(h.messages().at(-1).apiExecution.response.data.result.kind, kind); }
   } finally { h.close(); }
 });
 
@@ -1506,5 +1510,282 @@ test("7-A 활성 질문 ID가 일치해도 같은 질문의 이전 만료 시각
     confirmationButtons(h, old.id)[1].props.onPress(); h.render(); await h.settle();
     assert.equal(postMessage(h).apiErrorRecovery.status, "mismatch"); assert.ok(nodes(h.renderConversation().rows, "Pressable").every(button => button.props.disabled));
     assert.equal(postedBodies(h).length, 2); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
+
+// 인지 의사와 서버 접수 확인은 별도로 검증한다. 실제 저장소·서버는 사용하지 않는다.
+async function liveUncertain(h) { h.state.handle = responseWith(results.uncertain); h.send("일정 변경"); await h.settle(); return h.messages().at(-1).apiExecution.reference.requestId; }
+const riskView = (h, id) => h.find("ConversationList").uncertainViews?.find(value => value.requestId.toLowerCase() === id.toLowerCase());
+function riskButtons(h, id) {
+  const index = h.messages().findIndex(message => message.apiExecution?.reference.requestId.toLowerCase() === id.toLowerCase());
+  const buttons = nodes(h.renderConversation().rows[index], "Pressable");
+  return { check: buttons.find(button => textOf(button).includes("결과 확인")), acknowledge: buttons.find(button => textOf(button).includes("위험을 이해")) };
+}
+function armRisk(h, id) { riskButtons(h, id).acknowledge.props.onPress(); h.render(); }
+function checkRisk(h, id) { riskButtons(h, id).check.props.onPress(); h.render(); }
+const riskDone = (id, kind = "uncertain") => done(id, kind);
+
+test("7-B uncertain 원문·check_status·write 반영 위험 안내와 인지 전 새 작업 보류", async () => {
+  const h = harness(), before = h.mock.getState().schedules;
+  try {
+    const id = await liveUncertain(h), text = textOf(h.renderConversation().rows);
+    assert.equal(h.messages().at(-1).text, results.uncertain.text); assert.equal(h.messages().at(-1).apiExecution.response.data.result.nextAction, "check_status");
+    assert.ok(text.includes("반영됐을 수")); assert.ok(text.includes("중복될 위험")); assert.ok(text.includes("취소·성공·실패 판정이 아니")); assert.ok(text.includes("일정 목록"));
+    assert.equal(h.messages().at(-1).apiExecution.response.data.result.schedulesChanged, undefined);
+    h.send("새 작업"); await h.settle(); assert.equal(postedBodies(h).length, 1); assert.equal(h.state.uuidCalls, 1); assert.equal(riskView(h, id).armed, false);
+    assert.equal(h.find("MessageInput").value, "새 작업"); assert.strictEqual(h.mock.getState().schedules, before); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
+
+test("7-B 인지 버튼·입력·탭 재렌더만으로 POST 없음, 명시적 새 text에만 별도 UUID와 ack ID", async () => {
+  const h = harness(); try {
+    const id = await liveUncertain(h), button = riskButtons(h, id).acknowledge.props.onPress, count = h.state.calls.length;
+    h.edit("새 독립 작업"); h.render(); assert.equal(riskView(h, id).armed, false); button(); button(); h.render();
+    assert.equal(h.state.calls.length, count); assert.equal(h.state.uuidCalls, 1); assert.equal(riskView(h, id).armed, true); assert.equal(riskView(h, id).acknowledged, false);
+    h.state.handle = responseWith(results.outcome); h.find("MessageInput").onSend(); await h.settle(); const body = postedBodies(h).at(-1);
+    assert.notEqual(body.requestId, id);
+    assert.deepEqual(body, { requestId: body.requestId, acknowledgedUncertainRequestId: id, input: { type: "text", text: "새 독립 작업" } });
+    assert.equal(riskView(h, id).acknowledged, true); assert.equal(h.state.uuidCalls, 2); assert.equal(h.state.cleanup, 0);
+    const saved = [...h.data.values()].join(""); assert.equal(saved.includes("acknowledgedUncertainRequestId"), false); assert.equal(saved.includes("새 독립 작업"), false);
+  } finally { h.close(); }
+});
+
+test("7-B 수동 GET은 120초 이후에도 원래 ID만 사용·연타 GET 1회·여전히 uncertain 유지", async () => {
+  const h = harness(), gate = deferred(); try {
+    const id = await liveUncertain(h); await h.advance(120000); h.state.handle = () => gate.promise;
+    const buttons = riskButtons(h, id), check = buttons.check.props.onPress; check(); check(); buttons.acknowledge.props.onPress(); h.render(); await h.settle();
+    assert.equal(riskView(h, id).armed, false);
+    assert.equal(h.state.calls.at(-1).init.method, "GET"); assert.ok(h.state.calls.at(-1).url.endsWith(id)); assert.equal(h.state.calls.length, 3);
+    gate.resolve(json(riskDone(id))); await h.settle(); assert.equal(riskView(h, id).state, "uncertain"); assert.equal(h.messages().length, 2);
+    assert.equal(postedBodies(h).length, 1); assert.equal(h.state.uuidCalls, 1); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
+
+for (const kind of ["outcome", "failure"]) test(`7-B uncertain → ${kind}: 같은 메시지 갱신·위험 인지 대기 무효화·과거 결과로 되돌림 없음`, async () => {
+  const h = harness(); try {
+    const id = await liveUncertain(h), messageId = h.messages().at(-1).id, oldAcknowledge = riskButtons(h, id).acknowledge.props.onPress; armRisk(h, id);
+    h.state.handle = () => json(riskDone(id, kind)); checkRisk(h, id); await h.settle();
+    assert.equal(h.messages().at(-1).id, messageId); assert.equal(h.messages().at(-1).apiExecution.response.data.result.kind, kind); assert.equal(riskView(h, id), undefined);
+    h.publishSnapshot(snapshotOf([recovered("uncertain", id)])); assert.equal(h.messages().at(-1).apiExecution.response.data.result.kind, kind);
+    oldAcknowledge?.(); h.state.handle = responseWith(results.outcome); h.send("명시적 다음 작업"); await h.settle();
+    assert.equal(Object.hasOwn(postedBodies(h).at(-1), "acknowledgedUncertainRequestId"), false); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
+
+for (const value of ["accepted", "processing"]) test(`7-B 수동 GET ${value}: 진행 중으로 표시·인지/새 POST/자동 polling 없음`, async () => {
+  const h = harness(); try {
+    const id = await liveUncertain(h); h.state.handle = () => json(status(id, value)); checkRisk(h, id); await h.settle();
+    assert.equal(h.messages().at(-1).apiExecution.kind, "observed"); assert.equal(h.messages().at(-1).apiExecution.response.data.status, value);
+    assert.equal(riskView(h, id).state, "pending"); assert.equal(riskButtons(h, id).acknowledge.props.disabled, true);
+    const count = h.state.calls.length; await h.advance(4000); h.send("새 작업"); await h.settle(); assert.equal(h.state.calls.length, count); assert.equal(postedBodies(h).length, 1);
+    h.publishSnapshot(snapshotOf([recovered("uncertain", id)])); assert.equal(h.messages().find(message => message.apiExecution?.reference.requestId === id).apiExecution.kind, "observed");
+  } finally { h.close(); }
+});
+
+for (const failure of ["404", "503", "timeout", "network", "storage", "410"]) test(`7-B 수동 GET ${failure}: 원문·구조화 오류·metadata 보존, 실패/미실행으로 단정하지 않음`, async () => {
+  const h = harness(); try {
+    const id = await liveUncertain(h), before = [...h.data.values()].join("");
+    if (failure === "storage") h.state.failRead = true;
+    h.state.handle = () => { if (failure === "network") throw Error("연결 실패"); if (failure === "timeout") return deferred().promise;
+      return error7a(failure === "410" ? "REQUEST_EXPIRED" : failure === "404" ? "ASSISTANT_REQUEST_NOT_FOUND" : "ASSISTANT_UNAVAILABLE", Number(failure) || 503); };
+    checkRisk(h, id); await h.settle(); if (failure === "timeout") await h.advance(5000);
+    const message = h.messages().at(-1); assert.equal(message.text, results.uncertain.text); assert.equal(message.apiExecution.kind, "needs-attention");
+    assert.equal(riskView(h, id).state, failure === "410" ? "expired" : "unknown"); assert.equal(riskButtons(h, id).acknowledge.props.disabled, true);
+    if (failure === "404") assert.ok(textOf(h.renderConversation().rows).includes("미실행을 뜻하지"));
+    if (failure === "410") assert.ok(textOf(h.renderConversation().rows).includes("이전 성공·실패는 알 수 없어요"));
+    assert.equal([...h.data.values()].join(""), before); assert.equal(h.state.cleanup, 0); assert.equal(postedBodies(h).length, 1);
+  } finally { h.state.failRead = false; h.close(); }
+});
+
+test("7-B UNRESOLVED_UNCERTAIN은 서버 blocking ID GET 후 실제 uncertain만 인지 대상으로 사용", async () => {
+  const h = harness(); h.state.handle = (url, init) => init.method === "POST" ? error7a("UNRESOLVED_UNCERTAIN", 409, { blockingRequestId: id(700) }) : json(done(id(700), "uncertain"));
+  try { h.send("새 작업"); await h.settle(); assert.equal(lastPostExecution(h).recoveryResult.postResult.error.problem.blockingRequestId, id(700));
+    assert.ok(h.state.calls.at(-1).url.endsWith(id(700))); assert.equal(riskView(h, id(700)).canAcknowledge, true);
+    assert.equal(Object.hasOwn(postedBodies(h)[0], "acknowledgedUncertainRequestId"), false); assert.equal(postedBodies(h).length, 1);
+  } finally { h.close(); }
+});
+
+for (const failure of ["missing", "404", "invalid"]) test(`7-B blocking ID ${failure}: 임의 인지 대상·새 conversation 우회·자동 POST 없음`, async () => {
+  const h = harness(); h.state.handle = (url, init) => init.method === "POST" ? error7a("UNRESOLVED_UNCERTAIN", 409, failure === "missing" ? {} : { blockingRequestId: id(700) })
+    : failure === "invalid" ? json({ ...done(id(700)), status: "잘못된 상태" }) : error7a("ASSISTANT_REQUEST_NOT_FOUND", 404);
+  try { h.send("첫 시도"); await h.settle(); assert.ok(!h.find("ConversationList").uncertainViews.some(view => view.canAcknowledge));
+    const count = h.state.calls.length; h.send("다른 새 대화"); await h.settle(); assert.equal(h.state.calls.length, count); assert.equal(postedBodies(h).length, 1);
+  } finally { h.close(); }
+});
+
+test("7-B 복수 uncertain: 서버 blocking ID 우선·거절된 인지 미반영·한 번의 인지로 모두 해제하지 않음", async () => {
+  const h = harness(); try {
+    const first = await liveUncertain(h), second = id(701); h.publishSnapshot(snapshotOf([recovered("uncertain", second)])); armRisk(h, first);
+    h.state.handle = (url, init) => init.method === "POST" ? error7a("UNRESOLVED_UNCERTAIN", 409, { blockingRequestId: second }) : json(done(second, "uncertain"));
+    h.send("새 작업 시도"); await h.settle(); assert.equal(riskView(h, first).acknowledged, false); assert.equal(riskView(h, first).canAcknowledge, false); assert.equal(riskView(h, second).canAcknowledge, true);
+    armRisk(h, second); h.state.handle = responseWith(results.outcome); h.send("서버가 지정한 위험 인지 후 새 작업"); await h.settle();
+    assert.equal(postedBodies(h).at(-1).acknowledgedUncertainRequestId, second); assert.equal(riskView(h, second).acknowledged, true); assert.equal(riskView(h, first).acknowledged, false);
+    const count = postedBodies(h).length; h.send("남은 위험을 건너뛴 작업"); await h.settle(); assert.equal(postedBodies(h).length, count);
+  } finally { h.close(); }
+});
+
+for (const kind of ["candidate_selection", "confirmation", "need_more_info"]) test(`7-B 활성 ${kind}에는 ack를 붙이지 않고 명시적 인지 다음 새 독립 text만 허용`, async () => {
+  const h = harness(); try {
+    if (kind === "candidate_selection") await liveCandidates(h); else if (kind === "confirmation") await liveConfirmation(h);
+    else { h.state.handle = responseWith(results.need_more_info); h.send("질문"); await h.settle(); }
+    const old = h.messages().at(-1), idRisk = id(700); h.publishSnapshot(snapshotOf([recovered("uncertain", idRisk)])); armRisk(h, idRisk);
+    h.find("ConversationList").onApiCandidateSelection(old.id, "opaque/1"); h.find("ConversationList").onApiConfirmation(old.id, true); await h.settle();
+    assert.equal(postedBodies(h).length, 1); h.state.handle = responseWith(results.outcome); h.send("위험을 인지한 뒤 직접 작성한 새 작업"); await h.settle();
+    const body = postedBodies(h).at(-1); assert.equal(body.input.type, "text"); assert.equal(body.acknowledgedUncertainRequestId, idRisk);
+    assert.equal(Object.hasOwn(body, "conversationId"), false); assert.equal(Object.hasOwn(body.input, "questionId"), false);
+  } finally { h.close(); }
+});
+
+for (const reason of ["storage-write", "storage-read", "422", "503"]) test(`7-B ack 새 text 접수 전 ${reason} 실패: 인지 미완료·원문/초안 보존·명시적 재시도만 가능`, async () => {
+  const h = harness(); try {
+    const id = await liveUncertain(h); armRisk(h, id);
+    if (reason === "storage-write") h.state.failStorage = true; else if (reason === "storage-read") h.state.failRead = true;
+    else h.state.handle = () => error7a(reason === "422" ? "VALIDATION_ERROR" : "ASSISTANT_UNAVAILABLE", Number(reason));
+    h.send("실제 새 입력"); await h.settle(); assert.equal(riskView(h, id).acknowledged, false); assert.equal(riskView(h, id).armed, true);
+    assert.equal(h.find("MessageInput").value, "실제 새 입력"); assert.equal(postedBodies(h).length, reason.startsWith("storage") ? 1 : 2);
+    h.state.failStorage = false; h.state.failRead = false; h.state.handle = responseWith(results.outcome); h.find("MessageInput").onSend(); await h.settle();
+    assert.equal(postedBodies(h).at(-1).acknowledgedUncertainRequestId, id); assert.equal(riskView(h, id).acknowledged, true);
+  } finally { h.state.failRead = false; h.close(); }
+});
+
+test("7-B ack 접수 2xx 후 metadata/GET 실패: 인지 반영·새 작업 결과 GET만 가능·중복 POST 0회", async () => {
+  const h = harness(); try {
+    const id = await liveUncertain(h); armRisk(h, id);
+    h.state.handle = (url, init) => { if (init.method === "POST") { h.state.failStorage = true; return json(status(JSON.parse(init.body).requestId), 202); }
+      return error7a("ASSISTANT_UNAVAILABLE", 503); };
+    h.send("새 작업"); await h.settle(); h.state.failStorage = false; const nextId = postedBodies(h).at(-1).requestId;
+    assert.equal(riskView(h, id).acknowledged, true); assert.equal(riskView(h, id).pendingRequestId, nextId); assert.equal(h.find("MessageInput").value, "");
+    h.send("또 보내기"); await h.settle(); assert.equal(postedBodies(h).length, 2);
+    h.state.handle = url => json(done(url.split("/").pop())); checkRisk(h, id); await h.settle(); assert.ok(h.state.calls.at(-1).url.endsWith(nextId));
+    assert.equal(riskView(h, id).pendingRequestId, undefined); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
+
+for (const failedGet of ["503", "storage"]) test(`7-B ack POST 응답 유실·GET ${failedGet} 실패: 새 UUID 재전송 금지·원래 새 요청 ID GET으로 접수 확인`, async () => {
+  const h = harness(); try {
+    const id = await liveUncertain(h); armRisk(h, id);
+    h.state.handle = (url, init) => { if (init.method === "POST") { if (failedGet === "storage") h.state.failRead = true; throw Error("POST 응답 유실"); }
+      return error7a("ASSISTANT_UNAVAILABLE", 503); };
+    h.send("새 작업"); await h.settle(); const nextId = postedBodies(h).at(-1).requestId;
+    assert.equal(riskView(h, id).acknowledged, false); assert.equal(riskView(h, id).pendingRequestId, nextId);
+    const count = h.state.calls.length; h.find("MessageInput").onSend(); await h.settle(); assert.equal(h.state.calls.length, count); assert.equal(h.state.uuidCalls, 2);
+    h.state.failRead = false; h.state.handle = url => json(status(url.split("/").pop(), "processing")); checkRisk(h, id); await h.settle();
+    assert.ok(h.state.calls.at(-1).url.endsWith(nextId)); assert.equal(riskView(h, id).acknowledged, true); assert.equal(riskView(h, id).pendingRequestId, nextId);
+    h.state.handle = url => json(done(url.split("/").pop())); checkRisk(h, id); await h.settle(); assert.equal(riskView(h, id).pendingRequestId, undefined);
+    assert.equal(postedBodies(h).length, 2); assert.equal(h.state.cleanup, 0);
+  } finally { h.state.failRead = false; h.close(); }
+});
+
+test("7-B ack POST 응답 유실 후 GET-first 제한 재전송은 동일 ID/body·인지 ID를 유지", async () => {
+  const h = harness(); let posts = 0, gets = 0; try {
+    const id = await liveUncertain(h); armRisk(h, id);
+    h.state.handle = (url, init) => { if (init.method === "POST") { if (++posts === 1) throw Error("유실"); return json(status(JSON.parse(init.body).requestId), 202); }
+      return ++gets === 1 ? error7a("ASSISTANT_REQUEST_NOT_FOUND", 404) : json(done(url.split("/").pop())); };
+    h.send("새 작업 원문"); await h.settle(); const bodies = postedBodies(h);
+    assert.equal(bodies.length, 3); assert.deepEqual(bodies[1], bodies[2]); assert.equal(bodies[1].acknowledgedUncertainRequestId, id);
+    assert.equal(h.state.uuidCalls, 2); assert.equal(riskView(h, id).acknowledged, true); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
+
+for (const kind of ["outcome", "uncertain"]) test(`7-B ACKNOWLEDGEMENT_NOT_APPLICABLE 후 원래 ID GET ${kind}: 인지 완료로 처리하지 않음`, async () => {
+  const h = harness(); try {
+    const id = await liveUncertain(h); armRisk(h, id);
+    h.state.handle = (url, init) => init.method === "POST" ? error7a("ACKNOWLEDGEMENT_NOT_APPLICABLE", 409) : json(done(url.split("/").pop(), kind));
+    h.send("새 작업"); await h.settle(); assert.ok(h.state.calls.at(-1).url.endsWith(id)); assert.equal(postedBodies(h).length, 2);
+    if (kind === "outcome") { assert.equal(riskView(h, id), undefined); assert.equal(h.messages().find(message => message.apiExecution?.reference.requestId === id).apiExecution.response.data.result.kind, "outcome"); }
+    else { assert.equal(riskView(h, id).acknowledged, false); assert.equal(riskView(h, id).canAcknowledge, false); }
+    assert.equal(lastPostExecution(h).recoveryResult.postResult.error.problem.code, "ACKNOWLEDGEMENT_NOT_APPLICABLE"); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
+
+for (const change of ["mode", "server", "restart"]) test(`7-B ${change}: 이전 서버·세션의 인지 의사와 오래된 callback을 재사용하지 않음`, async () => {
+  const h = harness(); let restarted; try {
+    const id = await liveUncertain(h), oldButton = riskButtons(h, id).acknowledge.props.onPress; armRisk(h, id);
+    if (change === "restart") {
+      restarted = harness({ data: h.data, initialSnapshot: snapshotOf([recovered("uncertain", id)]) }); restarted.send("새 작업"); await restarted.settle();
+      assert.equal(restarted.state.calls.length, 0); assert.equal(riskView(restarted, id).armed, false);
+    } else {
+      if (change === "mode") { h.switchMode("mock"); h.switchMode("server"); h.publishSnapshot(snapshotOf([recovered("uncertain", id)])); }
+      else { const other = "development:https://other.example.invalid"; h.state.config = h.source("src/services/api/config.ts").parseDevelopmentServerConfig("https://other.example.invalid");
+        h.publishSnapshot(snapshotOf([recovered("uncertain", id, other)], { serverId: other })); }
+      oldButton(); h.render(); assert.equal(riskView(h, id).armed, false); const count = h.state.calls.length; h.send("새 작업"); await h.settle(); assert.equal(h.state.calls.length, count);
+    }
+  } finally { restarted?.close(); h.close(); }
+});
+
+test("7-B 수동 GET보다 먼저 lifecycle outcome이 오면 늦은 uncertain·인지 callback은 무효", async () => {
+  const h = harness(), gate = deferred(); try {
+    const id = await liveUncertain(h), oldAcknowledge = riskButtons(h, id).acknowledge.props.onPress;
+    h.state.handle = () => gate.promise; checkRisk(h, id); await h.settle(); h.publishSnapshot(snapshotOf([recovered("outcome", id)]));
+    gate.resolve(json(done(id, "uncertain"))); await h.settle(); oldAcknowledge(); h.render();
+    assert.equal(h.messages().find(message => message.apiExecution?.reference.requestId === id).apiExecution.response.data.result.kind, "outcome"); assert.equal(riskView(h, id), undefined);
+    assert.equal(postedBodies(h).length, 1); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
+
+test("7-B 같은 요청의 기존 GET 잠금과 수동 확인 경합: 중복 GET·POST 없음", async () => {
+  const h = harness(), gate = deferred(); try {
+    const id = await liveUncertain(h); h.state.handle = () => gate.promise;
+    const existing = h.delegate.queryRequestOnce(recoveryRef(id)); await h.settle(); checkRisk(h, id); await h.settle();
+    assert.equal(h.state.calls.filter(call => call.init.method === "GET").length, 2); assert.equal(postedBodies(h).length, 1);
+    gate.resolve(json(done(id, "uncertain"))); await existing.completion; await h.settle(); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
+
+test("7-B 새 초안은 오래된 ack 전송 실패로 덮이지 않으며 Schedule/Mock write 0회", async () => {
+  const h = harness(), gate = deferred(), before = h.mock.getState().schedules; try {
+    const id = await liveUncertain(h); armRisk(h, id); h.state.handle = () => gate.promise; h.send("전송한 새 입력"); await h.settle();
+    h.edit("나중에 작성한 새 초안"); gate.resolve(error7a("ASSISTANT_UNAVAILABLE", 503)); await h.settle();
+    assert.equal(h.find("MessageInput").value, "나중에 작성한 새 초안"); assert.equal(riskView(h, id).acknowledged, false);
+    assert.strictEqual(h.mock.getState().schedules, before); assert.equal(h.state.mockRuns, 0); assert.ok(h.state.calls.every(call => call.url.includes("/assistant/requests")));
+  } finally { h.close(); }
+});
+
+test("7-B ack POST timeout·GET 실패는 인지 미완료이며 새 ID 재전송 없이 접수 확인만 허용", async () => {
+  const h = harness(); try {
+    const id = await liveUncertain(h); armRisk(h, id);
+    h.state.handle = (url, init) => init.method === "POST" ? deferred().promise : error7a("ASSISTANT_UNAVAILABLE", 503);
+    h.send("새 작업"); await h.settle(); await h.advance(5000);
+    assert.equal(riskView(h, id).acknowledged, false); assert.equal(riskView(h, id).pendingRequestId, postedBodies(h).at(-1).requestId);
+    const count = h.state.calls.length; h.find("MessageInput").onSend(); await h.settle(); assert.equal(h.state.calls.length, count); assert.equal(h.state.uuidCalls, 2);
+  } finally { h.close(); }
+});
+
+test("7-B ACK_NOT_APPLICABLE에 새 blocking ID가 있으면 그 ID를 확인하고 원래 인지 의사는 무효화", async () => {
+  const h = harness(); try {
+    const original = await liveUncertain(h), next = id(702); armRisk(h, original);
+    h.state.handle = (url, init) => init.method === "POST" ? error7a("ACKNOWLEDGEMENT_NOT_APPLICABLE", 409, { blockingRequestId: next }) : json(done(next, "uncertain"));
+    h.send("새 작업"); await h.settle(); assert.ok(h.state.calls.at(-1).url.endsWith(next)); assert.equal(riskView(h, original).acknowledged, false);
+    assert.equal(riskView(h, original).canAcknowledge, false); assert.equal(riskView(h, next).canAcknowledge, true); assert.equal(postedBodies(h).length, 2);
+  } finally { h.close(); }
+});
+
+for (const change of ["server", "unmount"]) test(`7-B 원래 ID 수동 GET 도중 ${change}: 늦은 결과·인지 상태 갱신 무효화`, async () => {
+  const h = harness(), gate = deferred(); try {
+    const id = await liveUncertain(h); h.state.handle = () => gate.promise; checkRisk(h, id); await h.settle(); const count = h.state.calls.length;
+    if (change === "unmount") h.close();
+    else { const other = "development:https://other.example.invalid"; h.state.config = h.source("src/services/api/config.ts").parseDevelopmentServerConfig("https://other.example.invalid");
+      h.publishSnapshot(snapshotOf([], { serverId: other })); }
+    gate.resolve(json(done(id, "outcome"))); await h.settle(); assert.equal(h.state.calls.length, count); assert.equal(h.state.lateUpdates, 0); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
+
+test("7-B 인지 반영 뒤 새 질문의 후속 text에는 ack ID를 재사용하지 않음", async () => {
+  const h = harness(); try {
+    const riskId = await liveUncertain(h); armRisk(h, riskId); h.state.handle = responseWith({ ...results.need_more_info, questionId: id(350) });
+    h.send("새로운 일정 등록"); await h.settle(); assert.equal(riskView(h, riskId).acknowledged, true);
+    h.state.handle = responseWith(results.outcome); h.send("오후 3시"); await h.settle(); const body = postedBodies(h).at(-1);
+    assert.equal(Object.hasOwn(body, "acknowledgedUncertainRequestId"), false); assert.equal(body.conversationId, id(100)); assert.equal(body.input.questionId, id(350));
+  } finally { h.close(); }
+});
+
+test("7-B 새 작업 확정 뒤 늦은 uncertain 관측은 메시지뿐 아니라 새 작업 보류 상태도 되돌리지 않음", async () => {
+  const h = harness(); try {
+    const original = await liveUncertain(h); armRisk(h, original); h.state.handle = responseWith(results.outcome);
+    h.send("새 작업"); await h.settle(); const latest = postedBodies(h).at(-1).requestId;
+    h.publishSnapshot(snapshotOf([recovered("uncertain", latest)]));
+    assert.equal(h.messages().find(message => message.apiExecution?.reference.requestId === latest).apiExecution.response.data.result.kind, "outcome");
+    assert.equal(riskView(h, latest), undefined); h.send("명시적 다음 작업"); await h.settle();
+    assert.equal(postedBodies(h).length, 3); assert.equal(Object.hasOwn(postedBodies(h).at(-1), "acknowledgedUncertainRequestId"), false);
   } finally { h.close(); }
 });

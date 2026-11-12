@@ -12,6 +12,7 @@ import type {
 import type { Schedule } from "@/types/schedule";
 import type { AssistantResultDisplay } from "@/utils/assistant-mapper";
 import { assistantFailureAdvice } from "@/utils/assistant-errors";
+import type { AssistantUncertainView } from "@/utils/assistant-uncertain";
 
 type AssistantMessageProps = {
   text: string;
@@ -27,6 +28,11 @@ type AssistantMessageProps = {
   selectedApiApproval?: boolean;
   apiConfirmationExpired?: boolean;
   apiRecoveryText?: string;
+  uncertainView?: AssistantUncertainView;
+  uncertainErrorText?: string;
+  uncertainActionsDisabled?: boolean;
+  onUncertainCheck?: () => void;
+  onUncertainAcknowledge?: () => void;
 };
 
 export function AssistantMessage({
@@ -43,6 +49,11 @@ export function AssistantMessage({
   selectedApiApproval,
   apiConfirmationExpired,
   apiRecoveryText,
+  uncertainView,
+  uncertainErrorText,
+  uncertainActionsDisabled = false,
+  onUncertainCheck,
+  onUncertainAcknowledge,
 }: AssistantMessageProps) {
   const theme = useTheme();
   const confirmationDisabled = interactionsDisabled || interaction?.resolved || !onDeleteConfirmation;
@@ -57,6 +68,8 @@ export function AssistantMessage({
       {apiRecoveryText && <ThemedText type="small" themeColor="primaryForeground">{apiRecoveryText}</ThemedText>}
       {apiResult && <ApiResultDetails result={apiResult} onCandidateSelection={onApiCandidateSelection} selectedCandidateId={selectedApiCandidateId}
         onConfirmation={onApiConfirmation} selectedApproval={selectedApiApproval} confirmationExpired={apiConfirmationExpired} />}
+      {uncertainView && <UncertainActions value={uncertainView} errorText={uncertainErrorText} disabled={uncertainActionsDisabled}
+        onCheck={onUncertainCheck} onAcknowledge={onUncertainAcknowledge} />}
       {!apiResult && schedules?.map((schedule) => (
         <AssistantScheduleCard key={schedule.id} schedule={schedule} />
       ))}
@@ -72,6 +85,43 @@ export function AssistantMessage({
       )}
     </ThemedView>
   );
+}
+
+function UncertainActions({ value, errorText, disabled, onCheck, onAcknowledge }: {
+  value: AssistantUncertainView; errorText?: string; disabled: boolean; onCheck?: () => void; onAcknowledge?: () => void;
+}) {
+  const theme = useTheme();
+  const acknowledgeDisabled = disabled || !value.canAcknowledge || value.armed || !onAcknowledge;
+  const stateText = value.pendingRequestId ? value.acknowledged
+    ? "위험 인지는 새 작업 접수와 함께 반영됐어요. 새 작업 결과는 확인이 필요해요."
+    : "새 작업의 접수 여부가 미확인이에요. 새 ID로 다시 보내지 않고 원래 ID를 확인해 주세요."
+    : value.armed ? "아직 서버에 인지가 반영되지 않았어요. 다음 입력은 과거 질문의 답변이 아닌 새 독립 text 작업으로 전송돼요."
+    : value.acknowledged ? "위험 인지는 새 작업 접수와 함께 반영됐지만 과거 결과는 여전히 미확인이에요."
+    : value.state === "pending" ? "아직 처리 중이에요. 새 요청을 보내지 않고 상태를 다시 확인해 주세요."
+    : value.state === "expired" ? "상세 보관 기간이 지나 과거 성공·실패는 알 수 없어요."
+    : value.state === "unknown" ? "현재 상태를 확인하지 못했어요. 먼저 원래 요청을 다시 확인해 주세요." : "결과가 아직 확인되지 않았어요.";
+  return <>
+    <ThemedText type="small" themeColor="primaryForeground">{value.state === "resolved"
+      ? "과거 요청의 결과는 확정됐어요. 별도로 보낸 새 작업은 원래 ID로 확인해 주세요."
+      : <>
+      과거 일정 변경이 반영됐을 수 있으며 아직 확정되지 않았어요. 같은 변경을 반복하면 중복될 위험이 있어요.
+      위험 인지는 과거 작업의 취소·성공·실패 판정이 아니에요. 일정 목록에서도 직접 확인해 주세요.
+      </>}
+    </ThemedText>
+    <ThemedText type="small" themeColor="primaryForeground">{stateText}</ThemedText>
+    {errorText && <ThemedText type="small" themeColor="primaryForeground">{errorText}</ThemedText>}
+    <View style={styles.actions}>
+      <Pressable accessibilityRole="button" accessibilityState={{ disabled: disabled || !onCheck }} disabled={disabled || !onCheck}
+        onPress={disabled ? undefined : onCheck} style={[styles.buttonBase, styles.action, { backgroundColor: theme.primaryForeground }, disabled && styles.disabled]}>
+        <ThemedText themeColor="primary">{value.pendingRequestId ? "새 작업 결과 확인" : "원래 요청 결과 확인"}</ThemedText>
+      </Pressable>
+      <Pressable accessibilityRole="button" accessibilityState={{ disabled: acknowledgeDisabled, selected: value.armed }} disabled={acknowledgeDisabled}
+        onPress={acknowledgeDisabled ? undefined : onAcknowledge}
+        style={[styles.buttonBase, styles.action, { backgroundColor: theme.primaryForeground }, acknowledgeDisabled && styles.disabled]}>
+        <ThemedText themeColor="primary">위험을 이해하고 새 작업 입력</ThemedText>
+      </Pressable>
+    </View>
+  </>;
 }
 
 // 서버 후속 입력 callback은 Mock interaction 실행과 분리한다.

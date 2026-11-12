@@ -1,7 +1,7 @@
 import type { AssistantHttpError } from "@/services/api/assistant";
 import type { AssistantExecutionResult } from "@/services/api/assistant-orchestrator";
 
-export type AssistantErrorRecoveryNotice = { targetRequestId: string; kind: "question" | "blocking";
+export type AssistantErrorRecoveryNotice = { targetRequestId: string; kind: "question" | "blocking" | "uncertain";
   status: "checking" | "restored" | "observed" | "mismatch" | "unconfirmed" | "busy" | "context-changed";
   result?: AssistantExecutionResult };
 export const assistantErrorRecoveryNotice = (notice: AssistantErrorRecoveryNotice): string => ({
@@ -71,7 +71,7 @@ export const assistantFailureAdvice = (action: "revise_input" | "retry_later" | 
   none: "오류가 발생했어요. 요청 결과를 확인해 주세요.",
 })[action];
 
-export function getAssistantErrorRecoveryTarget(execution: AssistantExecutionResult) {
+export function getAssistantErrorRecoveryTarget(execution: AssistantExecutionResult, acknowledgedId?: string) {
   const error = getAssistantExecutionError(execution);
   if (error?.kind !== "http" || error.operation !== "post" || error.status !== 409) return;
   const problem = error.problem;
@@ -80,5 +80,11 @@ export function getAssistantErrorRecoveryTarget(execution: AssistantExecutionRes
   }
   if (problem?.code === "CONVERSATION_BUSY" && problem.blockingRequestId) {
     return { kind: "blocking" as const, requestId: problem.blockingRequestId };
+  }
+  if (problem?.code === "UNRESOLVED_UNCERTAIN" && problem.blockingRequestId) {
+    return { kind: "uncertain" as const, requestId: problem.blockingRequestId };
+  }
+  if (problem?.code === "ACKNOWLEDGEMENT_NOT_APPLICABLE" && (problem.blockingRequestId || acknowledgedId)) {
+    return { kind: "uncertain" as const, requestId: problem.blockingRequestId ?? acknowledgedId! };
   }
 }
