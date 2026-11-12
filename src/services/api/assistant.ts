@@ -10,7 +10,7 @@ import type {
   AssistantRequestCreate,
   AssistantRequestStatusResponse,
 } from "@/types/assistant-api";
-import type { AssistantRecoveryReference } from "@/types/assistant-recovery";
+import type { AssistantRecoveryMetadata, AssistantRecoveryReference } from "@/types/assistant-recovery";
 import {
   isAssistantUuidV4,
   parseAssistantCancelRequest,
@@ -51,6 +51,10 @@ export type AssistantHttpResult<T> =
   | Extract<ResponseResult<T>, { ok: false }>;
 
 export type AssistantRequestOptions = { expectedServerId: string; signal?: AbortSignal };
+export type AssistantPostOptions = AssistantRequestOptions & {
+  // 저장 장벽 뒤 실제 fetch 직전에 복구 계층의 접수·시각 조건을 동기 검사한다.
+  beforeSend?: (metadata: Readonly<AssistantRecoveryMetadata>) => boolean;
+};
 // cancel 전용 timeout 수치는 미합의다. 호출자 취소 신호를 필수로 받고 임의 기본값은 두지 않는다.
 export type AssistantCancelOptions = { expectedServerId: string; signal: AbortSignal };
 type RecoveryStorage = Pick<typeof assistantRecoveryStorage, "saveBeforePost" | "read" | "recordResponse">;
@@ -59,6 +63,9 @@ type BoundServer = DevelopmentServerConfig & { modeGeneration: number };
 
 const RESPONSE_TIMEOUT_MS = 5_000;
 const sameUuid = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+// 저장 갱신 실패에도 이미 검증한 접수 사실은 같은 runtime의 다른 호출자가 다시 부정하지 않는다.
+const acceptedRequestKeys = new Set<string>();
+const acceptanceKey = (ref: AssistantRecoveryReference) => JSON.stringify([ref.serverId, ref.requestId.toLowerCase()]);
 const storageCode = (error: unknown): StorageCode => error instanceof AssistantRecoveryStorageError ? error.code : "unknown";
 function validSignal(signal: AbortSignal | undefined) {
   return signal === undefined || (signal !== null && typeof signal.aborted === "boolean" &&
@@ -121,7 +128,8 @@ export function createAssistantHttpClient({
 
   // 한 번의 HTTP 교환만 수행한다. retry·GET-first 복구·polling·복구 항목 정리는 호출자 책임이다.
   async function send<T>(server: BoundServer, context: Context, path: string, method: "POST" | "GET", body: string | undefined,
-    signal: AbortSignal | undefined, timeoutMs: number | null, parse: (data: unknown, status: number) => T | null): Promise<ResponseResult<T>> {
+    signal: AbortSignal | undefined, timeoutMs: number | null, parse: (data: unknown, status: number) => T | null,
+    beforeSend?: () => boolean): Promise<ResponseResult<T>> {
     if (signal?.aborted) return failure(context, "aborted");
     if (!isCurrent(server)) return failure(context, "context-changed");
     const controller = new AbortController();
@@ -143,6 +151,9 @@ export function createAssistantHttpClient({
       try {
         const headers = new Headers({ Accept: "application/json, application/problem+json" });
         if (body !== undefined) headers.set("Content-Type", "application/json");
+        try { if (beforeSend && !beforeSend()) return failure(context, "policy"); }
+        catch { return failure(context, "policy"); }
+        if (signal?.aborted) return failure(context, "aborted");
         // Expo fetch는 RN의 기본 fetch와 달리 redirect:error를 지원한다. GET도 원래 origin 밖으로 보내지 않는다.
         const response = await (fetchImpl ?? expoFetch)(`${server.apiBaseUrl}${path}`, {
           method, headers, body, signal: controller.signal, redirect: "error",
@@ -183,6 +194,7 @@ export function createAssistantHttpClient({
   async function record<T extends AssistantRequestStatusResponse>(result: ResponseResult<T>, ref: AssistantRecoveryReference,
     server: BoundServer, context: Context, tracked: boolean): Promise<AssistantHttpResult<T>> {
     if (!result.ok) return result;
+    acceptedRequestKeys.add(acceptanceKey(ref));
     let metadata: AssistantMetadataUpdate = { status: "not-tracked" };
     if (tracked) {
       try { await recovery.recordResponse(ref, result.data); metadata = { status: "updated" }; }
@@ -195,7 +207,7 @@ export function createAssistantHttpClient({
     return { ...result, metadata };
   }
 
-  async function postAssistantRequest(input: AssistantRequestCreate, options: AssistantRequestOptions): Promise<AssistantHttpResult<AssistantRequestStatusResponse>> {
+  async function postAssistantRequest(input: AssistantRequestCreate, options: AssistantPostOptions): Promise<AssistantHttpResult<AssistantRequestStatusResponse>> {
     const payload = snapshotBody(input, parseAssistantRequestCreate);
     const context: Context = { operation: "post", assistantRequestId: payload?.data.requestId, serverId: options?.expectedServerId };
     if (!payload || typeof options?.expectedServerId !== "string" || !validSignal(options.signal)) return failure(context, "request");
@@ -213,7 +225,7 @@ export function createAssistantHttpClient({
         (payload.data.conversationId !== undefined && !sameUuid(payload.data.conversationId, parsed.conversationId)) ||
         (saved.acceptConfirmed && !sameUuid(saved.conversationId, parsed.conversationId))) return null;
       return parsed;
-    });
+    }, () => options.beforeSend?.({ ...saved }) !== false);
     return record(result, ref, server, context, true);
   }
 
@@ -258,7 +270,10 @@ export function createAssistantHttpClient({
     const current = config();
     return current.status === "ready" ? current.config.serverId : null;
   }
-  return { postAssistantRequest, getAssistantRequest, cancelAssistantConversation, getServerId };
+  function hasAcceptanceEvidence(ref: AssistantRecoveryReference): boolean {
+    return isAssistantUuidV4(ref.requestId) && acceptedRequestKeys.has(acceptanceKey(ref));
+  }
+  return { postAssistantRequest, getAssistantRequest, cancelAssistantConversation, getServerId, hasAcceptanceEvidence };
 }
 
 // import만으로 storage나 서버에 접근하지 않는다.
