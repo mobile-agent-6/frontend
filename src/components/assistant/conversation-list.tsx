@@ -11,6 +11,7 @@ import type { AssistantLifecycleSnapshot } from "@/services/api/assistant-lifecy
 import type { AssistantInteraction } from "@/types/assistant";
 import type { Schedule } from "@/types/schedule";
 import { assistantResultToDisplay } from "@/utils/assistant-mapper";
+import type { AssistantCandidateQuestion } from "@/utils/assistant-text-question";
 
 // 화면 메시지와 공개 API 결과를 구분하며 API 원형은 현재 실행 세션에만 보관한다.
 export type ConversationMessage = {
@@ -44,6 +45,9 @@ type ConversationListProps = {
   interactionsDisabled?: boolean;
   onDeleteConfirmation?: (messageId: string, confirmed: boolean) => void;
   onCandidateSelection?: (messageId: string, scheduleId: string) => void;
+  activeApiCandidate?: AssistantCandidateQuestion;
+  apiCandidateSelections?: Readonly<Record<string, string>>;
+  onApiCandidateSelection?: (messageId: string, candidateId: string) => void;
 };
 
 export function ConversationList({
@@ -53,6 +57,9 @@ export function ConversationList({
   interactionsDisabled = false,
   onDeleteConfirmation,
   onCandidateSelection,
+  activeApiCandidate,
+  apiCandidateSelections,
+  onApiCandidateSelection,
 }: ConversationListProps) {
   const listRef = useRef<FlatList<ConversationMessage>>(null);
   const messageCount = messages.length;
@@ -214,6 +221,15 @@ export function ConversationList({
             schedules={item.apiExecution ? undefined : item.schedules}
             interaction={item.apiExecution ? undefined : item.interaction}
             interactionsDisabled={Boolean(item.apiExecution) || interactionsDisabled}
+            selectedApiCandidateId={item.apiExecution ? apiCandidateSelections?.[item.apiExecution.reference.requestId.toLowerCase()] : undefined}
+            onApiCandidateSelection={
+              !interactionsDisabled && activeApiCandidate && onApiCandidateSelection && item.apiExecution?.kind === "completed" &&
+              item.apiExecution.reference.serverId === activeApiCandidate.serverId &&
+              item.apiExecution.reference.requestId.toLowerCase() === activeApiCandidate.requestId.toLowerCase() &&
+              item.apiExecution.response.data.result.kind === "candidate_selection" &&
+              item.apiExecution.response.data.result.questionId.toLowerCase() === activeApiCandidate.questionId.toLowerCase()
+                ? candidateId => onApiCandidateSelection(item.id, candidateId) : undefined
+            }
             onCandidateSelection={
               !item.apiExecution && onCandidateSelection
                 ? (scheduleId) => onCandidateSelection(item.id, scheduleId)

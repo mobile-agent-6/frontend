@@ -8,6 +8,7 @@ import {
   type ConversationListHandle,
 } from "@/components/assistant/conversation-list";
 import { MessageInput } from "@/components/assistant/message-input";
+import { formatAssistantCardDateTime } from "@/components/assistant/assistant-schedule-card";
 import { Header } from "@/components/navigation/header";
 import { ThemedView } from "@/components/ui/themed-view";
 import { useColorScheme } from "@/hooks/use-color-scheme";
@@ -26,7 +27,8 @@ import { useScheduleStore } from "@/stores/scheduleStore";
 import { isMockScheduleMode, scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
 import { parseAssistantRequestCreate, validateAssistantJsonBodySize, validateAssistantText } from "@/utils/assistant-validation";
 import { upsertAssistantExecutionMessage } from "@/utils/assistant-recovery-messages";
-import { createAssistantTextQuestionContext } from "@/utils/assistant-text-question";
+import { createAssistantTextQuestionContext, type AssistantCandidateQuestion, type AssistantTextQuestion } from "@/utils/assistant-text-question";
+import { assistantCandidateToDisplay } from "@/utils/assistant-mapper";
 
 // processing UI를 보여주기 위한 Mock 지연이며, 실제 API timeout이 아니다.
 const MOCK_PROCESSING_DELAY_MS = 700;
@@ -44,6 +46,8 @@ export default function AssistantScreen() {
   const [inputText, setInputText] = useState("");
   const [status, setStatus] = useState<AssistantStatus>("idle");
   const [isBusy, setIsBusy] = useState(false);
+  const [candidateUi, setCandidateUi] = useState<{ serverId: string; generation: number;
+    active?: AssistantCandidateQuestion; selections: Readonly<Record<string, string>> } | null>(null);
   const [recoverySnapshot, setRecoverySnapshot] = useState(assistantLifecycle.getSnapshot);
   const sendLockedRef = useRef(false);
   const inputTextRef = useRef("");
@@ -66,6 +70,13 @@ export default function AssistantScreen() {
       textQuestionRef.current = createAssistantTextQuestionContext(serverId, generation);
     }
     return textQuestionRef.current;
+  }, []);
+
+  const syncCandidateUi = useCallback((context: ReturnType<typeof createAssistantTextQuestionContext>) => {
+    if (!mountedRef.current) return;
+    const next = { serverId: context.serverId, generation: context.generation,
+      active: context.getCandidateQuestion(Date.now()), selections: context.getSelections() };
+    setCandidateUi(previous => JSON.stringify(previous) === JSON.stringify(next) ? previous : next);
   }, []);
 
   const invalidateActiveInteraction = useCallback(() => {
@@ -135,6 +146,7 @@ export default function AssistantScreen() {
     serverTaskRef.current?.cancel();
     serverTaskRef.current = null;
     textQuestionRef.current = null;
+    setCandidateUi(null);
     if (processingTimerRef.current !== null) clearTimeout(processingTimerRef.current);
     processingTimerRef.current = null;
     pendingMockRef.current = null;
@@ -184,6 +196,7 @@ export default function AssistantScreen() {
             context.observeResponse(entry.lastResponse.data, "recovery");
           }
         }
+        syncCandidateUi(context);
       }
       setMessages(current => {
         let next = snapshot.initialCheck === "checked" && !snapshot.issue && !snapshot.initialization
@@ -214,7 +227,7 @@ export default function AssistantScreen() {
     const unsubscribe = assistantLifecycle.subscribe(consume);
     consume();
     return () => { subscribed = false; unsubscribe(); };
-  }, [getTextQuestionContext, reportRecoveryIssue]);
+  }, [getTextQuestionContext, reportRecoveryIssue, syncCandidateUi]);
 
   useEffect(() => {
     if (status !== "processing" || serverTaskRef.current !== null || !isMockScheduleMode()) return;
@@ -263,7 +276,7 @@ export default function AssistantScreen() {
     };
   }, [status, finishOperation, invalidateActiveInteraction, publishResponse, reportError, restoreInput, clearMockOperation]);
 
-  const sendServerText = async () => {
+  const sendServerInput = async (selection?: { messageId: string; candidateId: string }) => {
     if (!mountedRef.current || sendLockedRef.current || status === "processing") return;
     sendLockedRef.current = true;
     setIsBusy(true);
@@ -271,11 +284,12 @@ export default function AssistantScreen() {
     const generation = scheduleDataModeStore.getState().generation;
     const text = inputTextRef.current, revision = inputRevisionRef.current;
     let completed = false;
+    let clearSelectionExpiry: (() => void) | undefined;
     const isCurrent = () => mountedRef.current && operationVersionRef.current === version &&
       scheduleDataModeStore.getState().mode === "server" && scheduleDataModeStore.getState().generation === generation;
     try {
       // 서버 계약은 trim 전 원문을 검사한다. Mock의 기존 입력 처리와 분리한다.
-      if (!validateAssistantText(text).ok) {
+      if (!selection && !validateAssistantText(text).ok) {
         reportError("공백이 아닌 메시지를 1~500자로 입력해 주세요. 허용되지 않는 제어문자는 사용할 수 없어요.");
         return;
       }
@@ -288,17 +302,42 @@ export default function AssistantScreen() {
         return false;
       };
       if (!canStart()) return;
-      const requestId = Crypto.randomUUID();
       const context = getTextQuestionContext(serverId);
-      const question = context.getQuestion();
-      if (typeof question === "string") {
-        reportError(question === "unsupported" ? "현재 질문은 후보 선택 또는 확인이 필요해요."
+      const currentQuestion = context.getQuestion();
+      let question: AssistantTextQuestion | undefined, label = text;
+      const resolveSelection = () => {
+        if (!selection) return;
+        const active = context.getCandidateQuestion(Date.now());
+        const message = messages.find(item => item.id === selection.messageId);
+        const execution = message?.role === "assistant" ? message.apiExecution : undefined;
+        if (!active || execution?.kind !== "completed" || execution.reference.serverId !== serverId ||
+          execution.reference.requestId.toLowerCase() !== active.requestId.toLowerCase() ||
+          execution.response.data.result.kind !== "candidate_selection" ||
+          execution.response.data.result.questionId !== active.questionId || !active.candidateIds.includes(selection.candidateId)) return;
+        const candidate = execution.response.data.result.candidates.find(item => item.candidateId === selection.candidateId);
+        return candidate ? { question: active, candidate } : undefined;
+      };
+      const selected = resolveSelection();
+      if (selection) {
+        if (!selected) return;
+        question = selected.question;
+        const candidate = assistantCandidateToDisplay(selected.candidate);
+        label = `${candidate.title} · ${formatAssistantCardDateTime(candidate.date, candidate.time)} · ${candidate.category}`;
+      } else if (typeof currentQuestion === "string") {
+        reportError(currentQuestion === "unsupported" ? "현재 질문은 후보 선택 또는 확인이 필요해요."
           : "현재 질문을 확인하지 못했어요. 원래 요청의 결과 확인이 필요해요.");
         return;
+      } else question = currentQuestion;
+      const requestId = Crypto.randomUUID();
+      if (!selection) {
+        const latest = context.getQuestion();
+        if (typeof latest === "string") return;
+        question = latest;
       }
       const body = parseAssistantRequestCreate({ requestId,
         ...(question ? { conversationId: question.conversationId } : {}),
-        input: { type: "text", text, ...(question ? { questionId: question.questionId } : {}) } });
+        input: selection ? { type: "selection", questionId: question?.questionId, candidateId: selection.candidateId }
+          : { type: "text", text, ...(question ? { questionId: question.questionId } : {}) } });
       if (!body || !validateAssistantJsonBodySize(JSON.stringify(body)).ok) {
         reportError("메시지 형식이나 크기를 확인해 주세요.");
         return;
@@ -306,24 +345,40 @@ export default function AssistantScreen() {
       if (!isCurrent() || assistantHttpClient.getServerId() !== serverId) return;
       if (!canStart()) return;
       // 본문을 만든 사이 질문이 바뀌었으면 오래된 ID로 보내지 않고 입력을 남긴다.
-      if (JSON.stringify(question) !== JSON.stringify(context.getQuestion())) return;
-      pendingInputRef.current = text;
-      setMessages((current) => [...current, { id: requestId, role: "user", text, serverId }]);
-      inputTextRef.current = "";
-      setInputText("");
+      if (selection ? JSON.stringify(selected?.question) !== JSON.stringify(resolveSelection()?.question)
+        : JSON.stringify(question) !== JSON.stringify(context.getQuestion())) return;
+      const selectionController = selection ? new AbortController() : undefined;
+      if (selectionController && selected) {
+        const remaining = Date.parse(selected.question.expiresAt) - Date.now();
+        if (remaining <= 0) return;
+        // 저장 장벽 대기 중 만료되면 기존 HTTP의 AbortSignal 검사로 실제 전송을 막는다. 서버 취소는 아니다.
+        const timer = setTimeout(() => {
+          if (!assistantHttpClient.hasAcceptanceEvidence({ serverId, requestId })) selectionController.abort();
+        }, Math.min(2_147_483_647, remaining));
+        clearSelectionExpiry = () => clearTimeout(timer);
+      }
+      pendingInputRef.current = label;
+      setMessages((current) => [...current, { id: requestId, role: "user", text: label, serverId }]);
+      if (!selection) { inputTextRef.current = ""; setInputText(""); }
       setStatus("processing");
-      context.beginRequest(requestId, question);
+      context.beginRequest(requestId, question, selection?.candidateId);
+      syncCandidateUi(context);
       // 저장 장벽·GET-first·polling·재전송은 기존 orchestration에만 맡긴다.
-      const task = assistantOrchestrator.startRequest(body, { expectedServerId: serverId, onUpdate: event => {
+      const task = assistantOrchestrator.startRequest(body, { expectedServerId: serverId, signal: selectionController?.signal, onUpdate: event => {
         if (!isCurrent() || assistantHttpClient.getServerId() !== serverId || event.reference.serverId !== serverId ||
           event.reference.requestId.toLowerCase() !== requestId.toLowerCase()) return;
-        if (event.phase === "status") context.observeResponse(event.response.data, "request", question);
+        if (event.phase === "status") {
+          clearSelectionExpiry?.();
+          context.observeResponse(event.response.data, "request", question);
+          syncCandidateUi(context);
+        }
       } });
       if (!isCurrent()) { task.cancel(); return; }
       serverTaskRef.current = task;
       const execution = await task.completion;
       if (!isCurrent() || assistantHttpClient.getServerId() !== serverId) return;
       context.observeExecution(execution, "request", question);
+      syncCandidateUi(context);
       if (execution.kind === "completed") {
         completed = true;
         // 원본 처리 결과를 메시지에 보존하고 상세 표시는 ConversationList에 맡긴다.
@@ -337,9 +392,10 @@ export default function AssistantScreen() {
         try { reportError("응답을 확인하지 못했어요. 원래 요청의 결과 확인이 필요해요."); } catch {}
       }
     } finally {
+      clearSelectionExpiry?.();
       if (mountedRef.current && operationVersionRef.current === version) {
         // 새로 작성했다가 지운 초안도 이전 요청의 실패 입력으로 덮어쓰지 않는다.
-        if (!completed && inputRevisionRef.current === revision) restoreInput(text);
+        if (!selection && !completed && inputRevisionRef.current === revision) restoreInput(text);
         serverTaskRef.current = null;
         finishOperation();
       }
@@ -347,7 +403,7 @@ export default function AssistantScreen() {
   };
 
   const handleSend = () => {
-    if (!isMockScheduleMode()) { void sendServerText(); return; }
+    if (!isMockScheduleMode()) { void sendServerInput(); return; }
     const text = inputTextRef.current.trim();
     if (!mountedRef.current || !text || sendLockedRef.current || status === "processing") return;
     sendLockedRef.current = true;
@@ -443,6 +499,19 @@ export default function AssistantScreen() {
       : message.role === "assistant" ? message.apiExecution?.reference.serverId : undefined;
     return mockMode ? serverId === undefined : serverId !== undefined && serverId === currentServerId;
   });
+  const candidateView = !mockMode && candidateUi?.serverId === currentServerId &&
+    candidateUi.generation === scheduleDataModeStore.getState().generation ? candidateUi : null;
+  const activeCandidate = candidateView?.active;
+  const candidateRequestId = activeCandidate?.requestId, candidateExpiresAt = activeCandidate?.expiresAt;
+  useEffect(() => {
+    if (!candidateExpiresAt) return;
+    const timer = setTimeout(() => {
+      const context = textQuestionRef.current;
+      if (context) syncCandidateUi(context);
+    },
+      Math.min(2_147_483_647, Math.max(0, Date.parse(candidateExpiresAt) - Date.now())));
+    return () => clearTimeout(timer);
+  }, [candidateRequestId, candidateExpiresAt, syncCandidateUi]);
 
   return (
     <ThemedView
@@ -464,6 +533,9 @@ export default function AssistantScreen() {
           messages={visibleMessages.length === messages.length ? messages : visibleMessages}
           isProcessing={status === "processing" || recoveryPending || recoveryProcessing}
           interactionsDisabled={isBusy || status === "processing"}
+          activeApiCandidate={!recoveryPending && !isBusy ? activeCandidate : undefined}
+          apiCandidateSelections={candidateView?.selections}
+          onApiCandidateSelection={(messageId, candidateId) => { if (!isMockScheduleMode()) void sendServerInput({ messageId, candidateId }); }}
           onDeleteConfirmation={(messageId, confirmed) =>
             handleInteraction(messageId, { type: "confirmation", confirmed })}
           onCandidateSelection={(messageId, scheduleId) =>

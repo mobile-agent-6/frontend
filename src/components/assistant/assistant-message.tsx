@@ -20,6 +20,8 @@ type AssistantMessageProps = {
   interactionsDisabled?: boolean;
   onDeleteConfirmation?: (confirmed: boolean) => void;
   onCandidateSelection?: (scheduleId: string) => void;
+  onApiCandidateSelection?: (candidateId: string) => void;
+  selectedApiCandidateId?: string;
 };
 
 export function AssistantMessage({
@@ -30,6 +32,8 @@ export function AssistantMessage({
   interactionsDisabled = false,
   onDeleteConfirmation,
   onCandidateSelection,
+  onApiCandidateSelection,
+  selectedApiCandidateId,
 }: AssistantMessageProps) {
   const theme = useTheme();
   const confirmationDisabled = interactionsDisabled || interaction?.resolved || !onDeleteConfirmation;
@@ -41,7 +45,7 @@ export function AssistantMessage({
       >
         {text}
       </Text>
-      {apiResult && <ApiResultDetails result={apiResult} />}
+      {apiResult && <ApiResultDetails result={apiResult} onCandidateSelection={onApiCandidateSelection} selectedCandidateId={selectedApiCandidateId} />}
       {!apiResult && schedules?.map((schedule) => (
         <AssistantScheduleCard key={schedule.id} schedule={schedule} />
       ))}
@@ -59,22 +63,31 @@ export function AssistantMessage({
   );
 }
 
-// API 상세는 표시 전용이다. Mock interaction으로 바꾸거나 실행 callback을 받지 않는다.
-function ApiResultDetails({ result }: { result: AssistantResultDisplay }) {
+// 서버 후보 선택 callback은 Mock interaction·confirmation 실행과 분리한다.
+function ApiResultDetails({ result, onCandidateSelection, selectedCandidateId }: {
+  result: AssistantResultDisplay;
+  onCandidateSelection?: (candidateId: string) => void;
+  selectedCandidateId?: string;
+}) {
   const theme = useTheme();
   switch (result.kind) {
     case "need_more_info": return null;
-    case "candidate_selection": return (
+    case "candidate_selection": {
+      const disabled = !onCandidateSelection;
+      return (
       <View style={styles.candidates}>
         {result.candidates.map(candidate => (
           <Pressable key={candidate.candidateId} accessibilityRole="button"
-            accessibilityState={{ disabled: true }} disabled
-            style={[styles.buttonBase, styles.candidate, { backgroundColor: theme.primaryForeground }, styles.disabled]}>
+            accessibilityState={{ disabled, selected: candidate.candidateId === selectedCandidateId }} disabled={disabled}
+            onPress={disabled ? undefined : () => onCandidateSelection?.(candidate.candidateId)}
+            style={[styles.buttonBase, styles.candidate, { backgroundColor: theme.primaryForeground }, disabled && styles.disabled]}>
             <AssistantScheduleCard schedule={candidate} />
+            {candidate.candidateId === selectedCandidateId && <ThemedText type="small" themeColor="primary">선택됨</ThemedText>}
           </Pressable>
         ))}
       </View>
-    );
+      );
+    }
     case "confirmation": return (
       <>
         <ThemedText type="small" themeColor="primaryForeground">
