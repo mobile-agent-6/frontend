@@ -2331,3 +2331,82 @@ test("8-B 결과 표시 확인 metadata 정리와 Schedule GET-only retry는 독
     assert.equal(postedBodies(h).length, 1); assert.equal(h.state.cleanup, 1); assert.equal(h.messages().at(-1).apiExecution.response.data.result.outcome, "success");
   } finally { h.close(); }
 });
+
+// 단계별 시험 사이의 공백을 실제 카드 버튼→후속 POST→polling→Schedule GET까지 연속 실행한다.
+for (const [approved, completed] of [[true, true], [true, false], [false, true]]) test(`9 통합 후보→확인 ${approved ? "승인" : "거절"}·완료 ${completed}: 실제 버튼·최신 ID·GET 동기화·write 분리`, async () => {
+  const h = harness({ actualScheduleSync: true }), beforeMock = h.mock.getState().schedules;
+  const original = scheduleDto8b({ completed: !completed }), updated = scheduleDto8b({ completed });
+  const cache = h.source("src/stores/serverScheduleStore.ts").serverScheduleStore;
+  h.state.handle = async () => json({ items: [original] });
+  const owner = cache.acquire({ from: "2026-11-01T00:00:00Z", to: "2026-12-01T00:00:00Z" }); await owner.promise;
+  const opaque = "opaque:/후보 ?#% 원형", requests = new Map(); let nextStage = 0;
+  const candidate = { ...results.candidate_selection, questionId: id(380), expiresAt: new Date(h.wall + 600000).toISOString(),
+    candidates: [{ ...results.candidate_selection.candidates[0], candidateId: opaque }, results.candidate_selection.candidates[1]] };
+  const confirmation = { ...results.confirmation, questionId: id(381), expiresAt: candidate.expiresAt, target: { ...summary, completed: !completed }, changes: { completed } };
+  h.state.handle = async (url, init) => {
+    if (new URL(url).pathname === "/api/v1/schedules") return json({ items: [updated] });
+    if (init.method === "POST") {
+      const body = JSON.parse(init.body); requests.set(body.requestId, { stage: nextStage++, gets: 0 }); return json(status(body.requestId), 202);
+    }
+    const requestId = url.split("/").pop(), entry = requests.get(requestId); entry.gets++;
+    if (entry.stage === 2 && entry.gets <= 2) return json(status(requestId, entry.gets === 1 ? "accepted" : "processing"));
+    return json({ ...done(requestId), result: entry.stage === 0 ? candidate : entry.stage === 1 ? confirmation : confirmationOutcome(approved) });
+  };
+  try {
+    h.edit("완료 상태를 바꿀 일정 찾아 줘"); const send = h.find("MessageInput").onSend; send(); send(); h.render(); await h.settle();
+    const candidateMessage = h.messages().at(-1); assert.equal(candidateMessage.apiExecution.response.data.result.kind, "candidate_selection");
+    const select = candidateButtons(h, candidateMessage.id)[0].props.onPress; select(); select(); h.find("MessageInput").onSend(); h.render(); await h.settle();
+    const confirmationMessage = h.messages().at(-1); assert.equal(confirmationMessage.apiExecution.response.data.result.questionId, id(381));
+    assert.ok(candidateButtons(h, candidateMessage.id).every(button => button.props.disabled));
+    const confirmationDisplay = h.renderConversation().components.find(component => component.name === "AssistantMessage" && component.props.apiResult?.kind === "confirmation").props.apiResult;
+    assert.equal(confirmationDisplay.operation, "update"); assert.equal(confirmationDisplay.target.completed, !completed);
+    assert.deepEqual(confirmationDisplay.changes, { completed });
+    const buttons = confirmationButtons(h, confirmationMessage.id); buttons[approved ? 1 : 0].props.onPress(); buttons[approved ? 0 : 1].props.onPress();
+    h.render(); await h.settle(); assert.equal(h.find("MessageInput").disabled, true); assert.equal(postedBodies(h).length, 3);
+    assert.equal(h.messages().filter(message => message.apiExecution?.kind === "completed").length, 2);
+    await h.advance(2000); assert.equal(h.find("ConversationList").isProcessing, true); await h.advance(2000); await h.settle();
+    const bodies = postedBodies(h), [first, selection, answer] = bodies;
+    assert.equal(new Set(bodies.map(body => body.requestId)).size, 3); assert.equal(h.state.uuidCalls, 3);
+    assert.ok(bodies.every(body => h.source("src/utils/assistant-validation.ts").isAssistantUuidV4(body.requestId)));
+    assert.deepEqual(first, { requestId: first.requestId, input: { type: "text", text: "완료 상태를 바꿀 일정 찾아 줘" } });
+    assert.deepEqual(selection, { requestId: selection.requestId, conversationId: id(100), input: { type: "selection", questionId: id(380), candidateId: opaque } });
+    assert.deepEqual(answer, { requestId: answer.requestId, conversationId: id(100), input: { type: "confirmation", questionId: id(381), approved } });
+    const execution = postMessage(h).apiExecution; assert.equal(execution.response.data.result.outcome, approved ? "success" : "cancelled");
+    assert.equal(h.messages().filter(message => message.apiExecution?.reference.requestId === answer.requestId).length, 1);
+    assert.deepEqual(h.messages().map(message => message.role), ["user", "assistant", "user", "assistant", "user", "assistant"]);
+    assert.ok(confirmationButtons(h, confirmationMessage.id).every(button => button.props.disabled));
+    assert.equal(syncCalls8b(h).length, approved ? 2 : 1); assert.equal(cache.store.getState().servers[serverId].entities[id(200)].completed, approved ? completed : !completed);
+    if (approved) assert.ok(textOf(syncStatus8b(h, answer.requestId)).includes("동기화가 완료")); else assert.equal(syncStatus8b(h, answer.requestId), undefined);
+    assert.equal(await h.storage.read(candidateMessage.apiExecution.reference), null); assert.equal(await h.storage.read(confirmationMessage.apiExecution.reference), null);
+    assert.ok(await h.storage.read(execution.reference)); assert.equal(h.state.cleanup, 0);
+    assert.strictEqual(h.mock.getState().schedules, beforeMock); assert.equal(h.state.mockRuns, 0);
+    assert.ok(h.state.calls.every(call => call.init.method === "GET" || new URL(call.url).pathname === "/api/v1/assistant/requests"));
+  } finally { owner.release(); h.close(); }
+});
+
+test("9 통합 연속 정보 보충→등록: 실제 입력창·최신 questionId·정식 Schedule GET과 metadata 경계", async () => {
+  const h = harness({ actualScheduleSync: true }), before = h.mock.getState().schedules, requests = new Map(); let stage = 0;
+  h.state.handle = async (url, init) => {
+    if (new URL(url).pathname === "/api/v1/schedules") return json({ items: [scheduleDto8b({ title: "정식 GET 등록 제목", category: "INBOUND" })] });
+    if (init.method === "POST") { const body = JSON.parse(init.body); requests.set(body.requestId, stage++); return json(status(body.requestId), 202); }
+    const requestId = url.split("/").pop(), step = requests.get(requestId);
+    return json({ ...done(requestId), result: step < 2 ? { kind: "need_more_info", text: step === 0 ? "몇 시인가요?" : "어디인가요?", questionId: id(390 + step) }
+      : writeOutcome8b("create") });
+  };
+  try {
+    h.send("회의 등록해 줘"); await h.settle(); const first = postMessage(h).apiExecution;
+    h.send("오후 3시"); await h.settle(); const second = postMessage(h).apiExecution;
+    h.send("북부 창고"); await h.settle(); await h.settle(); const third = postMessage(h).apiExecution;
+    const bodies = postedBodies(h); assert.equal(new Set(bodies.map(body => body.requestId)).size, 3); assert.equal(h.state.uuidCalls, 3);
+    assert.deepEqual(bodies[0], { requestId: bodies[0].requestId, input: { type: "text", text: "회의 등록해 줘" } });
+    for (let n = 1; n < 3; n++) assert.deepEqual(bodies[n], { requestId: bodies[n].requestId, conversationId: id(100),
+      input: { type: "text", text: n === 1 ? "오후 3시" : "북부 창고", questionId: id(389 + n) } });
+    assert.equal(third.response.data.result.operation, "create"); assert.equal(syncCalls8b(h).length, 1);
+    const cache = h.source("src/stores/serverScheduleStore.ts").serverScheduleStore.store.getState().servers[serverId];
+    assert.equal(cache.entities[id(200)].title, "정식 GET 등록 제목"); assert.equal(cache.entities[id(200)].category, "입고");
+    assert.ok(textOf(syncStatus8b(h, third.reference.requestId)).includes("동기화가 완료"));
+    assert.equal(await h.storage.read(first.reference), null); assert.equal(await h.storage.read(second.reference), null); assert.ok(await h.storage.read(third.reference));
+    assert.equal(h.messages().length, 6); assert.strictEqual(h.mock.getState().schedules, before); assert.equal(h.state.mockRuns, 0); assert.equal(h.state.cleanup, 0);
+    assert.ok(h.state.calls.every(call => call.init.method === "GET" || new URL(call.url).pathname === "/api/v1/assistant/requests"));
+  } finally { h.close(); }
+});
