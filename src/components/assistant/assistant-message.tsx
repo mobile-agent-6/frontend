@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 
 import { AssistantScheduleCard, formatAssistantCardDateTime } from "@/components/assistant/assistant-schedule-card";
@@ -105,6 +106,15 @@ function ScheduleSyncStatus({ entry, retrying, onRetry }: { entry: AssistantSche
   const theme = useTheme();
   const canRetry = entry.phase === "refresh-error" || entry.phase === "interrupted";
   return <View testID="assistant-schedule-sync-status" style={styles.candidates} accessibilityLiveRegion="polite">
+    {entry.detail?.phase === "ready" && entry.detail.schedule && <AssistantScheduleCard schedule={entry.detail.schedule} showCompleted />}
+    {entry.detail?.phase === "loading" && <ThemedText type="small" themeColor="primaryForeground">일정 정보를 불러오고 있어요.</ThemedText>}
+    {entry.detail?.phase === "error" && <>
+      <ThemedText type="small" themeColor="primaryForeground">변경은 완료됐지만 일정 요약을 불러오지 못했어요.</ThemedText>
+      <Pressable accessibilityRole="button" disabled={retrying || !onRetry} onPress={retrying ? undefined : onRetry}
+        style={[styles.buttonBase, { backgroundColor: theme.primaryForeground }, (retrying || !onRetry) && styles.disabled]}>
+        <ThemedText themeColor="primary">일정 요약 다시 불러오기</ThemedText>
+      </Pressable>
+    </>}
     <ThemedText type="small" themeColor="primaryForeground">{retrying || entry.phase === "refreshing"
       ? "일정 변경은 완료됐어요. 목록을 최신화하고 있어요."
       : entry.phase === "synchronized" ? "이 요청의 목록 동기화가 완료됐어요."
@@ -121,6 +131,8 @@ function ScheduleSyncStatus({ entry, retrying, onRetry }: { entry: AssistantSche
 function RecoveryActions({ value, onAction }: { value: AssistantRecoveryControl;
   onAction?: (action: AssistantRecoveryControlAction) => void }) {
   const theme = useTheme();
+  const [expanded, setExpanded] = useState(false);
+  const showingControls = expanded || value.phase === "confirming";
   const done = value.phase === "removed" || value.phase === "not-found";
   const disabled = !onAction || value.phase === "working";
   const button = (action: AssistantRecoveryControlAction, label: string) => (
@@ -131,7 +143,13 @@ function RecoveryActions({ value, onAction }: { value: AssistantRecoveryControl;
     </Pressable>
   );
   return <View style={styles.candidates} testID={`assistant-recovery-record-${JSON.stringify([value.reference.serverId, value.reference.requestId.toLowerCase()])}`}>
-    <ThemedText type="small" themeColor="primaryForeground">서버: {value.reference.serverId}{"\n"}요청 ID: {value.reference.requestId}</ThemedText>
+    <Pressable testID="assistant-recovery-toggle" accessibilityRole="button" accessibilityState={{ expanded: showingControls, disabled: value.phase === "confirming" }}
+      disabled={value.phase === "confirming"} onPress={() => setExpanded(previous => !previous)}>
+      <ThemedText type="small" themeColor="primaryForeground">{showingControls ? "요청 정보·복구 관리 접기" : "요청 정보·복구 관리"}</ThemedText>
+    </Pressable>
+    {showingControls && <>
+    <ThemedText type="small" themeColor="primaryForeground">대상 서버: {value.reference.serverId.replace(/^development:/, "")}</ThemedText>
+    <ThemedText type="small" themeColor="primaryForeground">요청 ID: {value.reference.requestId}</ThemedText>
     {value.phase && <ThemedText type="small" themeColor="primaryForeground">{{
       confirming: "이 서버의 이 요청에 대한 로컬 복구 기록만 지워요. 서버 작업은 취소되지 않으며 과거 변경이 반영됐을 수 있어요. 성공·실패 판정이나 uncertain 보류 해제가 아니에요. 자동 복구 대상에서 빠지므로 같은 작업을 다시 보내지 마세요.",
       working: "로컬 복구 기록을 정리하고 있어요.",
@@ -147,6 +165,7 @@ function RecoveryActions({ value, onAction }: { value: AssistantRecoveryControl;
       {value.expiryConfirmable && button("expiry", "상세 보관 종료 안내 확인 및 기록 정리")}
       {button("manual", "로컬 복구 기록 수동 정리")}
     </>)}
+    </>}
   </View>;
 }
 
@@ -253,7 +272,8 @@ function ApiResultDetails({ result, onCandidateSelection, selectedCandidateId, o
         : result.outcome === "cancelled" ? "취소됨" : "대상 없음";
       return (
         <>
-          <ThemedText type="small" themeColor="primaryForeground">{operation === undefined ? label : `${operation} ${label}`}</ThemedText>
+          {!(result.outcome === "success" && (result.operation === "create" || result.operation === "update")) &&
+            <ThemedText type="small" themeColor="primaryForeground">{operation === undefined ? label : `${operation} ${label}`}</ThemedText>}
           {result.outcome === "success" && result.operation === "list" && result.items.map(item => (
             <AssistantScheduleCard key={item.id} schedule={item} showCompleted />
           ))}

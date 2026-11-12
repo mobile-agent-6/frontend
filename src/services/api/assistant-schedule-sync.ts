@@ -1,4 +1,6 @@
 import { scheduleHttpClient, type HttpError } from "@/services/api/http";
+import { getSchedule } from "@/services/api/schedules";
+import type { Schedule } from "@/types/schedule";
 import { scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
 import { scheduleQueryKey, serverScheduleStore } from "@/stores/serverScheduleStore";
 import type { AssistantRecoveryReference } from "@/types/assistant-recovery";
@@ -10,6 +12,7 @@ export type AssistantScheduleSyncEntry = Readonly<{
   phase: "refreshing" | "synchronized" | "refresh-error" | "interrupted";
   failedQueries: readonly ScheduleListQuery[];
   errors: readonly { query: ScheduleListQuery; error: HttpError | null }[];
+  detail?: Readonly<{ phase: "loading" | "ready" | "error"; schedule?: Schedule }>;
 }>;
 const keyOf = (reference: AssistantRecoveryReference) => JSON.stringify([reference.serverId, reference.requestId.toLowerCase()]);
 function immutable<T>(value: T): T {
@@ -19,14 +22,18 @@ function immutable<T>(value: T): T {
 
 // 채팅·복구 metadata와 별개인 실행 세션의 GET 동기화 상태다. 서버 write·영속 저장은 수행하지 않는다.
 export function createAssistantScheduleSync({ cache = serverScheduleStore, readServerId = scheduleHttpClient.getServerId,
-  mode = scheduleDataModeStore }: {
+  mode = scheduleDataModeStore, readSchedule }: {
   cache?: Pick<typeof serverScheduleStore, "refreshAfterExternalChange" | "store">;
   readServerId?: () => string | null;
   mode?: Pick<typeof scheduleDataModeStore, "getState">;
+  readSchedule?: typeof getSchedule;
 } = {}) {
   const entries = new Map<string, AssistantScheduleSyncEntry>();
   const changes = new Map<string, readonly string[]>();
   const flights = new Map<string, Promise<AssistantScheduleSyncEntry>>();
+  const detailFlights = new Map<string, Promise<void>>();
+  const detailIds = new Map<string, string>();
+  const details = new Map<string, NonNullable<AssistantScheduleSyncEntry["detail"]>>();
   const subscribers = new Set<() => void>();
   let snapshot: readonly AssistantScheduleSyncEntry[] = Object.freeze([]);
   let tail: Promise<unknown> = Promise.resolve();
@@ -44,7 +51,7 @@ export function createAssistantScheduleSync({ cache = serverScheduleStore, readS
     }
   }
   function publish(entry: AssistantScheduleSyncEntry) {
-    const saved = immutable(entry);
+    const saved = immutable({ ...entry, ...(details.has(keyOf(entry.reference)) ? { detail: details.get(keyOf(entry.reference)) } : {}) });
     entries.set(keyOf(entry.reference), saved);
     snapshot = Object.freeze([...entries.values()]);
     // 기존 목록 화면의 GET-only 재시도·stale 재조회 성공도 같은 실패 안내를 해제한다. 새 GET은 시작하지 않는다.
@@ -53,6 +60,29 @@ export function createAssistantScheduleSync({ cache = serverScheduleStore, readS
     else if (!needsWatch && unsubscribeFailedQueries) { unsubscribeFailedQueries(); unsubscribeFailedQueries = undefined; }
     for (const listener of [...subscribers]) { try { listener(); } catch {} }
     return saved;
+  }
+  function refreshDetail(reference: AssistantRecoveryReference, retry = false): Promise<void> {
+    const key = keyOf(reference), id = detailIds.get(key), flight = detailFlights.get(key);
+    if (flight) return flight;
+    if (!readSchedule || !id || (!retry && details.has(key)) || (retry && details.get(key)?.phase !== "error")) return Promise.resolve();
+    const generation = mode.getState().generation;
+    const current = () => readServerId() === reference.serverId && mode.getState().mode === "server" && mode.getState().generation === generation;
+    if (!current()) return Promise.resolve();
+    const update = (detail: NonNullable<AssistantScheduleSyncEntry["detail"]>) => {
+      details.set(key, detail);
+      const entry = entries.get(key);
+      if (entry) publish(entry);
+    };
+    const promise = Promise.resolve().then(async () => {
+      update({ phase: "loading" });
+      try {
+        const result = await readSchedule(id);
+        // 카드 조회 실패는 Assistant 결과나 필수 목록 동기화의 성공 여부를 변경하지 않는다.
+        update(current() && result.ok && result.data.id === id ? { phase: "ready", schedule: result.data } : { phase: "error" });
+      } catch { update({ phase: "error" }); }
+    }).finally(() => { detailFlights.delete(key); });
+    detailFlights.set(key, promise);
+    return promise;
   }
   function refresh(reference: AssistantRecoveryReference, retry = false) {
     const ref = Object.freeze({ serverId: reference.serverId, requestId: reference.requestId.toLowerCase() });
@@ -97,11 +127,18 @@ export function createAssistantScheduleSync({ cache = serverScheduleStore, readS
       return Promise.resolve(null);
     const key = keyOf(reference);
     if (!changes.has(key)) changes.set(key, Object.freeze([...data.result.affectedScheduleIds]));
-    return refresh(reference);
+    if (data.result.operation === "create" || data.result.operation === "update") detailIds.set(key, data.result.affectedScheduleIds[0]);
+    const refreshed = refresh(reference);
+    void refreshDetail(reference);
+    return refreshed;
   }
-  return { observe, retry: (reference: AssistantRecoveryReference) => refresh(reference, true),
+  return { observe, retry: async (reference: AssistantRecoveryReference) => {
+    const entry = entries.get(keyOf(reference));
+    await Promise.all([entry?.phase === "synchronized" ? Promise.resolve(entry) : refresh(reference, true), refreshDetail(reference, true)]);
+    return entries.get(keyOf(reference)) ?? null;
+  },
     getSnapshot: () => snapshot,
     subscribe(listener: () => void) { subscribers.add(listener); return () => { subscribers.delete(listener); }; } };
 }
 
-export const assistantScheduleSync = createAssistantScheduleSync();
+export const assistantScheduleSync = createAssistantScheduleSync({ readSchedule: getSchedule });

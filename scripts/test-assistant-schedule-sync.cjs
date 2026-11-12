@@ -21,7 +21,7 @@ const problem = (status = 404) => json({ type: "https://example.invalid/problem"
 const tick = async () => { for (let n = 0; n < 150; n++) await Promise.resolve(); };
 
 // 실제 Schedule HTTP·DTO mapper·공유 캐시·Assistant orchestration을 실행하며 외부 I/O만 메모리 대역으로 둔다.
-function harness() {
+function harness({ withDetails = false } = {}) {
   const modules = new Map(), calls = [], data = new Map(); let config;
   const state = { refreshes: [], assistant: success(), scheduleHandle: null };
   const send = (url, options) => {
@@ -55,7 +55,10 @@ function harness() {
   const cacheModule = load("src/stores/serverScheduleStore.ts"), cache = cacheModule.serverScheduleStore;
   const refresh = cache.refreshAfterExternalChange;
   cache.refreshAfterExternalChange = (...args) => { state.refreshes.push(args); return refresh(...args); };
-  const sync = load("src/services/api/assistant-schedule-sync.ts").assistantScheduleSync;
+  const syncModule = load("src/services/api/assistant-schedule-sync.ts");
+  // 기존 목록 동기화 회귀는 단건 표시와 분리한다. 신규 통합 사례에서는 실제 기본 인스턴스를 사용한다.
+  const sync = withDetails ? syncModule.assistantScheduleSync : syncModule.createAssistantScheduleSync();
+  syncModule.assistantScheduleSync = sync;
   const mode = load("src/stores/scheduleDataModeStore.ts").scheduleDataModeStore;
   const entry = (q = query, server = serverId) => cache.store.getState().servers[server]?.queries[cacheModule.scheduleQueryKey(server, q)];
   return { load, sync, cache, cacheModule, mode, calls, state, data, entry,
@@ -64,6 +67,47 @@ function harness() {
     getCalls: () => calls.filter(call => !call.url.includes("/assistant/")),
     cacheData: () => cache.store.getState().servers[serverId] };
 }
+
+for (const operation of ["create", "update"]) test(`서버 ${operation} 카드: 목록 범위 밖 ID를 실제 단건 GET으로 표시하고 목록 GET도 유지`, async () => {
+  const h = harness({ withDetails: true });
+  h.state.scheduleHandle = async url => new URL(url).pathname.endsWith(`/schedules/${id(200)}`)
+    ? json(dto(200, { title: "범위 밖 최신 일정", scheduledAt: "2026-12-14T07:00:00Z", completed: operation === "update" })) : json({ items: [] });
+  const original = success(operation); await h.sync.observe(ref(), original); await tick();
+  const entry = h.sync.getSnapshot()[0]; assert.equal(entry.phase, "synchronized"); assert.equal(entry.detail.phase, "ready");
+  assert.equal(entry.detail.schedule.title, "범위 밖 최신 일정"); assert.equal(entry.detail.schedule.date, "2026-12-14");
+  assert.equal(entry.detail.schedule.time, "16:00"); assert.equal(entry.detail.schedule.category, "재고");
+  assert.equal(entry.detail.schedule.completed, operation === "update"); assert.equal(h.calls.length, 2);
+  assert.ok(h.calls.every(call => call.method === "GET")); assert.deepEqual(h.cacheData().queries[Object.keys(h.cacheData().queries)[0]].ids, []);
+  await h.sync.observe(ref(), original); await tick(); assert.equal(h.calls.length, 2);
+});
+
+test("카드 단건 GET 실패는 write 성공·목록 동기화와 분리하고 명시적 retry는 단건 GET만", async () => {
+  const h = harness({ withDetails: true }); let fail = true;
+  h.state.scheduleHandle = async url => new URL(url).pathname.endsWith(`/schedules/${id(200)}`)
+    ? fail ? problem(404) : json(dto()) : json({ items: [] });
+  const original = success(); await h.sync.observe(ref(), original); await tick();
+  assert.equal(original.result.outcome, "success"); assert.equal(h.sync.getSnapshot()[0].phase, "synchronized");
+  assert.equal(h.sync.getSnapshot()[0].detail.phase, "error");
+  fail = false; const count = h.calls.length;
+  await Promise.all([h.sync.retry(ref()), h.sync.retry(ref())]); await tick();
+  assert.equal(h.calls.length, count + 1); assert.equal(h.sync.getSnapshot()[0].detail.phase, "ready");
+  assert.ok(h.calls.every(call => call.method === "GET"));
+});
+
+test("서버 변경 뒤 늦은 카드 단건 GET은 ready 데이터나 현재 캐시로 반영하지 않음", async () => {
+  const h = harness({ withDetails: true }); let finish;
+  h.state.scheduleHandle = async url => new URL(url).pathname.endsWith(`/schedules/${id(200)}`)
+    ? new Promise(resolve => { finish = resolve; }) : json({ items: [] });
+  await h.sync.observe(ref(), success()); await tick(); h.server(otherOrigin); finish(json(dto())); await tick();
+  assert.equal(h.sync.getSnapshot()[0].detail.phase, "error");
+  assert.equal(h.cache.store.getState().serverId, `development:${otherOrigin}`);
+});
+
+test("delete·list 결과에는 새 단건 요약 조회를 실행하지 않음", async () => {
+  const h = harness({ withDetails: true }); h.state.scheduleHandle = async () => json({ items: [] });
+  await h.sync.observe(ref(), success("delete")); await tick(); assert.equal(h.calls.length, 1);
+  assert.equal(h.sync.getSnapshot()[0].detail, undefined);
+});
 
 for (const operation of ["create", "update", "delete"]) test(`8-A ${operation} 성공: 목록 GET만 실행·ID로 객체/삭제 상태를 만들지 않음`, async () => {
   const h = harness(), result = success(operation), original = JSON.stringify(result);

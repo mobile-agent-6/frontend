@@ -9,7 +9,7 @@ const root = path.resolve(__dirname, "..");
 
 // 실제 화면·Hook·서비스를 실행하되 native 컴포넌트와 React 실행기만 메모리 대역으로 둔다.
 // native 렌더링·레이아웃·아이폰 통신을 검증하는 테스트는 아니다.
-function harness(initialMode, { readOnly = false, assistantSyncUi = false } = {}) {
+function harness(initialMode, { readOnly = false, assistantSyncUi = false, assistantDetails = false } = {}) {
   const modules = new Map(), screens = [], calls = [], navigations = [];
   const assistantListeners = new Set();
   let assistantSnapshot;
@@ -55,6 +55,7 @@ function harness(initialMode, { readOnly = false, assistantSyncUi = false } = {}
       module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX,
     }, fileName: filename }).outputText;
     const resolve = (name) => {
+      if (name === "@/services/api/server-connection") return { serverConnection: { initialize: async () => null } };
       // Assistant의 서버 통신 검증은 전용 화면 테스트에서 실행한다.
       if (name === "@/services/api/assistant") return { assistantHttpClient: { getServerId: () => assistantSyncUi && config?.status === "ready" ? config.config.serverId : null } };
       if (name === "@/services/api/assistant-orchestrator") return { assistantOrchestrator: { startRequest: () => { throw new Error("Schedule 화면 검증에서 Assistant 전송 금지"); } } };
@@ -106,6 +107,10 @@ function harness(initialMode, { readOnly = false, assistantSyncUi = false } = {}
       (url, options) => new Promise((resolve, reject) => calls.push({ url, ...options, resolve, reject, transport: "global" })), FixedDate,
       { env: { EXPO_PUBLIC_SCHEDULE_DATA_MODE: initialMode,
         EXPO_PUBLIC_SCHEDULE_READ_ONLY: String(readOnly) } });
+    // 기존 목록·필터 회귀는 단건 카드 조회와 분리하며 카드 통합 사례에서만 함께 실행한다.
+    if (file === "src/services/api/assistant-schedule-sync.ts" && !assistantDetails) {
+      module.exports.assistantScheduleSync = module.exports.createAssistantScheduleSync();
+    }
     return module.exports;
   }
   const configModule = source("src/services/api/config.ts");

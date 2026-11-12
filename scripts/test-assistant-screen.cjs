@@ -25,8 +25,10 @@ const deferred = () => { let resolve; const promise = new Promise(r => { resolve
 // 실제 화면 Hook·HTTP·복구·polling을 실행하고 native·시계·storage·fetch만 프로세스 대역으로 둔다.
 // 실제 단말 렌더링·키보드·네트워크 시험은 아니다.
 function harness({ initialMode = "server", readOnly = false, data = new Map(), initialSnapshot, actualLifecycle = false, snapshotAtSubscribe, notifyOnSubscribe = false,
-  actualScheduleSync = false, initialSyncSnapshot = [], syncSnapshotAtSubscribe } = {}) {
+  actualScheduleSync = false, actualScheduleDetails = false, initialSyncSnapshot = [], syncSnapshotAtSubscribe } = {}) {
   const cache = new Map(), slots = [], effects = [], timers = new Map(), listeners = new Set();
+  const displayStates = new Map();
+  let displayOwner = null, displayCursor = 0;
   let cursor = 0, dirty = false, tree, wall = 1000, mono = 0, timerId = 0, closed = false, displaying = false;
   const state = { app: "active", calls: [], starts: [], uuidCalls: 0, failUuid: false, failStorage: false, throwMessage: false,
     cleanup: 0, storageCleanupCalls: [], manualCleanupCalls: [], lateUpdates: 0, mockRuns: 0, beforeUuid: null, config: null, failRead: false, beforeRead: null,
@@ -36,7 +38,13 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
     handle: async (url, init) => init.method === "POST" ? json(status(JSON.parse(init.body).requestId), 202) : json(done(url.split("/").pop())) };
   const same = (a, b) => a && b && a.length === b.length && a.every((v, i) => Object.is(v, b[i]));
   const react = {
-    useState(initial) { const i = cursor++; slots[i] ??= { value: typeof initial === "function" ? initial() : initial };
+    useState(initial) {
+      if (displayOwner) {
+        const owner = displayOwner, index = displayCursor++;
+        owner[index] ??= { value: typeof initial === "function" ? initial() : initial };
+        return [owner[index].value, next => { owner[index].value = typeof next === "function" ? next(owner[index].value) : next; }];
+      }
+      const i = cursor++; slots[i] ??= { value: typeof initial === "function" ? initial() : initial };
       return [slots[i].value, next => {
         if (closed) state.lateUpdates++;
         const value = typeof next === "function" ? next(slots[i].value) : next;
@@ -84,6 +92,10 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
     new Function("require", "module", "exports", "fetch", "setTimeout", "clearTimeout", "performance", "process", "Date", code)(resolve, module, module.exports,
       () => { throw Error("실제 네트워크 금지"); }, setTimer, clearTimer, { now: () => mono }, { env: { EXPO_PUBLIC_DEV_SERVER_BASE_URL: origin, EXPO_PUBLIC_SCHEDULE_DATA_MODE: initialMode, EXPO_PUBLIC_SCHEDULE_READ_ONLY: String(readOnly) } },
       ["assistant.tsx", "assistant-text-question.ts", "assistant-message.tsx"].some(name => file.endsWith(name)) ? class extends Date { static now() { return wall; } } : Date);
+    // 기존 목록 동기화 회귀에서는 카드 조회를 분리하며 신규 통합 사례에서 실제 단건 GET도 실행한다.
+    if (file.endsWith(path.join("src", "services", "api", "assistant-schedule-sync.ts")) && !actualScheduleDetails) {
+      module.exports.assistantScheduleSync = module.exports.createAssistantScheduleSync();
+    }
     return module.exports;
   }
   const source = file => load(path.join(root, file));
@@ -134,7 +146,14 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
     function expand(node) {
       if (!node || typeof node !== "object") return node;
       if (Array.isArray(node)) return node.map(expand);
-      if (typeof node.type === "function") { components.push({ name: node.type.name, props: node.props, key: node.key }); return expand(node.type(node.props)); }
+      if (typeof node.type === "function") {
+        components.push({ name: node.type.name, props: node.props, key: node.key });
+        const key = `${node.type.name}:${JSON.stringify(node.props?.value?.reference ?? node.props?.recoveryControl?.reference ?? node.key ?? "")}`;
+        if (!displayStates.has(key)) displayStates.set(key, []);
+        const previousOwner = displayOwner, previousCursor = displayCursor;
+        displayOwner = displayStates.get(key); displayCursor = 0;
+        try { return expand(node.type(node.props)); } finally { displayOwner = previousOwner; displayCursor = previousCursor; }
+      }
       return { ...node, props: { ...node.props, children: expand(node.props?.children) } };
     }
     return { list, components, rows: messages.map(item => expand(list.props.renderItem({ item }))), footer: expand(list.props.ListFooterComponent) };
@@ -378,7 +397,9 @@ for (const count of [0, 3]) test(`조회 items ${count}건: 정상 조회·실�
 for (const [operation, label] of [["create", "등록"], ["update", "수정"], ["delete", "삭제"]]) test(`outcome success/${operation}: 변경 ID 보존·추측 카드와 Schedule write 없음`, async () => {
   const result = { kind: "outcome", text: "서버 완료 문구", outcome: "success", operation, schedulesChanged: true, affectedScheduleIds: [summary.id] };
   await showResult(result, (h, view) => {
-    assert.ok(textOf(view.rows).includes(`${label} 완료`)); assert.equal(cards(view).length, 0);
+    if (operation === "delete") assert.ok(textOf(view.rows).includes(`${label} 완료`));
+    else assert.ok(!textOf(view.rows).includes(`${label} 완료`));
+    assert.equal(cards(view).length, 0);
     const mapped = view.components.find(item => item.name === "AssistantMessage").props.apiResult; assert.equal(mapped.schedulesChanged, true); assert.deepEqual(mapped.affectedScheduleIds, [summary.id]); assert.equal(Object.hasOwn(mapped, "items"), false);
   });
 });
@@ -1111,7 +1132,7 @@ for (const approved of [true, false]) test(`6-C 실제 ${approved ? "예" : "아
     assert.equal(confirmationButtons(h, message.id)[approved ? 1 : 0].props.accessibilityState.selected, true);
     assert.ok(confirmationButtons(h, message.id).every(button => button.props.disabled));
     assert.deepEqual(h.messages().at(-1).apiExecution.response.data.result, confirmationOutcome(approved));
-    assert.ok(textOf(h.renderConversation().rows).includes(approved ? "수정 완료" : "수정 취소됨"));
+    assert.ok(textOf(h.renderConversation().rows).includes(approved ? confirmationOutcome(true).text : "수정 취소됨"));
     assert.equal(h.find("MessageInput").value, "사용자 초안 유지"); assert.equal(h.state.uuidCalls, 2);
     assert.ok(h.state.calls.every(call => call.url.startsWith(`${origin}/api/v1/assistant/requests`)));
     assert.strictEqual(h.mock.getState().schedules, before); assert.equal(h.state.mockRuns, 0); assert.equal(h.state.cleanup, 0);
@@ -1820,8 +1841,15 @@ const cleanupData = (...references) => new Map([["assistant.requestRecovery.v1",
 function cleanupButton(h, requestId, action) {
   const view = h.renderConversation(), control = h.find("ConversationList").recoveryControls.find(value => value.reference.requestId === requestId);
   assert.ok(control, "정리 대상 서버·요청이 UI에 있어야 한다");
-  const container = nodes([view.rows, view.footer], "View").find(node => node.props.testID ===
+  let container = nodes([view.rows, view.footer], "View").find(node => node.props.testID ===
     `assistant-recovery-record-${JSON.stringify([control.reference.serverId, requestId.toLowerCase()])}`);
+  // 실제 UI의 보조 영역을 명시적으로 펼친 뒤 기존 정리 action을 실행한다.
+  const toggle = nodes(container, "Pressable").find(button => button.props.testID === "assistant-recovery-toggle");
+  if (toggle && !toggle.props.accessibilityState.expanded) {
+    toggle.props.onPress(); const expanded = h.renderConversation();
+    container = nodes([expanded.rows, expanded.footer], "View").find(node => node.props.testID ===
+      `assistant-recovery-record-${JSON.stringify([control.reference.serverId, requestId.toLowerCase()])}`);
+  }
   return nodes(container, "Pressable").find(button => button.props.testID === `assistant-recovery-${action}`);
 }
 function clickCleanup(h, requestId, action) {
@@ -1997,7 +2025,7 @@ for (const value of ["unconfirmed", "accepted", "processing", "need_more_info", 
     h.publishSnapshot(snapshotOf([])); h.render(); await readyCleanup(h);
     assert.equal(cleanupButton(h, ref.requestId, "confirm-manual"), undefined);
     clickCleanup(h, ref.requestId, "manual"); await readyCleanup(h); assert.ok(await h.storage.read(ref));
-    const warning = textOf(h.renderConversation().footer); assert.ok(warning.includes(ref.serverId)); assert.ok(warning.includes(ref.requestId));
+    const warning = textOf(h.renderConversation().footer); assert.ok(warning.includes(ref.serverId.replace(/^development:/, ""))); assert.ok(warning.includes(ref.requestId));
     assert.ok(warning.includes("보류 해제가 아니")); assert.equal(h.state.manualCleanupCalls.length, 0);
     const press = cleanupButton(h, ref.requestId, "confirm-manual").props.onPress; press(); press(); await readyCleanup(h);
     assert.equal(await h.storage.read(ref), null); assert.ok(await h.storage.read(other)); assert.equal(h.state.manualCleanupCalls.length, 1);
@@ -2166,6 +2194,63 @@ const syncStatus8b = (h, requestId) => {
 const syncRetry8b = (h, requestId) => nodes(syncStatus8b(h, requestId), "Pressable").find(node => node.props.testID === "assistant-schedule-sync-retry");
 const syncCalls8b = h => h.state.calls.filter(call => new URL(call.url).pathname === "/api/v1/schedules");
 const scheduleDto8b = (extra = {}) => ({ ...summary, createdAt: "2026-11-01T00:00:00Z", ...extra });
+
+test("등록 화면→실제 orchestrator→Schedule 목록·단건 GET→기존 카드 통합", async () => {
+  const h = harness({ actualScheduleSync: true, actualScheduleDetails: true }); try {
+    h.state.handle = async (url, options) => {
+      const route = new URL(url).pathname;
+      if (route === "/api/v1/schedules") return json({ items: [] });
+      if (route === `/api/v1/schedules/${summary.id}`) return json(scheduleDto8b({ title: "목록 밖 등록 일정", scheduledAt: "2026-12-14T07:00:00Z" }));
+      return options.method === "POST" ? json(status(JSON.parse(options.body).requestId), 202)
+        : json({ ...done(route.split("/").pop()), result: writeOutcome8b() });
+    };
+    h.send("고정 등록 요청"); await readyCleanup(h);
+    const view = h.renderConversation(); assert.equal(cards(view).length, 1);
+    assert.equal(cards(view)[0].props.schedule.title, "목록 밖 등록 일정");
+    assert.equal(cards(view)[0].props.schedule.time, "16:00");
+    assert.equal(postedBodies(h).length, 1); assert.equal(h.state.mockRuns, 0);
+    const scheduleCalls = h.state.calls.filter(call => new URL(call.url).pathname.startsWith("/api/v1/schedules"));
+    assert.equal(scheduleCalls.length, 2); assert.ok(scheduleCalls.every(call => call.init.method === "GET"));
+  } finally { h.close(); }
+});
+
+for (const operation of ["create", "update"]) test(`서버 ${operation} 성공 말풍선은 실제 GET 요약 카드·원문·완료 상태를 표시`, async () => {
+  const h = harness(); try {
+    h.state.handle = responseWith({ ...writeOutcome8b(), operation }); h.send("일정 변경"); await readyCleanup(h);
+    const reference = h.messages().at(-1).apiExecution.reference;
+    const schedule = { id: summary.id, title: "최신 일정 정보", date: "2026-12-14", time: "16:00", category: "재고", completed: operation === "update" };
+    h.publishSync([{ reference, phase: "synchronized", failedQueries: [], errors: [], detail: { phase: "ready", schedule } }]);
+    const view = h.renderConversation(); assert.equal(cards(view).length, 1); assert.deepEqual(cards(view)[0].props.schedule, schedule);
+    assert.ok(textOf(view.rows).includes("최신 일정 정보")); assert.ok(textOf(view.rows).includes(h.messages().at(-1).text));
+    assert.equal(h.state.mockRuns, 0); assert.ok(h.state.calls.every(call => call.url.includes("/assistant/")));
+  } finally { h.close(); }
+});
+
+test("요약 카드 실패는 원문 성공을 유지하고 retry 연타는 GET 동기화 경계 한 번만 호출", async () => {
+  const h = harness(); try {
+    h.state.handle = responseWith(writeOutcome8b()); h.send("등록"); await readyCleanup(h);
+    const reference = h.messages().at(-1).apiExecution.reference;
+    h.publishSync([{ reference, phase: "synchronized", failedQueries: [], errors: [], detail: { phase: "error" } }]);
+    const row = h.renderConversation().rows.at(-1); assert.ok(textOf(row).includes("일정 요약을 불러오지 못했어요"));
+    const retry = nodes(row, "Pressable").find(button => textOf(button).includes("일정 요약 다시 불러오기"));
+    const before = postedBodies(h).length; retry.props.onPress(); retry.props.onPress(); await h.settle();
+    assert.equal(h.state.syncRetries.length, 1); assert.equal(postedBodies(h).length, before);
+    assert.equal(h.messages().at(-1).apiExecution.response.data.result.outcome, "success");
+  } finally { h.close(); }
+});
+
+test("일반 성공의 ID·복구 버튼은 기본 접힘, 명시적 펼치기로 결과 확인·정리 가능", async () => {
+  const h = harness(); try {
+    h.send("조회"); await readyCleanup(h); const reference = h.messages().at(-1).apiExecution.reference;
+    let view = h.renderConversation(); assert.ok(!textOf(view.rows).includes(reference.serverId));
+    assert.ok(!textOf(view.rows).includes(reference.requestId));
+    const toggle = nodes(view.rows, "Pressable").find(button => button.props.testID === "assistant-recovery-toggle");
+    assert.equal(toggle.props.accessibilityState.expanded, false); toggle.props.onPress(); view = h.renderConversation();
+    assert.ok(textOf(view.rows).includes(reference.requestId));
+    const confirm = nodes(view.rows, "Pressable").find(button => button.props.testID === "assistant-recovery-result");
+    assert.ok(confirm); confirm.props.onPress(); await readyCleanup(h); assert.equal(await h.storage.read(reference), null);
+  } finally { h.close(); }
+});
 function routeSync8b(h, read, result = writeOutcome8b()) {
   h.state.handle = (url, init) => new URL(url).pathname === "/api/v1/schedules" ? read(url, init)
     : init.method === "POST" ? json(status(JSON.parse(init.body).requestId), 202) : json({ ...done(url.split("/").pop()), result });

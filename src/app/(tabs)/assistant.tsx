@@ -384,7 +384,7 @@ export default function AssistantScreen() {
         return;
       }
       const serverId = assistantHttpClient.getServerId();
-      if (!serverId) { reportError("Assistant 서버 설정을 확인해 주세요."); return; }
+      if (!serverId) { reportError("Assistant 서버 설정을 확인해 주세요. 설정에서 주소를 연결 확인하고 저장해 주세요."); return; }
       const canStart = () => {
         const snapshot = assistantLifecycle.getSnapshot();
         if (snapshot.serverId === serverId && snapshot.initialCheck === "checked") return true;
@@ -671,7 +671,7 @@ export default function AssistantScreen() {
       assistantHttpClient.getServerId() === viewServerId && scheduleDataModeStore.getState().generation === generation;
     if (!current() || scheduleSyncRetryLocksRef.current.has(key)) return;
     const entry = assistantScheduleSync.getSnapshot().find(value => assistantRecoveryKey(value.reference) === key);
-    if (!entry || !["refresh-error", "interrupted"].includes(entry.phase)) return;
+    if (!entry || (!["refresh-error", "interrupted"].includes(entry.phase) && entry.detail?.phase !== "error")) return;
     const message = committedMessagesRef.current.find(value => value.role === "assistant" && value.apiExecution &&
       assistantRecoveryKey(value.apiExecution.reference) === key);
     const execution = message?.role === "assistant" ? message.apiExecution : undefined;

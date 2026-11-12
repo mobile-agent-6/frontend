@@ -1,4 +1,5 @@
 import { createStore } from "zustand/vanilla";
+import { subscribeServerConfiguration } from "@/services/api/config";
 
 import { scheduleHttpClient, type HttpError } from "@/services/api/http";
 import { getSchedule, listSchedules, prepareScheduleDeletion, prepareScheduleUpdate } from "@/services/api/schedules";
@@ -582,3 +583,5 @@ export function getScheduleCoverage(entry: ScheduleQueryEntry | undefined, from:
 
 // 생성만으로 조회하지 않는다. 기존 Mock 화면에서는 import하지 않는다.
 export const serverScheduleStore = createServerScheduleStore();
+// 렌더 사이 주소를 왕복 변경해도 이전 서버의 진행 GET·mutation을 즉시 무효화한다.
+subscribeServerConfiguration(() => serverScheduleStore.syncServer());

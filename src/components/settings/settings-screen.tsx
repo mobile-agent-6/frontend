@@ -1,4 +1,7 @@
 import { useEffect, useRef, useState } from "react";
+import { useStore } from "zustand";
+import { ServerSettingsScreen } from "@/components/settings/server-settings-screen";
+import { scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
 import {
   KeyboardAvoidingView,
   Platform,
@@ -56,6 +59,11 @@ const initialVerification: Verification = {
 };
 
 export function SettingsScreen() {
+  const mode = useStore(scheduleDataModeStore, state => state.mode);
+  return mode === "mock" ? <MockSettingsScreen /> : <ServerSettingsScreen />;
+}
+
+function MockSettingsScreen() {
   const theme = useTheme();
   const colorScheme = useColorScheme();
   const [inputIp, setInputIp] = useState("");
