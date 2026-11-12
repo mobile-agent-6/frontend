@@ -34,7 +34,7 @@ export function assistantHttpErrorNotice(error: AssistantHttpError): string {
       case "server-mismatch": case "context-changed": return "서버 설정이 바뀌어 요청을 확인하지 못했어요. 원래 서버 설정을 확인해 주세요.";
       case "aborted": return "앱에서 확인을 중단했어요. 서버 취소가 아니며 원래 요청의 결과 확인이 필요해요.";
       case "policy": return "현재 실행 모드에서는 요청을 보낼 수 없어요. 설정을 확인해 주세요.";
-      case "configuration": return "Assistant 서버 설정을 확인해 주세요. 설정에서 주소를 연결 확인하고 저장해 주세요.";
+      case "configuration": return "Assistant 서버 설정을 확인해 주세요.";
       default: return "요청을 보내지 못했어요. 입력 형식을 확인해 주세요.";
     }
   }

@@ -384,7 +384,7 @@ export default function AssistantScreen() {
         return;
       }
       const serverId = assistantHttpClient.getServerId();
-      if (!serverId) { reportError("Assistant 서버 설정을 확인해 주세요. 설정에서 주소를 연결 확인하고 저장해 주세요."); return; }
+      if (!serverId) { reportError("Assistant 서버 설정을 확인해 주세요."); return; }
       const canStart = () => {
         const snapshot = assistantLifecycle.getSnapshot();
         if (snapshot.serverId === serverId && snapshot.initialCheck === "checked") return true;

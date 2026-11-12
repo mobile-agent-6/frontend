@@ -1,5 +1,4 @@
 import { createStore } from "zustand/vanilla";
-import { subscribeServerConfiguration } from "@/services/api/config";
 
 export type ScheduleDataMode = "mock" | "server";
 
@@ -24,9 +23,6 @@ export const scheduleDataModeStore = createStore<{
     mode, generation: state.generation + 1,
   }),
 }));
-
-// 주소를 왕복 변경해도 이전 서버 세대의 진행 요청을 재사용하지 않는다.
-subscribeServerConfiguration(() => scheduleDataModeStore.setState(state => ({ generation: state.generation + 1 })));
 
 export function isMockScheduleMode(generation?: number) {
   const current = scheduleDataModeStore.getState();

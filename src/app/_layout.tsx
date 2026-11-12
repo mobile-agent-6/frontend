@@ -11,7 +11,6 @@ import { useEffect, useRef } from "react";
 import { Platform, useColorScheme } from "react-native";
 
 import { assistantLifecycle } from "@/services/api/assistant-lifecycle";
-import { serverConnection } from "@/services/api/server-connection";
 
 export default function RootLayout() {
   const colorScheme = useColorScheme();
@@ -20,15 +19,7 @@ export default function RootLayout() {
   const router = useRouter();
   const hasHandledInitialRoute = useRef(false);
 
-  useEffect(() => {
-    let mounted = true;
-    let detach: (() => void) | undefined;
-    // 주소 복원이 끝난 뒤 현재 서버의 GET-only 복구를 시작한다. 복원 실패는 앱을 막지 않는다.
-    void serverConnection.initialize().catch(() => undefined).then(() => {
-      if (mounted) detach = assistantLifecycle.attach();
-    });
-    return () => { mounted = false; detach?.(); };
-  }, []);
+  useEffect(() => assistantLifecycle.attach(), []);
 
   useEffect(() => {
     const handleInitialRoute = () => {

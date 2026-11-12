@@ -8,7 +8,6 @@ import type { ScheduleDateRange, ScheduleListQuery } from "@/utils/schedule-quer
 
 /** 명시적으로 활성화한 소비자만 조회하며 선택 날짜는 기존 성공 coverage를 재사용한다. */
 export function useServerScheduleData(query: ScheduleListQuery, enabled = false, coverageRange?: ScheduleDateRange) {
-  const configurationGeneration = useStore(scheduleDataModeStore, state => state.generation);
   const state = useStore(serverScheduleStore.store);
   const subscription = useRef<{ release: () => void; retry: () => Promise<void> } | null>(null);
   const config = getDevelopmentServerConfig();
@@ -35,7 +34,7 @@ export function useServerScheduleData(query: ScheduleListQuery, enabled = false,
     const consumer = serverScheduleStore.acquire(prepared.query);
     subscription.current = consumer;
     return consumer.release;
-  }, [enabled, serverId, prepared, configurationGeneration]);
+  }, [enabled, serverId, prepared]);
   const key = serverId && prepared.query ? scheduleQueryKey(serverId, prepared.query) : null;
   // effect가 서버 세대를 전환하기 전 렌더에서는 이전 서버의 성공 이력을 노출하지 않는다.
   const entry = key ? cache?.queries[key] : undefined;
@@ -93,7 +92,6 @@ export function useScheduleCompletion(serverId: string | null, enabled: boolean)
 
 /** 단건 성공은 공유 객체에만 반영하며 목록 coverage를 만들지 않는다. */
 export function useServerScheduleDetail(scheduleId: string | undefined, enabled = false) {
-  const configurationGeneration = useStore(scheduleDataModeStore, state => state.generation);
   const state = useStore(serverScheduleStore.store);
   const subscription = useRef<{ release: () => void; retry: () => Promise<void> } | null>(null);
   const config = getDevelopmentServerConfig();
@@ -105,7 +103,7 @@ export function useServerScheduleDetail(scheduleId: string | undefined, enabled 
     const consumer = serverScheduleStore.acquireDetail(scheduleId);
     subscription.current = consumer;
     return consumer.release;
-  }, [enabled, serverId, scheduleId, configurationGeneration]);
+  }, [enabled, serverId, scheduleId]);
   const cache = serverId && state.serverId === serverId ? state.servers[serverId] : undefined;
   const entry = scheduleId ? cache?.details[scheduleId] : undefined;
   const localError = enabled && (config.status !== "ready" ? {

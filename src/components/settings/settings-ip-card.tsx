@@ -8,10 +8,6 @@ import { Spacing } from "@/constants/theme";
 import { useTheme } from "@/hooks/use-theme";
 
 type SettingsIpCardProps = {
-  label?: string;
-  description?: string;
-  placeholder?: string;
-  urlInput?: boolean;
   inputIp: string;
   hasIpInput: boolean;
   hasCurrentResult: boolean;
@@ -27,10 +23,6 @@ type SettingsIpCardProps = {
 };
 
 export function SettingsIpCard({
-  label = "서버 주소 (Pi IP)",
-  description = "Orange Pi 핫스팟에 연결한 뒤 Pi IP를 입력하세요",
-  placeholder = "192.168.0.1",
-  urlInput = false,
   inputIp,
   hasIpInput,
   hasCurrentResult,
@@ -48,7 +40,7 @@ export function SettingsIpCard({
   return (
     <View style={styles.addressSection}>
       <View style={styles.labelRow}>
-        <ThemedText style={styles.label}>{label}</ThemedText>
+        <ThemedText style={styles.label}>서버 주소 (Pi IP)</ThemedText>
         {connectionBadge}
       </View>
 
@@ -73,7 +65,7 @@ export function SettingsIpCard({
           />
         </View>
         <TextInput
-          accessibilityLabel={label}
+          accessibilityLabel="서버 주소 (Pi IP)"
           accessibilityHint={
             hasCurrentResult
               ? isTimeMismatch
@@ -81,7 +73,7 @@ export function SettingsIpCard({
                 : "연결 확인을 완료한 주소입니다."
               : hasIpInput
                 ? "아직 연결을 확인하지 않은 주소입니다."
-                : "서버 주소를 입력하세요."
+                : "Pi IP를 입력하세요."
           }
           editable={!isProcessing}
           accessibilityState={{ disabled: isProcessing }}
@@ -89,11 +81,11 @@ export function SettingsIpCard({
           autoComplete="off"
           autoCorrect={false}
           keyboardType={
-            urlInput ? "url" : Platform.OS === "ios" ? "numbers-and-punctuation" : "decimal-pad"
+            Platform.OS === "ios" ? "numbers-and-punctuation" : "decimal-pad"
           }
           onChangeText={onIpChange}
           spellCheck={false}
-          placeholder={placeholder}
+          placeholder="192.168.0.1"
           placeholderTextColor={theme.textSecondary}
           style={[styles.textInput, { color: theme.text }]}
           value={inputIp}
@@ -118,7 +110,7 @@ export function SettingsIpCard({
         themeColor="textSecondary"
         style={styles.description}
       >
-        {description}
+        Orange Pi 핫스팟에 연결한 뒤 Pi IP를 입력하세요
       </ThemedText>
     </View>
   );

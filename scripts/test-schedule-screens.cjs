@@ -55,7 +55,6 @@ function harness(initialMode, { readOnly = false, assistantSyncUi = false, assis
       module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX,
     }, fileName: filename }).outputText;
     const resolve = (name) => {
-      if (name === "@/services/api/server-connection") return { serverConnection: { initialize: async () => null } };
       // Assistant의 서버 통신 검증은 전용 화면 테스트에서 실행한다.
       if (name === "@/services/api/assistant") return { assistantHttpClient: { getServerId: () => assistantSyncUi && config?.status === "ready" ? config.config.serverId : null } };
       if (name === "@/services/api/assistant-orchestrator") return { assistantOrchestrator: { startRequest: () => { throw new Error("Schedule 화면 검증에서 Assistant 전송 금지"); } } };
