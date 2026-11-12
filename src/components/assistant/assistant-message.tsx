@@ -13,6 +13,7 @@ import type { Schedule } from "@/types/schedule";
 import type { AssistantResultDisplay } from "@/utils/assistant-mapper";
 import { assistantFailureAdvice } from "@/utils/assistant-errors";
 import type { AssistantUncertainView } from "@/utils/assistant-uncertain";
+import type { AssistantRecoveryControl, AssistantRecoveryControlAction } from "@/utils/assistant-recovery-cleanup";
 
 type AssistantMessageProps = {
   text: string;
@@ -33,6 +34,8 @@ type AssistantMessageProps = {
   uncertainActionsDisabled?: boolean;
   onUncertainCheck?: () => void;
   onUncertainAcknowledge?: () => void;
+  recoveryControl?: AssistantRecoveryControl;
+  onRecoveryAction?: (action: AssistantRecoveryControlAction) => void;
 };
 
 export function AssistantMessage({
@@ -54,6 +57,8 @@ export function AssistantMessage({
   uncertainActionsDisabled = false,
   onUncertainCheck,
   onUncertainAcknowledge,
+  recoveryControl,
+  onRecoveryAction,
 }: AssistantMessageProps) {
   const theme = useTheme();
   const confirmationDisabled = interactionsDisabled || interaction?.resolved || !onDeleteConfirmation;
@@ -83,8 +88,41 @@ export function AssistantMessage({
           processing={interactionsDisabled}
         />
       )}
+      {recoveryControl && <RecoveryActions value={recoveryControl} onAction={onRecoveryAction} />}
     </ThemedView>
   );
+}
+
+function RecoveryActions({ value, onAction }: { value: AssistantRecoveryControl;
+  onAction?: (action: AssistantRecoveryControlAction) => void }) {
+  const theme = useTheme();
+  const done = value.phase === "removed" || value.phase === "not-found";
+  const disabled = !onAction || value.phase === "working";
+  const button = (action: AssistantRecoveryControlAction, label: string) => (
+    <Pressable key={action} testID={`assistant-recovery-${action}`} accessibilityRole="button" disabled={disabled}
+      accessibilityState={{ disabled }} onPress={disabled ? undefined : () => onAction?.(action)}
+      style={[styles.buttonBase, { backgroundColor: theme.primaryForeground }, disabled && styles.disabled]}>
+      <ThemedText themeColor="primary">{label}</ThemedText>
+    </Pressable>
+  );
+  return <View style={styles.candidates} testID={`assistant-recovery-record-${JSON.stringify([value.reference.serverId, value.reference.requestId.toLowerCase()])}`}>
+    <ThemedText type="small" themeColor="primaryForeground">서버: {value.reference.serverId}{"\n"}요청 ID: {value.reference.requestId}</ThemedText>
+    {value.phase && <ThemedText type="small" themeColor="primaryForeground">{{
+      confirming: "이 서버의 이 요청에 대한 로컬 복구 기록만 지워요. 서버 작업은 취소되지 않으며 과거 변경이 반영됐을 수 있어요. 성공·실패 판정이나 uncertain 보류 해제가 아니에요. 자동 복구 대상에서 빠지므로 같은 작업을 다시 보내지 마세요.",
+      working: "로컬 복구 기록을 정리하고 있어요.",
+      removed: "로컬 복구 기록을 정리했어요. 서버의 작업·결과·보류 상태는 바뀌지 않아요.",
+      "not-found": "이 요청의 로컬 복구 기록은 이미 없어요. 서버 상태는 바뀌지 않아요.",
+      retained: "정리 조건이 확인되지 않아 복구 기록을 유지했어요.",
+      failed: "복구 기록을 정리하지 못했어요. 저장 상태를 확인해 주세요. 요청을 다시 실행하지 않았어요.",
+    }[value.phase]}</ThemedText>}
+    {!done && (value.phase === "confirming" ? <>
+      {button("confirm-manual", "위험을 확인했고 로컬 기록만 정리")}{button("keep", "복구 기록 유지")}
+    </> : <>
+      {value.resultConfirmable && button("result", "결과 확인 및 복구 기록 정리")}
+      {value.expiryConfirmable && button("expiry", "상세 보관 종료 안내 확인 및 기록 정리")}
+      {button("manual", "로컬 복구 기록 수동 정리")}
+    </>)}
+  </View>;
 }
 
 function UncertainActions({ value, errorText, disabled, onCheck, onAcknowledge }: {

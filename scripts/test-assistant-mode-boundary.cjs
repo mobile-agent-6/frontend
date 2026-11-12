@@ -44,6 +44,8 @@ function harness(initialMode = "mock") {
       if (name === "@/services/api/assistant") return { assistantHttpClient: { getServerId: () => null } };
       if (name === "@/services/api/assistant-orchestrator") return { assistantOrchestrator: { startRequest: () => { throw new Error("서버 설정 없이 전송 금지"); } } };
       if (name === "@/services/api/assistant-lifecycle") return { assistantLifecycle: { getSnapshot: () => ({ phase: "idle", initialCheck: "pending", serverId: null, results: [] }), subscribe: () => () => {} } };
+      // 실제 사용자 저장소를 읽지 않는다. 정리·저장 안전성은 전용 Assistant 화면 테스트에서 검증한다.
+      if (name === "@/services/storage/assistant-recovery") return { assistantRecoveryStorage: { readAll: async () => [] } };
       if (name === "react") return react;
       if (name === "react/jsx-runtime") return { jsx: (type, props) => ({ type, props }), jsxs: (type, props) => ({ type, props }) };
       if (name === "react-native") return { KeyboardAvoidingView: "KeyboardAvoidingView", Platform: { OS: "ios" }, StyleSheet: { create: (s) => s } };

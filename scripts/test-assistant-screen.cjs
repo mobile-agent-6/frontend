@@ -28,7 +28,7 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
   const cache = new Map(), slots = [], effects = [], timers = new Map(), listeners = new Set();
   let cursor = 0, dirty = false, tree, wall = 1000, mono = 0, timerId = 0, closed = false, displaying = false;
   const state = { app: "active", calls: [], starts: [], uuidCalls: 0, failUuid: false, failStorage: false, throwMessage: false,
-    cleanup: 0, lateUpdates: 0, mockRuns: 0, beforeUuid: null, config: null, failRead: false, beforeRead: null,
+    cleanup: 0, storageCleanupCalls: [], manualCleanupCalls: [], lateUpdates: 0, mockRuns: 0, beforeUuid: null, config: null, failRead: false, beforeRead: null,
     recoveryListeners: new Set(), lastRecoveryListener: null, beforeSubscribe: null, initializations: 0, unsubscribed: 0,
     snapshot: initialSnapshot ?? { phase: "settled", initialCheck: "checked", serverId, results: [] },
     handle: async (url, init) => init.method === "POST" ? json(status(JSON.parse(init.body).requestId), 202) : json(done(url.split("/").pop())) };
@@ -85,7 +85,11 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
   const recovery = source("src/services/api/assistant-request-recovery.ts").createAssistantRequestRecovery({ http, recovery: storage, now: () => wall });
   const api = source("src/services/api/assistant-orchestrator.ts");
   const orchestrator = api.createAssistantOrchestrator({ http, requests: recovery, storage: { ...storage, cleanup: async (...args) => { state.cleanup++; return storage.cleanup(...args); } }, clock: { now: () => wall, monotonicNow: () => mono } });
+  const originalCleanup = storage.cleanup, originalManualCleanup = storage.removeManually;
+  storage.cleanup = (...args) => { state.storageCleanupCalls.push(args); return originalCleanup(...args); };
+  storage.removeManually = (...args) => { state.manualCleanupCalls.push(args); return originalManualCleanup(...args); };
   const delegate = { startRequest: (...args) => { state.starts.push(args); return orchestrator.startRequest(...args); },
+    confirmResultDisplayed: (...args) => orchestrator.confirmResultDisplayed(...args),
     queryRequestOnce: (...args) => orchestrator.queryRequestOnce(...args) }; api.assistantOrchestrator = delegate;
   const mode = source("src/stores/scheduleDataModeStore.ts"), mock = source("src/stores/scheduleStore.ts").useScheduleStore;
   const lifecycleModule = source("src/services/api/assistant-lifecycle.ts");
@@ -118,7 +122,7 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
       if (typeof node.type === "function") { components.push({ name: node.type.name, props: node.props, key: node.key }); return expand(node.type(node.props)); }
       return { ...node, props: { ...node.props, children: expand(node.props?.children) } };
     }
-    return { list, components, rows: messages.map(item => expand(list.props.renderItem({ item }))) };
+    return { list, components, rows: messages.map(item => expand(list.props.renderItem({ item }))), footer: expand(list.props.ListFooterComponent) };
   }
   render();
   return { state, source, storage, data, mock, mode, delegate, lifecycle, render, renderConversation, find, settle, advance, timers, listeners,
@@ -255,6 +259,9 @@ function nodes(node, type) {
   if (Array.isArray(node)) return node.flatMap(item => nodes(item, type));
   return [...(node.type === type ? [node] : []), ...nodes(node.props?.children, type)];
 }
+function interactionButtons(node) {
+  return nodes(node, "Pressable").filter(button => !button.props.testID?.startsWith("assistant-recovery-"));
+}
 function textOf(node) {
   if (node == null || typeof node === "boolean") return "";
   if (typeof node !== "object") return String(node);
@@ -292,7 +299,7 @@ for (const kind of Object.keys(results)) test(`실제 목록→메시지→카�
       assert.equal(props.apiResult.code, result.code); assert.equal(props.apiResult.nextAction, result.nextAction); assert.equal(cards(view).length, 0);
       assert.ok(textOf(view.rows).includes(kind === "failure" ? "처리 실패" : "결과 미확인")); assert.equal(Object.hasOwn(props.apiResult, "schedulesChanged"), false);
     }
-    for (const button of nodes(view.rows, "Pressable")) {
+    for (const button of interactionButtons(view.rows)) {
       const candidate = kind === "candidate_selection", interactive = candidate || kind === "confirmation" || kind === "uncertain";
       assert.equal(button.props.disabled, !interactive); assert.equal(button.props.accessibilityState.disabled, !interactive);
       if (interactive) { if (candidate) assert.equal(button.props.accessibilityState.selected, false); assert.equal(typeof button.props.onPress, "function"); }
@@ -306,7 +313,7 @@ for (const count of [2, 10]) test(`후보 ${count}건 전체·opaque key·5종 c
   const categories = ["INBOUND", "INVENTORY", "OUTBOUND", "RETURN", "OTHER"], labels = ["입고", "재고", "출고", "반품", "기타"];
   const candidates = Array.from({ length: count }, (_, n) => ({ candidateId: `opaque:/선택 값 ${n}`, title: `후보 ${n}`, scheduledAt: "2026-11-12T15:05:32.123456Z", category: categories[n % 5] }));
   await showResult({ ...results.candidate_selection, candidates }, (h, view) => {
-    const buttons = nodes(view.rows, "Pressable"); assert.equal(buttons.length, count); assert.equal(cards(view).length, count);
+    const buttons = interactionButtons(view.rows); assert.equal(buttons.length, count); assert.equal(cards(view).length, count);
     for (let n = 0; n < count; n++) {
       assert.equal(buttons[n].key, candidates[n].candidateId); const display = cards(view)[n].props.schedule;
       assert.equal(display.candidateId, candidates[n].candidateId); assert.equal(display.title, candidates[n].title); assert.equal(display.category, labels[n % 5]);
@@ -323,7 +330,7 @@ test("update 확인의 실제 target·제목/일시/category/completed 변경 �
     const body = textOf(view.rows); assert.match(body, /수정 대상/); assert.match(body, /제목: 원본 일정 → 변경 제목/);
     assert.match(body, /일시: 11월 13일 \(금\) 오전 12:05 → 11월 13일 \(금\) 오후 1:10/); assert.match(body, /분류: 반품 → 출고/); assert.match(body, /완료 상태: 미완료 → 완료/);
     assert.equal(cards(view).length, 1); assert.equal(cards(view)[0].props.schedule.id, summary.id); assert.equal(cards(view)[0].props.schedule.title, summary.title);
-    assert.equal(nodes(view.rows, "Pressable").length, 2);
+    assert.equal(interactionButtons(view.rows).length, 2);
   });
 });
 
@@ -333,7 +340,7 @@ test("delete 확인에는 target과 예/아니요만 있고 changes 합성 없�
     const props = view.components.find(item => item.name === "AssistantMessage").props;
     assert.equal(props.apiResult.operation, "delete"); assert.equal(Object.hasOwn(props.apiResult, "changes"), false);
     assert.match(textOf(view.rows), /삭제 대상/); assert.doesNotMatch(textOf(view.rows), /완료 상태:|제목:|일시:|분류:/); assert.equal(cards(view).length, 1);
-    assert.deepEqual(nodes(view.rows, "Pressable").map(button => textOf(button)), ["아니요", "예"]);
+    assert.deepEqual(interactionButtons(view.rows).map(button => textOf(button)), ["아니요", "예"]);
   });
 });
 
@@ -347,7 +354,7 @@ for (const completed of [true, false]) test(`완료 변경 ${completed}는 updat
 for (const count of [0, 3]) test(`조회 items ${count}건: 정상 조회·실제 일정 ID/card key·선택/전송 없음`, async () => {
   const items = Array.from({ length: count }, (_, n) => ({ ...summary, id: id(400 + n), title: `조회 일정 ${n}`, completed: n % 2 === 0 }));
   await showResult({ ...results.outcome, items }, (h, view) => {
-    assert.equal(cards(view).length, count); assert.match(textOf(view.rows), /조회 완료/); assert.equal(nodes(view.rows, "Pressable").length, 0);
+    assert.equal(cards(view).length, count); assert.match(textOf(view.rows), /조회 완료/); assert.equal(interactionButtons(view.rows).length, 0);
     cards(view).forEach((card, n) => { assert.equal(card.key, items[n].id); assert.equal(card.props.schedule.id, items[n].id); assert.equal(card.props.schedule.completed, items[n].completed); assert.equal(card.props.showCompleted, true); });
   });
 });
@@ -385,9 +392,9 @@ test("취소 결과에 operation이 있으면 해당 작업만 표시하고 없�
 
 test("실제 Mock 후보·예/아니요는 활성 상태와 기존 삭제 동작 유지", async () => {
   const h = harness({ initialMode: "mock" }); try {
-    h.send("재고 일정 삭제해 줘"); await h.advance(700); let view = h.renderConversation(), buttons = nodes(view.rows, "Pressable");
+    h.send("재고 일정 삭제해 줘"); await h.advance(700); let view = h.renderConversation(), buttons = interactionButtons(view.rows);
     assert.ok(buttons.length >= 2); assert.equal(buttons[0].props.disabled, false); buttons[0].props.onPress(); h.render();
-    view = h.renderConversation(); buttons = nodes(view.rows.at(-1), "Pressable"); assert.deepEqual(buttons.map(textOf), ["아니요", "예"]); assert.ok(buttons.every(button => !button.props.disabled));
+    view = h.renderConversation(); buttons = interactionButtons(view.rows.at(-1)); assert.deepEqual(buttons.map(textOf), ["아니요", "예"]); assert.ok(buttons.every(button => !button.props.disabled));
     const before = h.mock.getState().schedules.length; buttons[1].props.onPress(); h.render(); assert.equal(h.mock.getState().schedules.length, before - 1); assert.equal(h.state.calls.length, 0);
   } finally { h.close(); }
 });
@@ -396,7 +403,7 @@ test("실제 Mock 삭제 거절 버튼은 데이터 유지·이전 승인 무효
   const h = harness({ initialMode: "mock" }); try {
     h.send("작업장 안전 점검 삭제해 줘"); await h.advance(700);
     const before = h.mock.getState().schedules, message = h.messages().at(-1);
-    const buttons = nodes(h.renderConversation().rows.at(-1), "Pressable");
+    const buttons = interactionButtons(h.renderConversation().rows.at(-1));
     assert.deepEqual(buttons.map(textOf), ["아니요", "예"]); assert.ok(buttons.every(button => !button.props.disabled));
     const lateApproval = buttons[1].props.onPress; buttons[0].props.onPress(); h.render();
     assert.strictEqual(h.mock.getState().schedules, before);
@@ -418,7 +425,7 @@ test("표시 반복·키 추출은 원본 메시지와 API metadata를 변경하
 test("완료되지 않은 API 오류 메시지는 과거 응답으로 상세 성공 카드를 만들지 않음", async () => {
   const h = harness(); try {
     h.state.handle = async () => { throw Error("네트워크 실패"); }; h.send("조회"); await h.settle();
-    const view = h.renderConversation(); assert.equal(cards(view).length, 0); assert.equal(nodes(view.rows, "Pressable").length, 0);
+    const view = h.renderConversation(); assert.equal(cards(view).length, 0); assert.equal(interactionButtons(view.rows).length, 0);
     assert.equal(h.messages().at(-1).apiExecution.kind, "needs-attention"); assert.equal(h.state.cleanup, 0);
   } finally { h.close(); }
 });
@@ -443,7 +450,7 @@ for (const kind of Object.keys(results)) test(`초기 복구 ${kind}: 실제 상
     await h.settle(); assert.equal(h.messages().length, 1); assert.equal(h.messages()[0].role, "assistant");
     assert.deepEqual(h.messages()[0].apiExecution, execution); const view = h.renderConversation();
     assert.equal(nodes(view.rows, "Text")[0].props.children, results[kind].text); assert.equal(h.state.calls.length, 0); assert.equal(h.state.uuidCalls, 0); assert.equal(h.state.cleanup, 0);
-    for (const button of nodes(view.rows, "Pressable")) {
+    for (const button of interactionButtons(view.rows)) {
       assert.equal(button.props.disabled, kind !== "uncertain");
       if (kind === "uncertain") assert.equal(typeof button.props.onPress, "function"); else assert.equal(button.props.onPress, undefined);
     }
@@ -657,7 +664,7 @@ for (const kind of ["candidate_selection", "confirmation"]) test(`후속 응답 
     h.send("회의 수정"); await h.settle(); h.state.handle = responseWith(results[kind]); h.send("오후 3시"); await h.settle();
     const message = h.messages().at(-1); assert.deepEqual(message.apiExecution.response.data.result, results[kind]);
     const view = h.renderConversation(); assert.ok(cards(view).length > 0);
-    assert.ok(nodes(view.rows, "Pressable").every(button => button.props.disabled === false));
+    assert.ok(interactionButtons(view.rows).every(button => button.props.disabled === false));
     const count = h.state.calls.length; h.find("ConversationList").onCandidateSelection(message.id, "opaque/1");
     h.find("ConversationList").onDeleteConfirmation(message.id, true); await h.settle();
     assert.equal(h.state.calls.length, count); assert.equal(postedBodies(h).length, 2); assert.equal(h.state.mockRuns, 0); assert.equal(h.state.cleanup, 0);
@@ -848,7 +855,7 @@ async function liveCandidates(h, { count = 2, expiresAt = new Date(h.wall + 6000
 }
 function candidateButtons(h, messageId) {
   const index = h.messages().findIndex(message => message.id === messageId);
-  return nodes(h.renderConversation().rows[index], "Pressable");
+  return interactionButtons(h.renderConversation().rows[index]);
 }
 function selectApi(h, messageId, candidateId) { h.find("ConversationList").onApiCandidateSelection(messageId, candidateId); h.render(); }
 
@@ -1135,7 +1142,7 @@ for (const [first, second] of [[true, true], [false, false], [true, false], [fal
 for (const text of ["예", "아니요"]) test(`6-C 정보 보충에서 ${text} 답변은 기존 6-A text·questionId 유지`, async () => {
   const h = harness(); try {
     h.state.handle = responseWith({ ...results.need_more_info, text: "이 일정으로 등록할까요?" }); h.send("회의 등록"); await h.settle();
-    assert.equal(nodes(h.renderConversation().rows, "Pressable").length, 0); h.state.handle = responseWith(results.outcome); h.send(text); await h.settle();
+    assert.equal(interactionButtons(h.renderConversation().rows).length, 0); h.state.handle = responseWith(results.outcome); h.send(text); await h.settle();
     assert.deepEqual(postedBodies(h).at(-1).input, { type: "text", text, questionId: id(300) });
   } finally { h.close(); }
 });
@@ -1380,7 +1387,7 @@ for (const mismatch of ["question", "conversation", "kind", "expired", "missing-
     if (mismatch === "conversation") data.conversationId = id(101);
     h.state.handle = (url, init) => init.method === "POST" ? stale7a(mismatch === "missing-question-field" ? { activeQuestionId: null } : {}) : json(data);
     oldClick(); h.render(); await h.settle(); assert.equal(postMessage(h).apiErrorRecovery.status, "mismatch");
-    assert.ok(nodes(h.renderConversation().rows, "Pressable").every(button => button.props.disabled));
+    assert.ok(interactionButtons(h.renderConversation().rows).every(button => button.props.disabled));
     oldClick(); confirmApi(h, h.messages().at(-1).id, true); await h.settle(); assert.equal(postedBodies(h).length, 2); assert.equal(h.state.cleanup, 0);
   } finally { h.close(); }
 });
@@ -1402,7 +1409,7 @@ for (const failure of ["503", "404", "timeout", "storage"]) test(`7-A STALE GET 
 test("7-A STALE conversation을 확정할 수 없으면 GET 카드만 표시하고 대화 ID를 임의 재사용하지 않음", async () => {
   const h = harness(); h.state.handle = (url, init) => init.method === "POST" ? stale7a() : json(active7a());
   try { h.send("첫 독립 요청"); await h.settle(); assert.equal(postMessage(h).apiErrorRecovery.status, "mismatch");
-    assert.ok(nodes(h.renderConversation().rows, "Pressable").every(button => button.props.disabled));
+    assert.ok(interactionButtons(h.renderConversation().rows).every(button => button.props.disabled));
     h.state.handle = responseWith(results.outcome); h.send("명시적 새 요청"); await h.settle(); assert.equal(Object.hasOwn(postedBodies(h).at(-1), "conversationId"), false);
   } finally { h.close(); }
 });
@@ -1508,7 +1515,7 @@ test("7-A 활성 질문 ID가 일치해도 같은 질문의 이전 만료 시각
     const expired = recovered("confirmation", id(640)); expired.response.data.result = { ...active7a().result, expiresAt: "1970-01-01T00:00:00Z" };
     h.publishSnapshot(snapshotOf([expired])); h.state.handle = (url, init) => init.method === "POST" ? stale7a() : json(active7a());
     confirmationButtons(h, old.id)[1].props.onPress(); h.render(); await h.settle();
-    assert.equal(postMessage(h).apiErrorRecovery.status, "mismatch"); assert.ok(nodes(h.renderConversation().rows, "Pressable").every(button => button.props.disabled));
+    assert.equal(postMessage(h).apiErrorRecovery.status, "mismatch"); assert.ok(interactionButtons(h.renderConversation().rows).every(button => button.props.disabled));
     assert.equal(postedBodies(h).length, 2); assert.equal(h.state.cleanup, 0);
   } finally { h.close(); }
 });
@@ -1518,7 +1525,7 @@ async function liveUncertain(h) { h.state.handle = responseWith(results.uncertai
 const riskView = (h, id) => h.find("ConversationList").uncertainViews?.find(value => value.requestId.toLowerCase() === id.toLowerCase());
 function riskButtons(h, id) {
   const index = h.messages().findIndex(message => message.apiExecution?.reference.requestId.toLowerCase() === id.toLowerCase());
-  const buttons = nodes(h.renderConversation().rows[index], "Pressable");
+  const buttons = interactionButtons(h.renderConversation().rows[index]);
   return { check: buttons.find(button => textOf(button).includes("결과 확인")), acknowledge: buttons.find(button => textOf(button).includes("위험을 이해")) };
 }
 function armRisk(h, id) { riskButtons(h, id).acknowledge.props.onPress(); h.render(); }
@@ -1787,5 +1794,346 @@ test("7-B 새 작업 확정 뒤 늦은 uncertain 관측은 메시지뿐 아니�
     assert.equal(h.messages().find(message => message.apiExecution?.reference.requestId === latest).apiExecution.response.data.result.kind, "outcome");
     assert.equal(riskView(h, latest), undefined); h.send("명시적 다음 작업"); await h.settle();
     assert.equal(postedBodies(h).length, 3); assert.equal(Object.hasOwn(postedBodies(h).at(-1), "acknowledgedUncertainRequestId"), false);
+  } finally { h.close(); }
+});
+
+// 로컬 기록 정리는 실제 bubble의 명시적 action으로만 확인한다. 서버 cancel·write 대역은 호출하지 않는다.
+async function readyCleanup(h) { await h.settle(); await h.settle(); }
+const cleanupData = (...references) => new Map([["assistant.requestRecovery.v1", JSON.stringify({ version: 1,
+  entries: references.map(reference => ({ ...reference, firstPostAttemptAt: 1000, lastPostAttemptAt: 1000, acceptConfirmed: false })) })]]);
+function cleanupButton(h, requestId, action) {
+  const view = h.renderConversation(), control = h.find("ConversationList").recoveryControls.find(value => value.reference.requestId === requestId);
+  assert.ok(control, "정리 대상 서버·요청이 UI에 있어야 한다");
+  const container = nodes([view.rows, view.footer], "View").find(node => node.props.testID ===
+    `assistant-recovery-record-${JSON.stringify([control.reference.serverId, requestId.toLowerCase()])}`);
+  return nodes(container, "Pressable").find(button => button.props.testID === `assistant-recovery-${action}`);
+}
+function clickCleanup(h, requestId, action) {
+  const button = cleanupButton(h, requestId, action); assert.ok(button && !button.props.disabled, action);
+  button.props.onPress(); h.render();
+}
+
+for (const kind of ["outcome", "failure"]) test(`7-C ${kind} 표시·명시적 확인 뒤에만 원래 기록 정리`, async () => {
+  const h = harness(); h.state.handle = responseWith(results[kind]);
+  try {
+    h.send("결과 확인"); await readyCleanup(h); const ref = h.messages().at(-1).apiExecution.reference;
+    assert.ok(await h.storage.read(ref)); assert.equal(h.state.cleanup, 0); h.renderConversation(); h.render();
+    assert.ok(await h.storage.read(ref)); const before = h.state.calls.length;
+    clickCleanup(h, ref.requestId, "result"); await readyCleanup(h);
+    assert.equal(await h.storage.read(ref), null); assert.equal(h.state.cleanup, 1); assert.equal(h.state.calls.length, before);
+    assert.ok(textOf(h.renderConversation().rows).includes("로컬 복구 기록을 정리했어요"));
+    assert.equal(h.messages().at(-1).apiExecution.response.data.result.kind, kind);
+  } finally { h.close(); }
+});
+
+test("7-C cold start 결과는 원래 사용자 메시지 없이 결과 확인·정리 가능", async () => {
+  const execution = recovered(), h = harness({ data: cleanupData(execution.reference), initialSnapshot: snapshotOf([execution]) });
+  try {
+    await h.storage.recordResponse(execution.reference, execution.response.data);
+    h.publishSnapshot(snapshotOf([execution])); await readyCleanup(h);
+    assert.equal(h.messages().filter(message => message.role === "user").length, 0);
+    clickCleanup(h, execution.reference.requestId, "result"); await readyCleanup(h);
+    assert.equal(await h.storage.read(execution.reference), null); assert.equal(h.state.calls.length, 0);
+  } finally { h.close(); }
+});
+
+test("7-C 결과 확인 연타는 같은 ID 정리 1회·완료 후 재확인도 안전", async () => {
+  const h = harness(); try {
+    h.send("조회"); await readyCleanup(h); const ref = h.messages().at(-1).apiExecution.reference;
+    const press = cleanupButton(h, ref.requestId, "result").props.onPress; press(); press(); await readyCleanup(h);
+    assert.equal(h.state.cleanup, 1); assert.equal(await h.storage.read(ref), null);
+    press(); await readyCleanup(h); assert.equal(await h.storage.read(ref), null); assert.equal(postedBodies(h).length, 1);
+  } finally { h.close(); }
+});
+
+test("7-C 응답 UI 게시 실패는 표시 확인·정리 0회", async () => {
+  const h = harness(); h.state.throwMessage = true;
+  try { h.send("조회"); await readyCleanup(h); assert.equal(h.state.cleanup, 0); assert.equal(h.state.storageCleanupCalls.length, 0);
+    assert.equal((await h.storage.readAll()).length, 1); assert.equal(postedBodies(h).length, 1);
+  } finally { h.close(); }
+});
+
+for (const change of ["server", "mock", "unmount"]) test(`7-C 결과 확인 이전 ${change}: 늦은 사용자 callback 정리 0회`, async () => {
+  const h = harness(); try {
+    h.send("조회"); await readyCleanup(h); const ref = h.messages().at(-1).apiExecution.reference;
+    const press = cleanupButton(h, ref.requestId, "result").props.onPress;
+    if (change === "server") h.state.config = h.source("src/services/api/config.ts").parseDevelopmentServerConfig("https://other.example.invalid");
+    else if (change === "mock") h.switchMode("mock"); else h.close();
+    press(); await h.settle(); assert.ok(await h.storage.read(ref)); assert.equal(h.state.cleanup, 0); assert.equal(h.state.lateUpdates, 0);
+  } finally { h.close(); }
+});
+
+for (const change of ["server", "unmount", "new-result"]) test(`7-C storage 조회 대기 중 ${change}: 이미 클릭한 결과도 삭제 쓰기 차단`, async () => {
+  const h = harness(), gate = deferred(); try {
+    const requestId = await liveUncertain(h); h.state.handle = () => json(done(requestId)); checkRisk(h, requestId); await readyCleanup(h);
+    h.state.beforeRead = () => gate.promise; clickCleanup(h, requestId, "result"); await h.settle();
+    if (change === "server") h.state.config = h.source("src/services/api/config.ts").parseDevelopmentServerConfig("https://other.example.invalid");
+    else if (change === "unmount") h.close();
+    else h.publishSnapshot(snapshotOf([recovered("failure", requestId)]));
+    gate.resolve(); h.state.beforeRead = null; await readyCleanup(h);
+    assert.ok(await h.storage.read(recoveryRef(requestId))); assert.equal(h.state.lateUpdates, 0); assert.equal(postedBodies(h).length, 1);
+  } finally { gate.resolve(); h.state.beforeRead = null; h.close(); }
+});
+
+for (const failure of ["read", "write"]) test(`7-C ${failure} 정리 실패를 UI에 노출·재POST 없이 기록 보존`, async () => {
+  const h = harness(); try {
+    h.send("조회"); await readyCleanup(h); const ref = h.messages().at(-1).apiExecution.reference;
+    if (failure === "read") h.state.failRead = true; else h.state.failStorage = true;
+    clickCleanup(h, ref.requestId, "result"); await readyCleanup(h);
+    assert.ok(textOf(h.renderConversation().rows).includes("정리하지 못했어요"));
+    h.state.failRead = false; h.state.failStorage = false; assert.ok(await h.storage.read(ref)); assert.equal(postedBodies(h).length, 1);
+  } finally { h.state.failRead = false; h.close(); }
+});
+
+for (const kind of ["need_more_info", "candidate_selection", "confirmation"]) test(`7-C 활성 ${kind} 보존·후속 POST 2xx 뒤 이전 질문만 정리`, async () => {
+  const h = harness(); try {
+    h.state.handle = responseWith(results[kind]); h.send("질문 요청"); await readyCleanup(h); const old = h.messages().at(-1);
+    assert.ok(await h.storage.read(old.apiExecution.reference)); assert.equal(cleanupButton(h, old.apiExecution.reference.requestId, "result"), undefined);
+    h.state.handle = responseWith(results.outcome);
+    if (kind === "need_more_info") h.send("오후 3시");
+    else if (kind === "candidate_selection") selectApi(h, old.id, "opaque/1"); else confirmApi(h, old.id, true);
+    await readyCleanup(h); assert.equal(await h.storage.read(old.apiExecution.reference), null);
+    const latest = postMessage(h).apiExecution.reference; assert.ok(await h.storage.read(latest));
+    assert.equal(h.state.cleanup, 0); assert.equal(h.state.storageCleanupCalls.length, 1);
+    assert.equal(h.state.storageCleanupCalls[0][2].type, "next-input-accepted"); assert.equal(postedBodies(h).length, 2);
+  } finally { h.close(); }
+});
+
+for (const kind of ["need_more_info", "candidate_selection", "confirmation"]) test(`7-C ${kind} 후속 접수 미확인·GET 실패에서는 이전 질문 보존`, async () => {
+  const h = harness(); try {
+    h.state.handle = responseWith(results[kind]); h.send("질문 요청"); await readyCleanup(h); const old = h.messages().at(-1);
+    h.state.handle = (url, init) => init.method === "POST" ? Promise.reject(Error("응답 유실")) : error7a("ASSISTANT_UNAVAILABLE", 503);
+    if (kind === "need_more_info") h.send("답변"); else if (kind === "candidate_selection") selectApi(h, old.id, "opaque/1"); else confirmApi(h, old.id, false);
+    await readyCleanup(h); assert.ok(await h.storage.read(old.apiExecution.reference)); assert.equal(h.state.storageCleanupCalls.length, 0);
+    assert.equal((await h.storage.readAll()).length, 2); assert.equal(postedBodies(h).length, 2);
+  } finally { h.close(); }
+});
+
+for (const kind of ["outcome", "failure"]) test(`7-C uncertain → ${kind} 확정은 명시적 결과 확인 뒤 정리`, async () => {
+  const h = harness(); try {
+    const requestId = await liveUncertain(h); await readyCleanup(h); assert.equal(cleanupButton(h, requestId, "result"), undefined);
+    h.state.handle = () => json(done(requestId, kind)); checkRisk(h, requestId); await readyCleanup(h);
+    assert.ok(await h.storage.read(recoveryRef(requestId))); clickCleanup(h, requestId, "result"); await readyCleanup(h);
+    assert.equal(await h.storage.read(recoveryRef(requestId)), null); assert.equal(postedBodies(h).length, 1);
+  } finally { h.close(); }
+});
+
+test("7-C 위험 인지 버튼은 보존·새 독립 text POST 2xx 확인 뒤 해당 uncertain만 정리", async () => {
+  const h = harness(); try {
+    const requestId = await liveUncertain(h); armRisk(h, requestId); await readyCleanup(h);
+    assert.ok(await h.storage.read(recoveryRef(requestId))); assert.equal(h.state.storageCleanupCalls.length, 0);
+    const other = recoveryRef(id(799)); await h.storage.saveBeforePost(other, 1000);
+    h.state.handle = responseWith(results.outcome); h.send("새 독립 작업"); await readyCleanup(h);
+    assert.equal(await h.storage.read(recoveryRef(requestId)), null); assert.ok(await h.storage.read(other)); assert.ok(await h.storage.read(postMessage(h).apiExecution.reference));
+    assert.equal(riskView(h, requestId).acknowledged, true); assert.equal(postedBodies(h).length, 2);
+  } finally { h.close(); }
+});
+
+for (const failure of ["reject", "network", "storage"]) test(`7-C 위험 인지 새 작업 ${failure}: uncertain 기록 유지`, async () => {
+  const h = harness(); try {
+    const requestId = await liveUncertain(h); armRisk(h, requestId);
+    if (failure === "storage") h.state.failStorage = true;
+    h.state.handle = failure === "reject" ? () => error7a("ASSISTANT_UNAVAILABLE", 503)
+      : (url, init) => init.method === "POST" ? Promise.reject(Error("응답 유실")) : error7a("ASSISTANT_UNAVAILABLE", 503);
+    h.send("새 작업"); await readyCleanup(h); h.state.failStorage = false;
+    assert.ok(await h.storage.read(recoveryRef(requestId))); assert.equal(h.state.storageCleanupCalls.length, 0); assert.equal(riskView(h, requestId).acknowledged, false);
+  } finally { h.close(); }
+});
+
+for (const [method, httpStatus] of [["GET", 410], ["POST", 409]]) test(`7-C ${method} ${httpStatus} REQUEST_EXPIRED 안내 확인 뒤 정리·과거 실행 판정 없음`, async () => {
+  const execution = recoveredError("http", httpStatus, "REQUEST_EXPIRED");
+  const error = execution.recoveryResult.getResult.error; error.operation = method.toLowerCase();
+  if (method === "POST") { execution.recoveryResult.postResult = execution.recoveryResult.getResult; delete execution.recoveryResult.getResult; }
+  const h = harness({ data: cleanupData(execution.reference), initialSnapshot: snapshotOf([execution]) });
+  try {
+    h.publishSnapshot(snapshotOf([execution])); await readyCleanup(h);
+    assert.ok(await h.storage.read(execution.reference)); assert.ok(textOf(h.renderConversation().rows).includes("성공·실패는 알 수 없어요"));
+    clickCleanup(h, execution.reference.requestId, "expiry"); await readyCleanup(h);
+    assert.equal(await h.storage.read(execution.reference), null); assert.equal(h.state.calls.length, 0); assert.equal(h.messages()[0].apiExecution.kind, "needs-attention");
+  } finally { h.close(); }
+});
+
+for (const [kind, httpStatus, code] of [["http", 404, "ASSISTANT_REQUEST_NOT_FOUND"], ["http", 404, "ROUTE_NOT_FOUND"],
+  ["http", 503, "ASSISTANT_UNAVAILABLE"], ["timeout"], ["network"], ["response"], ["http", 409, "REQUEST_EXPIRED"]]) test(`7-C 자동 정리 금지 ${code ?? kind}/${httpStatus ?? "없음"}: 원래 기록 보존`, async () => {
+  const execution = recoveredError(kind, httpStatus, code), h = harness({ data: cleanupData(execution.reference), initialSnapshot: snapshotOf([execution]) });
+  try {
+    h.publishSnapshot(snapshotOf([execution])); await readyCleanup(h);
+    assert.equal(cleanupButton(h, execution.reference.requestId, "expiry"), undefined); assert.equal(cleanupButton(h, execution.reference.requestId, "result"), undefined);
+    assert.equal(h.state.storageCleanupCalls.length, 0); assert.ok(await h.storage.read(execution.reference)); assert.equal(h.state.calls.length, 0);
+  } finally { h.close(); }
+});
+
+for (const value of ["accepted", "processing"]) test(`7-C ${value}·120초 경과만으로 metadata 정리 없음`, async () => {
+  const h = harness(); h.state.handle = (url, init) => init.method === "POST" ? json(status(JSON.parse(init.body).requestId), 202) : json(status(url.split("/").pop(), value));
+  try {
+    h.send("느린 작업"); await h.settle(); await h.advance(120000); await readyCleanup(h);
+    const ref = postMessage(h).apiExecution.reference; assert.ok(await h.storage.read(ref)); assert.equal(h.state.storageCleanupCalls.length, 0);
+    assert.equal(cleanupButton(h, ref.requestId, "result"), undefined); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
+
+for (const value of ["unconfirmed", "accepted", "processing", "need_more_info", "uncertain", "foreign-server"]) test(`7-C 수동 ${value}: 두 단계 확인·대상 하나만 로컬 정리·서버 상태 유지`, async () => {
+  const ref = recoveryRef(id(760), value === "foreign-server" ? "development:https://other.example.invalid" : serverId), other = recoveryRef(id(761));
+  const h = harness({ data: cleanupData(ref, other) });
+  try {
+    if (["accepted", "processing"].includes(value)) await h.storage.recordResponse(ref, status(ref.requestId, value));
+    else if (["need_more_info", "uncertain"].includes(value)) await h.storage.recordResponse(ref, done(ref.requestId, value));
+    h.publishSnapshot(snapshotOf([])); h.render(); await readyCleanup(h);
+    assert.equal(cleanupButton(h, ref.requestId, "confirm-manual"), undefined);
+    clickCleanup(h, ref.requestId, "manual"); await readyCleanup(h); assert.ok(await h.storage.read(ref));
+    const warning = textOf(h.renderConversation().footer); assert.ok(warning.includes(ref.serverId)); assert.ok(warning.includes(ref.requestId));
+    assert.ok(warning.includes("보류 해제가 아니")); assert.equal(h.state.manualCleanupCalls.length, 0);
+    const press = cleanupButton(h, ref.requestId, "confirm-manual").props.onPress; press(); press(); await readyCleanup(h);
+    assert.equal(await h.storage.read(ref), null); assert.ok(await h.storage.read(other)); assert.equal(h.state.manualCleanupCalls.length, 1);
+    assert.equal(h.state.calls.length, 0); assert.equal(h.state.uuidCalls, 0); assert.equal(h.state.mockRuns, 0);
+  } finally { h.close(); }
+});
+
+test("7-C 수동 정리 취소는 기록 유지·확인되지 않은 직접 confirm 호출 차단", async () => {
+  const h = harness(); try {
+    h.send("조회"); await readyCleanup(h); const ref = postMessage(h).apiExecution.reference;
+    const props = h.find("ConversationList"), control = props.recoveryControls[0]; props.onRecoveryAction(control, "confirm-manual"); await readyCleanup(h);
+    assert.ok(await h.storage.read(ref)); assert.equal(h.state.manualCleanupCalls.length, 0);
+    clickCleanup(h, ref.requestId, "manual"); clickCleanup(h, ref.requestId, "keep"); await readyCleanup(h);
+    assert.ok(await h.storage.read(ref)); assert.equal(h.state.manualCleanupCalls.length, 0);
+  } finally { h.close(); }
+});
+
+test("7-C uncertain 수동 정리는 위험 인지·새 작업 보류 해제가 아님", async () => {
+  const h = harness(); try {
+    const requestId = await liveUncertain(h); await readyCleanup(h); clickCleanup(h, requestId, "manual"); clickCleanup(h, requestId, "confirm-manual"); await readyCleanup(h);
+    assert.equal(await h.storage.read(recoveryRef(requestId)), null); assert.equal(riskView(h, requestId).acknowledged, false);
+    h.send("새 작업"); await h.settle(); assert.equal(postedBodies(h).length, 1); assert.equal(h.state.uuidCalls, 1);
+  } finally { h.close(); }
+});
+
+for (const change of ["server", "mock", "unmount"]) test(`7-C 수동 확인 대기 중 ${change}: 이전 확인 action은 삭제하지 않음`, async () => {
+  const h = harness(); try {
+    h.send("조회"); await readyCleanup(h); const ref = postMessage(h).apiExecution.reference;
+    clickCleanup(h, ref.requestId, "manual"); const press = cleanupButton(h, ref.requestId, "confirm-manual").props.onPress;
+    if (change === "server") h.state.config = h.source("src/services/api/config.ts").parseDevelopmentServerConfig("https://other.example.invalid");
+    else if (change === "mock") h.switchMode("mock"); else h.close();
+    press(); await h.settle(); assert.ok(await h.storage.read(ref)); assert.equal(h.state.manualCleanupCalls.length, 0);
+  } finally { h.close(); }
+});
+
+test("7-C 현재 UI 결과와 다른 requestId·오래된 결과 token은 정리하지 않음", async () => {
+  const h = harness(); try {
+    h.send("조회"); await readyCleanup(h); const props = h.find("ConversationList"), control = props.recoveryControls[0];
+    props.onRecoveryAction({ ...control, reference: recoveryRef(id(799)) }, "result");
+    props.onRecoveryAction({ ...control, executionToken: "과거 결과" }, "result"); await readyCleanup(h);
+    assert.ok(await h.storage.read(control.reference)); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
+
+for (const method of ["cleanup", "removeManually"]) test(`7-C 저장소 ${method}: 공유 큐 대기 중 무효화되면 삭제 쓰기 없음`, async () => {
+  const h = harness(), gate = deferred(); try {
+    const ref = recoveryRef(); await h.storage.saveBeforePost(ref, 1000); await h.storage.recordResponse(ref, done(ref.requestId));
+    h.state.beforeRead = () => gate.promise; const read = h.storage.read(ref); await h.settle(); let current = true;
+    const pending = method === "cleanup" ? h.storage.cleanup(ref, serverId, { type: "result-displayed" }, { isCurrent: () => current })
+      : h.storage.removeManually(ref, { confirmed: true }, { isCurrent: () => current });
+    current = false; h.state.beforeRead = null; gate.resolve(); await read; assert.equal(await pending, "retained"); assert.ok(await h.storage.read(ref));
+  } finally { gate.resolve(); h.state.beforeRead = null; h.close(); }
+});
+
+for (const via of ["get", undefined]) test(`7-C ${via ?? "출처 없음"} 상태는 POST 2xx 정리 증거로 대체하지 않음`, () => {
+  const h = harness(); try {
+    const build = h.source("src/utils/assistant-recovery-cleanup.ts").assistantAcceptedCleanup;
+    const request = { requestId: id(710), conversationId: id(100), input: { type: "text", text: "답", questionId: id(300) } };
+    const response = { ...recovered().response, status: 202, data: status(request.requestId) };
+    assert.deepEqual(build(request, { phase: "status", via, reference: recoveryRef(request.requestId), response }, { requestId: id(600), conversationId: id(100), questionId: id(300) }), []);
+  } finally { h.close(); }
+});
+
+for (const type of ["request", "question"]) for (const targetState of ["cancelled", "not_guaranteed", "already_completed", "uncertain", "not_active"]) test(`7-C cancel ${type}/${targetState}: 의미만 구분·자동 GET/정리/write 없음`, async () => {
+  const h = harness(); try {
+    const input = { target: { type, id: id(750) }, targetState, text: "서버 취소 응답" };
+    const output = h.source("src/utils/assistant-recovery-cleanup.ts").interpretAssistantCancelResponse(input);
+    assert.equal(output.requestCancelled, type === "request" && targetState === "cancelled");
+    assert.equal(output.questionInactive, type === "question" && ["cancelled", "not_active"].includes(targetState));
+    assert.equal(output.requiresRequestLookup, ["not_guaranteed", "uncertain"].includes(targetState));
+    assert.equal(output.targetAlreadyCompleted, targetState === "already_completed"); assert.deepEqual(output.target, input.target);
+    assert.deepEqual(input, { target: { type, id: id(750) }, targetState, text: "서버 취소 응답" });
+    await h.settle(); assert.equal(h.state.calls.length, 0); assert.equal(h.state.storageCleanupCalls.length, 0); assert.equal(h.state.manualCleanupCalls.length, 0);
+  } finally { h.close(); }
+});
+
+test("7-C cancel 응답 검증은 approved:false를 취소 DTO로 받아들이지 않음", () => {
+  const h = harness(); try {
+    const interpret = h.source("src/utils/assistant-recovery-cleanup.ts").interpretAssistantCancelResponse;
+    assert.equal(interpret({ target: { type: "question", id: id(750) }, targetState: "success", text: "잘못된 상태" }), null);
+    assert.equal(interpret({ type: "confirmation", questionId: id(300), approved: false }), null); assert.equal(h.state.calls.length, 0);
+  } finally { h.close(); }
+});
+
+test("7-C 후속 POST 성공 후 metadata 갱신 실패는 이전 질문을 정리하지 않음", async () => {
+  const h = harness(); try {
+    h.state.handle = responseWith(results.need_more_info); h.send("질문"); await readyCleanup(h); const ref = postMessage(h).apiExecution.reference;
+    h.state.handle = (url, init) => { if (init.method === "POST") { h.state.failStorage = true; return json(status(JSON.parse(init.body).requestId), 202); }
+      return json(done(url.split("/").pop())); };
+    h.send("답변"); await readyCleanup(h); h.state.failStorage = false;
+    assert.ok(await h.storage.read(ref)); assert.equal(h.find("ConversationList").recoveryControls.find(control => control.reference.requestId === ref.requestId).phase, "retained");
+    assert.equal(postedBodies(h).length, 2); assert.equal(h.state.mockRuns, 0);
+  } finally { h.close(); }
+});
+
+test("7-C 응답 유실 뒤 GET 확인만으로 POST 2xx 정리 사실을 꾸미지 않음", async () => {
+  const h = harness(); try {
+    h.state.handle = responseWith(results.need_more_info); h.send("질문"); await readyCleanup(h); const ref = postMessage(h).apiExecution.reference;
+    h.state.handle = (url, init) => init.method === "POST" ? Promise.reject(Error("응답 유실")) : json(done(url.split("/").pop()));
+    h.send("답변"); await readyCleanup(h); assert.ok(await h.storage.read(ref)); assert.equal(h.state.storageCleanupCalls.length, 0); assert.equal(postedBodies(h).length, 2);
+  } finally { h.close(); }
+});
+
+for (const code of ["QUESTION_EXPIRED", "CONVERSATION_EXPIRED"]) test(`7-C 서버 ${code} 409가 확인된 질문만 만료 정리`, async () => {
+  const h = harness(); try {
+    const message = await liveConfirmation(h), other = recoveryRef(id(799)); await h.storage.saveBeforePost(other, 1000);
+    h.state.handle = () => error7a(code, 409); confirmApi(h, message.id, true); await readyCleanup(h);
+    assert.equal(await h.storage.read(message.apiExecution.reference), null); assert.ok(await h.storage.read(other));
+    assert.ok(await h.storage.read(postMessage(h).apiExecution.reference)); assert.equal(postedBodies(h).length, 2);
+  } finally { h.close(); }
+});
+
+test("7-C 수동 정리도 storage 읽기 대기 중 화면 해제되면 삭제 쓰기 없음", async () => {
+  const h = harness(), gate = deferred(); try {
+    h.send("조회"); await readyCleanup(h); const ref = postMessage(h).apiExecution.reference;
+    clickCleanup(h, ref.requestId, "manual"); h.state.beforeRead = () => gate.promise;
+    clickCleanup(h, ref.requestId, "confirm-manual"); await h.settle(); h.close(); gate.resolve(); h.state.beforeRead = null; await h.settle();
+    assert.ok(await h.storage.read(ref)); assert.equal(h.state.lateUpdates, 0);
+  } finally { gate.resolve(); h.state.beforeRead = null; h.close(); }
+});
+
+test("7-C 같은 requestId라도 다른 서버의 수동 정리는 선택한 서버 항목 하나만 삭제", async () => {
+  const local = recoveryRef(), foreign = recoveryRef(local.requestId, "development:https://other.example.invalid");
+  const h = harness({ data: cleanupData(local, foreign) }); try {
+    await readyCleanup(h); const props = h.find("ConversationList"), target = props.recoveryControls.find(control => control.reference.serverId === foreign.serverId);
+    assert.ok(target); props.onRecoveryAction(target, "manual"); h.render();
+    const view = h.renderConversation(); const bubble = nodes(view.footer, "View").find(node => node.props.testID ===
+      `assistant-recovery-record-${JSON.stringify([foreign.serverId, foreign.requestId])}`);
+    nodes(bubble, "Pressable").find(button => button.props.testID === "assistant-recovery-confirm-manual").props.onPress(); await readyCleanup(h);
+    assert.equal(await h.storage.read(foreign), null); assert.ok(await h.storage.read(local)); assert.equal(h.state.calls.length, 0);
+  } finally { h.close(); }
+});
+
+test("7-C 삭제 대기 중 서버 왕복 뒤 이전 working UI를 남기지 않고 명시적 확인 가능", async () => {
+  const h = harness(), gate = deferred(); try {
+    h.send("조회"); await readyCleanup(h); const ref = postMessage(h).apiExecution.reference;
+    h.state.beforeRead = () => gate.promise; clickCleanup(h, ref.requestId, "result"); await h.settle();
+    const config = h.source("src/services/api/config.ts"); h.state.config = config.parseDevelopmentServerConfig("https://other.example.invalid"); h.render();
+    h.state.beforeRead = null; gate.resolve(); await readyCleanup(h);
+    h.state.config = config.parseDevelopmentServerConfig(origin); h.render(); await readyCleanup(h);
+    assert.ok(await h.storage.read(ref)); assert.equal(cleanupButton(h, ref.requestId, "result").props.disabled, false);
+    clickCleanup(h, ref.requestId, "result"); await readyCleanup(h); assert.equal(await h.storage.read(ref), null);
+  } finally { gate.resolve(); h.state.beforeRead = null; h.close(); }
+});
+
+test("7-C 서버 왕복은 이전 수동 정리 확인 의사를 복원하지 않음", async () => {
+  const h = harness(); try {
+    h.send("조회"); await readyCleanup(h); const ref = postMessage(h).apiExecution.reference;
+    clickCleanup(h, ref.requestId, "manual"); const oldConfirm = cleanupButton(h, ref.requestId, "confirm-manual").props.onPress;
+    const config = h.source("src/services/api/config.ts"); h.state.config = config.parseDevelopmentServerConfig("https://other.example.invalid"); h.render(); await readyCleanup(h);
+    h.state.config = config.parseDevelopmentServerConfig(origin); h.render(); await readyCleanup(h);
+    oldConfirm(); await readyCleanup(h); assert.ok(await h.storage.read(ref)); assert.equal(h.state.manualCleanupCalls.length, 0);
+    assert.equal(cleanupButton(h, ref.requestId, "confirm-manual"), undefined);
   } finally { h.close(); }
 });

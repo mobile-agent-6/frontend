@@ -25,7 +25,7 @@ export type AssistantExecutionResult = { reference: AssistantRecoveryReference }
 );
 export type AssistantExecutionEvent = { reference: AssistantRecoveryReference } & (
   | { phase: "posting" | "recovering" | "querying" | "waiting" }
-  | { phase: "status"; response: Response }
+  | { phase: "status"; response: Response; via?: Extract<AssistantRequestRecoveryResult, { kind: "confirmed" }>["via"] }
 );
 export type AssistantExecutionOptions = { signal?: AbortSignal; onUpdate?: (event: AssistantExecutionEvent) => void };
 export type AssistantRequestTask = {
@@ -177,7 +177,7 @@ export function createAssistantOrchestrator({
       lastRecovery = result;
       if (result.kind === "confirmed") {
         lastResponse = immutableResponse(result.response);
-        emit({ phase: "status", reference: ref, response: lastResponse });
+        emit({ phase: "status", reference: ref, response: lastResponse, via: result.via });
       }
     }
     function observed(): AssistantExecutionResult {
@@ -320,7 +320,12 @@ export function createAssistantOrchestrator({
     }
   }
   // 실제 UI가 결과 표시를 확인했을 때만 호출한다. 반환·callback만으로는 정리하지 않는다.
-  const confirmResultDisplayed = (ref: AssistantRecoveryReference) => storage.cleanup(ref, http.getServerId() ?? "", { type: "result-displayed" });
+  const confirmResultDisplayed = (ref: AssistantRecoveryReference, options?: { isCurrent?: () => boolean }) => {
+    const generation = mode.getState().generation;
+    return storage.cleanup(ref, http.getServerId() ?? "", { type: "result-displayed" }, {
+      isCurrent: () => !context(ref, generation) && (options?.isCurrent?.() ?? true),
+    });
+  };
   return { startRequest, resumeRequest, queryRequestOnce, initializeRecovery, confirmResultDisplayed };
 }
 

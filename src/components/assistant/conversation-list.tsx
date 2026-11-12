@@ -14,6 +14,7 @@ import { assistantResultToDisplay } from "@/utils/assistant-mapper";
 import type { AssistantCandidateQuestion, AssistantConfirmationQuestion } from "@/utils/assistant-text-question";
 import { assistantErrorRecoveryNotice, assistantHttpErrorNotice, getAssistantExecutionError, type AssistantErrorRecoveryNotice } from "@/utils/assistant-errors";
 import type { AssistantUncertainView } from "@/utils/assistant-uncertain";
+import { assistantRecoveryKey, type AssistantRecoveryControl, type AssistantRecoveryControlAction } from "@/utils/assistant-recovery-cleanup";
 
 // 화면 메시지와 공개 API 결과를 구분하며 API 원형은 현재 실행 세션에만 보관한다.
 export type ConversationMessage = {
@@ -59,6 +60,9 @@ type ConversationListProps = {
   uncertainViews?: readonly AssistantUncertainView[];
   onUncertainCheck?: (requestId: string) => void;
   onUncertainAcknowledge?: (requestId: string) => void;
+  recoveryControls?: readonly AssistantRecoveryControl[];
+  recoveryStorageError?: boolean;
+  onRecoveryAction?: (control: AssistantRecoveryControl, action: AssistantRecoveryControlAction) => void;
 };
 
 export function ConversationList({
@@ -78,6 +82,9 @@ export function ConversationList({
   uncertainViews,
   onUncertainCheck,
   onUncertainAcknowledge,
+  recoveryControls,
+  recoveryStorageError,
+  onRecoveryAction,
 }: ConversationListProps) {
   const listRef = useRef<FlatList<ConversationMessage>>(null);
   const messageCount = messages.length;
@@ -223,6 +230,12 @@ export function ConversationList({
               </ThemedText>
             </View>
           )}
+          {recoveryControls?.filter(control => !messages.some(message => message.role === "assistant" && message.apiExecution &&
+            assistantRecoveryKey(message.apiExecution.reference) === assistantRecoveryKey(control.reference))).map(control => (
+            <AssistantMessage key={`recovery-${assistantRecoveryKey(control.reference)}`} text="이전 요청의 로컬 복구 기록이 남아 있어요."
+              recoveryControl={control} onRecoveryAction={onRecoveryAction ? action => onRecoveryAction(control, action) : undefined} />
+          ))}
+          {recoveryStorageError && <AssistantMessage text="로컬 복구 기록을 읽지 못했어요. 기록을 삭제하지 않았으며 저장 상태 확인이 필요해요." />}
           <View style={styles.footer} />
         </View>
       }
@@ -234,6 +247,12 @@ export function ConversationList({
         ) : (
           <AssistantMessage
             text={item.text}
+            recoveryControl={item.apiExecution ? recoveryControls?.find(control =>
+              assistantRecoveryKey(control.reference) === assistantRecoveryKey(item.apiExecution!.reference)) : undefined}
+            onRecoveryAction={item.apiExecution && onRecoveryAction ? action => {
+              const control = recoveryControls?.find(control => assistantRecoveryKey(control.reference) === assistantRecoveryKey(item.apiExecution!.reference));
+              if (control) onRecoveryAction(control, action);
+            } : undefined}
             apiRecoveryText={item.apiErrorRecovery ? assistantErrorRecoveryNotice(item.apiErrorRecovery) : undefined}
             uncertainView={item.apiExecution ? uncertainViews?.find(view => view.requestId.toLowerCase() === item.apiExecution?.reference.requestId.toLowerCase()) : undefined}
             uncertainErrorText={item.apiUncertain && item.apiExecution && getAssistantExecutionError(item.apiExecution)

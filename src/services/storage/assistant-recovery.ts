@@ -134,10 +134,13 @@ export function createAssistantRecoveryStorage(storage: AssistantRecoveryStorage
     });
   }
 
-  function cleanup(input: AssistantRecoveryReference, currentServerId: string, evidence: AssistantRecoveryCleanupEvidence): Promise<AssistantRecoveryCleanupResult> {
+  function cleanup(input: AssistantRecoveryReference, currentServerId: string, evidence: AssistantRecoveryCleanupEvidence,
+    options?: { isCurrent?: () => boolean }): Promise<AssistantRecoveryCleanupResult> {
     const snapshot = { ...input };
     const facts = prepareAssistantRecoveryCleanupEvidence(evidence);
+    const isCurrent = options?.isCurrent ?? (() => true);
     return enqueue(async () => {
+      if (!isCurrent()) return "retained";
       const ref = reference(snapshot);
       const entries = await readEntries();
       const entry = entries.find((item) => matches(item, ref));
@@ -146,20 +149,26 @@ export function createAssistantRecoveryStorage(storage: AssistantRecoveryStorage
       const replacement = facts.type === "next-input-accepted"
         ? entries.find((item) => item.serverId === ref.serverId && item.requestId === facts.requestId) : undefined;
       if (!canRemoveAssistantRecovery(entry, currentServerId, facts, replacement)) return "retained";
+      // 큐와 storage 조회 대기 중 화면·서버가 바뀌면 삭제 쓰기를 시작하지 않는다.
+      if (!isCurrent()) return "retained";
       await writeEntries(entries.filter((item) => !matches(item, ref)));
       return "removed";
     });
   }
 
   /** 로컬 정보만 수동 정리한다. 서버 취소·uncertain 해소·재실행 허용이 아니다. */
-  function removeManually(input: AssistantRecoveryReference, confirmation: { confirmed: true }): Promise<AssistantRecoveryCleanupResult> {
+  function removeManually(input: AssistantRecoveryReference, confirmation: { confirmed: true },
+    options?: { isCurrent?: () => boolean }): Promise<AssistantRecoveryCleanupResult> {
     const snapshot = { ...input };
     const confirmed = confirmation?.confirmed === true;
+    const isCurrent = options?.isCurrent ?? (() => true);
     return enqueue(async () => {
+      if (!isCurrent()) return "retained";
       const ref = reference(snapshot);
       if (!confirmed) throw new AssistantRecoveryStorageError("invalid-input");
       const entries = await readEntries();
       if (!entries.some((entry) => matches(entry, ref))) return "not-found";
+      if (!isCurrent()) return "retained";
       await writeEntries(entries.filter((entry) => !matches(entry, ref)));
       return "removed";
     });

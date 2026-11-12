@@ -25,12 +25,16 @@ import {
 import type { AssistantInteraction, AssistantStatus } from "@/types/assistant";
 import { useScheduleStore } from "@/stores/scheduleStore";
 import { isMockScheduleMode, scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
-import { parseAssistantRequestCreate, validateAssistantJsonBodySize, validateAssistantText } from "@/utils/assistant-validation";
+import { parseAssistantRequestCreate, parseAssistantRequestStatusResponse, validateAssistantJsonBodySize, validateAssistantText } from "@/utils/assistant-validation";
 import { upsertAssistantExecutionMessage } from "@/utils/assistant-recovery-messages";
 import { createAssistantTextQuestionContext, type AssistantCandidateQuestion, type AssistantConfirmationQuestion, type AssistantTextQuestion } from "@/utils/assistant-text-question";
 import { assistantCandidateToDisplay } from "@/utils/assistant-mapper";
-import { getAssistantErrorRecoveryTarget, type AssistantErrorRecoveryNotice } from "@/utils/assistant-errors";
+import { getAssistantErrorRecoveryTarget, getAssistantExecutionError, type AssistantErrorRecoveryNotice } from "@/utils/assistant-errors";
 import { createAssistantUncertainContext, type AssistantUncertainView } from "@/utils/assistant-uncertain";
+import { assistantRecoveryStorage } from "@/services/storage/assistant-recovery";
+import type { AssistantRecoveryCleanupEvidence, AssistantRecoveryMetadata, AssistantRecoveryReference } from "@/types/assistant-recovery";
+import { assistantAcceptedCleanup, assistantRecoveryKey, assistantRequestExpiryEvidence,
+  type AssistantRecoveryCleanupPhase, type AssistantRecoveryControl, type AssistantRecoveryControlAction } from "@/utils/assistant-recovery-cleanup";
 
 // processing UI를 보여주기 위한 Mock 지연이며, 실제 API timeout이 아니다.
 const MOCK_PROCESSING_DELAY_MS = 700;
@@ -55,6 +59,15 @@ export default function AssistantScreen() {
   const [recoverySnapshot, setRecoverySnapshot] = useState(assistantLifecycle.getSnapshot);
   const [uncertainUi, setUncertainUi] = useState<{ serverId: string; generation: number; held: boolean;
     views: AssistantUncertainView[] } | null>(null);
+  const [recoveryRecords, setRecoveryRecords] = useState<AssistantRecoveryMetadata[]>([]);
+  const [recoveryReadError, setRecoveryReadError] = useState(false);
+  const [cleanupRevision, setCleanupRevision] = useState(0);
+  const [cleanupScope, setCleanupScope] = useState(() => JSON.stringify([scheduleDataModeStore.getState().mode,
+    assistantHttpClient.getServerId(), scheduleDataModeStore.getState().generation]));
+  const [cleanupStates, setCleanupStates] = useState<Record<string, { reference: AssistantRecoveryReference; phase: AssistantRecoveryCleanupPhase }>>({});
+  const cleanupLocksRef = useRef(new Set<string>());
+  const manualConfirmationsRef = useRef(new Map<string, { serverId: string | null; generation: number }>());
+  const committedMessagesRef = useRef(messages);
   const uncertainRef = useRef<ReturnType<typeof createAssistantUncertainContext> | null>(null);
   const sendLockedRef = useRef(false);
   const inputTextRef = useRef("");
@@ -70,6 +83,32 @@ export default function AssistantScreen() {
   const resolvedInteractionIdsRef = useRef(new Set<string>());
   const conversationListRef = useRef<ConversationListHandle>(null);
   const processingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // 커밋된 메시지와 클릭 대상을 비교할 뿐, effect 자체로 표시 확인이나 정리를 수행하지 않는다.
+  useEffect(() => { committedMessagesRef.current = messages; }, [messages]);
+
+  const publishCleanup = useCallback((reference: AssistantRecoveryReference, phase: AssistantRecoveryCleanupPhase) => {
+    if (!mountedRef.current) return;
+    setCleanupStates(previous => ({ ...previous, [assistantRecoveryKey(reference)]: { reference: { ...reference }, phase } }));
+  }, []);
+
+  const cleanupWithEvidence = useCallback(async (reference: AssistantRecoveryReference, evidence: AssistantRecoveryCleanupEvidence,
+    isCurrent: () => boolean) => {
+    const key = assistantRecoveryKey(reference);
+    const generation = scheduleDataModeStore.getState().generation;
+    if (!isCurrent() || cleanupLocksRef.current.has(key)) return;
+    cleanupLocksRef.current.add(key);
+    publishCleanup(reference, "working");
+    try {
+      const result = await assistantRecoveryStorage.cleanup(reference, reference.serverId, evidence, { isCurrent });
+      if (isCurrent()) { publishCleanup(reference, result); setCleanupRevision(value => value + 1); }
+    } catch { if (isCurrent()) publishCleanup(reference, "failed"); }
+    finally {
+      if (!isCurrent() && mountedRef.current && !isMockScheduleMode() && assistantHttpClient.getServerId() === reference.serverId &&
+        scheduleDataModeStore.getState().generation === generation) publishCleanup(reference, "retained");
+      cleanupLocksRef.current.delete(key);
+    }
+  }, [publishCleanup]);
 
   const getTextQuestionContext = useCallback((serverId: string) => {
     const generation = scheduleDataModeStore.getState().generation;
@@ -171,6 +210,8 @@ export default function AssistantScreen() {
     setQuestionUi(null);
     uncertainRef.current = null;
     setUncertainUi(null);
+    manualConfirmationsRef.current.clear();
+    setCleanupStates({});
     if (processingTimerRef.current !== null) clearTimeout(processingTimerRef.current);
     processingTimerRef.current = null;
     pendingMockRef.current = null;
@@ -438,6 +479,9 @@ export default function AssistantScreen() {
         if (event.phase === "status") {
           postAccepted = true;
           clearInputExpiry?.();
+          for (const target of assistantAcceptedCleanup(body, event, question)) {
+            void cleanupWithEvidence(target.reference, target.evidence, () => isCurrent() && assistantHttpClient.getServerId() === serverId);
+          }
           context.observeResponse(event.response.data, "request", question);
           const response = event.response, data = response.data;
           uncertain.observe(data.status === "completed" ? { kind: "completed", reference: event.reference, response: { ...response, data } }
@@ -465,6 +509,12 @@ export default function AssistantScreen() {
         setMessages(current => upsertAssistantExecutionMessage(current, execution, "request"));
       } else {
         reportError("요청 결과를 확인하지 못했어요. 원래 요청의 확인이 필요해요.", execution);
+        const error = getAssistantExecutionError(execution);
+        if (question && error?.kind === "http" && error.operation === "post" && error.status === 409 &&
+          ["QUESTION_EXPIRED", "CONVERSATION_EXPIRED"].includes(error.problem?.code ?? "")) {
+          void cleanupWithEvidence({ serverId, requestId: question.requestId },
+            { type: "question-inactive-confirmed", reason: "expired" }, () => isCurrent() && assistantHttpClient.getServerId() === serverId);
+        }
         const target = getAssistantErrorRecoveryTarget(execution, acknowledgedId);
         if (target) {
           const token = context.getRecoveryToken();
@@ -554,6 +604,53 @@ export default function AssistantScreen() {
     if (context.arm(requestId)) syncUncertainUi(context);
   };
 
+  const handleRecoveryAction = async (control: AssistantRecoveryControl, action: AssistantRecoveryControlAction,
+    viewServerId: string | null, generation: number) => {
+    const reference = { ...control.reference }, key = assistantRecoveryKey(reference);
+    const inCurrentView = () => mountedRef.current && !isMockScheduleMode() &&
+      scheduleDataModeStore.getState().generation === generation && assistantHttpClient.getServerId() === viewServerId;
+    if (!inCurrentView() || cleanupLocksRef.current.has(key)) return;
+    if (action === "manual") {
+      manualConfirmationsRef.current.set(key, { serverId: viewServerId, generation });
+      publishCleanup(reference, "confirming"); return;
+    }
+    if (action === "keep") {
+      manualConfirmationsRef.current.delete(key);
+      setCleanupStates(previous => { const next = { ...previous }; delete next[key]; return next; }); return;
+    }
+    const execution = () => committedMessagesRef.current.find(message => message.role === "assistant" && message.apiExecution &&
+      assistantRecoveryKey(message.apiExecution.reference) === key);
+    const latestExecution = () => { const message = execution(); return message?.role === "assistant" ? message.apiExecution : undefined; };
+    const matchesDisplayed = () => inCurrentView() && reference.serverId === viewServerId &&
+      control.executionToken !== undefined && JSON.stringify(latestExecution()) === control.executionToken;
+    let evidence: AssistantRecoveryCleanupEvidence | undefined;
+    if (action === "result") {
+      const result = latestExecution();
+      const data = result?.kind === "completed" && parseAssistantRequestStatusResponse(result.response.data);
+      if (!matchesDisplayed() || !data || data.status !== "completed" ||
+        data.requestId.toLowerCase() !== reference.requestId.toLowerCase() ||
+        !["outcome", "failure"].includes(data.result.kind)) return;
+    } else if (action === "expiry") {
+      const result = latestExecution();
+      if (!matchesDisplayed() || !result || !(evidence = assistantRequestExpiryEvidence(result))) return;
+    } else if (action === "confirm-manual") {
+      const confirmation = manualConfirmationsRef.current.get(key);
+      if (!confirmation || confirmation.serverId !== viewServerId || confirmation.generation !== generation) return;
+      manualConfirmationsRef.current.delete(key);
+    } else return;
+    cleanupLocksRef.current.add(key);
+    publishCleanup(reference, "working");
+    try {
+      const result = action === "result"
+        ? await assistantOrchestrator.confirmResultDisplayed(reference, { isCurrent: matchesDisplayed })
+        : action === "expiry"
+          ? await assistantRecoveryStorage.cleanup(reference, reference.serverId, evidence!, { isCurrent: matchesDisplayed })
+          : await assistantRecoveryStorage.removeManually(reference, { confirmed: true }, { isCurrent: inCurrentView });
+      if (inCurrentView()) { publishCleanup(reference, result); setCleanupRevision(value => value + 1); }
+    } catch { if (inCurrentView()) publishCleanup(reference, "failed"); }
+    finally { cleanupLocksRef.current.delete(key); }
+  };
+
   const handleSend = () => {
     if (!isMockScheduleMode()) { void sendServerInput(); return; }
     const text = inputTextRef.current.trim();
@@ -639,6 +736,29 @@ export default function AssistantScreen() {
   };
 
   const mockMode = isMockScheduleMode(), currentServerId = assistantHttpClient.getServerId();
+  const cleanupGeneration = scheduleDataModeStore.getState().generation;
+  const nextCleanupScope = JSON.stringify([mockMode ? "mock" : "server", currentServerId, cleanupGeneration]);
+  // 서버 경계가 바뀐 render에서는 이전 확인 UI를 커밋하기 전에 해당 화면 상태만 초기화한다.
+  if (cleanupScope !== nextCleanupScope) {
+    setCleanupScope(nextCleanupScope);
+    setCleanupStates({});
+  }
+  useEffect(() => {
+    manualConfirmationsRef.current.clear();
+  }, [mockMode, currentServerId, cleanupGeneration]);
+  useEffect(() => {
+    if (mockMode) return;
+    let subscribed = true;
+    const current = () => subscribed && mountedRef.current && !isMockScheduleMode() &&
+      assistantHttpClient.getServerId() === currentServerId && scheduleDataModeStore.getState().generation === cleanupGeneration;
+    // 다른 서버의 기록도 수동 정리 대상으로 읽기만 하며 해당 서버로 통신하지 않는다.
+    void assistantRecoveryStorage.readAll().then(records => {
+      if (!current()) return;
+      setRecoveryRecords(previous => JSON.stringify(previous) === JSON.stringify(records) ? previous : records);
+      setRecoveryReadError(false);
+    }).catch(() => { if (current()) setRecoveryReadError(true); });
+    return () => { subscribed = false; };
+  }, [messages, mockMode, currentServerId, cleanupGeneration, cleanupRevision]);
   const recoveryMatches = !mockMode && recoverySnapshot.serverId === currentServerId;
   const recoveryPending = !mockMode && currentServerId !== null &&
     (!recoveryMatches || recoverySnapshot.initialCheck === "pending") &&
@@ -650,6 +770,18 @@ export default function AssistantScreen() {
     const serverId = message.serverId !== undefined ? message.serverId
       : message.role === "assistant" ? message.apiExecution?.reference.serverId : undefined;
     return mockMode ? serverId === undefined : serverId !== undefined && serverId === currentServerId;
+  });
+  const cleanupReferences = new Map(recoveryRecords.map(record => [assistantRecoveryKey(record),
+    { serverId: record.serverId, requestId: record.requestId }]));
+  for (const [key, value] of Object.entries(cleanupStates)) cleanupReferences.set(key, value.reference);
+  const recoveryControls: AssistantRecoveryControl[] = mockMode ? [] : [...cleanupReferences].map(([key, reference]) => {
+    const message = visibleMessages.find(message => message.role === "assistant" && message.apiExecution &&
+      assistantRecoveryKey(message.apiExecution.reference) === key);
+    const execution = message?.role === "assistant" ? message.apiExecution : undefined;
+    const sameServer = reference.serverId === currentServerId;
+    return { reference, phase: cleanupStates[key]?.phase, executionToken: execution ? JSON.stringify(execution) : undefined,
+      resultConfirmable: sameServer && execution?.kind === "completed" && ["outcome", "failure"].includes(execution.response.data.result.kind),
+      expiryConfirmable: sameServer && Boolean(execution && assistantRequestExpiryEvidence(execution)) };
   });
   const questionView = !mockMode && questionUi?.serverId === currentServerId &&
     questionUi.generation === scheduleDataModeStore.getState().generation ? questionUi : null;
@@ -697,6 +829,9 @@ export default function AssistantScreen() {
           expiredApiConfirmations={questionView?.expiredConfirmations}
           onApiConfirmation={(messageId, approved) => { if (!isMockScheduleMode()) void sendServerInput({ type: "confirmation", messageId, approved }); }}
           uncertainViews={uncertainView?.views}
+          recoveryControls={recoveryControls}
+          recoveryStorageError={!mockMode && recoveryReadError}
+          onRecoveryAction={(control, action) => { void handleRecoveryAction(control, action, currentServerId, cleanupGeneration); }}
           onUncertainCheck={requestId => { void checkUncertain(requestId, uncertainView?.serverId, uncertainView?.generation); }}
           onUncertainAcknowledge={requestId => acknowledgeUncertain(requestId, uncertainView?.serverId, uncertainView?.generation)}
           onDeleteConfirmation={(messageId, confirmed) =>
