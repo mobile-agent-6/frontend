@@ -619,10 +619,11 @@ export default function AssistantScreen() {
   };
 
   const handleRecoveryAction = async (control: AssistantRecoveryControl, action: AssistantRecoveryControlAction,
-    viewServerId: string | null, generation: number) => {
+    viewServerId: string | null, generation: number, displayCurrent?: () => boolean) => {
     const reference = { ...control.reference }, key = assistantRecoveryKey(reference);
     const inCurrentView = () => mountedRef.current && !isMockScheduleMode() &&
-      scheduleDataModeStore.getState().generation === generation && assistantHttpClient.getServerId() === viewServerId;
+      scheduleDataModeStore.getState().generation === generation && assistantHttpClient.getServerId() === viewServerId &&
+      (displayCurrent?.() ?? true);
     if (!inCurrentView() || cleanupLocksRef.current.has(key)) return;
     if (action === "manual") {
       manualConfirmationsRef.current.set(key, { serverId: viewServerId, generation });
@@ -653,7 +654,7 @@ export default function AssistantScreen() {
       manualConfirmationsRef.current.delete(key);
     } else return;
     cleanupLocksRef.current.add(key);
-    publishCleanup(reference, "working");
+    if (!displayCurrent) publishCleanup(reference, "working");
     try {
       const result = action === "result"
         ? await assistantOrchestrator.confirmResultDisplayed(reference, { isCurrent: matchesDisplayed })
@@ -661,6 +662,7 @@ export default function AssistantScreen() {
           ? await assistantRecoveryStorage.cleanup(reference, reference.serverId, evidence!, { isCurrent: matchesDisplayed })
           : await assistantRecoveryStorage.removeManually(reference, { confirmed: true }, { isCurrent: inCurrentView });
       if (inCurrentView()) { publishCleanup(reference, result); setCleanupRevision(value => value + 1); }
+      return result;
     } catch { if (inCurrentView()) publishCleanup(reference, "failed"); }
     finally { cleanupLocksRef.current.delete(key); }
   };
@@ -875,6 +877,14 @@ export default function AssistantScreen() {
           retryingScheduleSync={retryingScheduleSync}
           onScheduleSyncRetry={reference => { void retryScheduleSync(reference, currentServerId, cleanupGeneration); }}
           recoveryControls={recoveryControls}
+          onResultDisplayed={result => {
+            const control = recoveryControls.find(value => assistantRecoveryKey(value.reference) === assistantRecoveryKey(result.reference));
+            const message = committedMessagesRef.current.find(value => value.id === result.messageId);
+            if (!control?.resultConfirmable || control.executionToken !== result.executionToken || message?.role !== "assistant" ||
+              !message.apiExecution || JSON.stringify(message.apiExecution) !== result.executionToken || !result.isCurrent()) return Promise.resolve(false);
+            return handleRecoveryAction(control, "result", currentServerId, cleanupGeneration, result.isCurrent)
+              .then(status => status === "removed" || status === "not-found");
+          }}
           recoveryStorageError={!mockMode && recoveryReadError}
           onRecoveryAction={(control, action) => { void handleRecoveryAction(control, action, currentServerId, cleanupGeneration); }}
           onUncertainCheck={requestId => { void checkUncertain(requestId, uncertainView?.serverId, uncertainView?.generation); }}

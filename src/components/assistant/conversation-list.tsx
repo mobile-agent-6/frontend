@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useImperativeHandle, useRef, type Ref } from "react";
-import { FlatList, Keyboard, StyleSheet, Text, View } from "react-native";
+import { useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, type ComponentRef, type Ref } from "react";
+import { AppState, Dimensions, FlatList, Keyboard, StyleSheet, Text, View } from "react-native";
+import { useFocusEffect } from "expo-router";
 
 import { AssistantMessage } from "@/components/assistant/assistant-message";
 import { ThemedText } from "@/components/ui/themed-text";
@@ -17,6 +18,7 @@ import type { AssistantUncertainView } from "@/utils/assistant-uncertain";
 import type { AssistantScheduleSyncEntry } from "@/services/api/assistant-schedule-sync";
 import type { AssistantRecoveryReference } from "@/types/assistant-recovery";
 import { assistantRecoveryKey, type AssistantRecoveryControl, type AssistantRecoveryControlAction } from "@/utils/assistant-recovery-cleanup";
+import { createAssistantResultVisibility, isAssistantResultFullyVisible, type AssistantDisplayedResult, type AssistantVisibleResult } from "@/utils/assistant-result-visibility";
 
 // 화면 메시지와 공개 API 결과를 구분하며 API 원형은 현재 실행 세션에만 보관한다.
 export type ConversationMessage = {
@@ -68,6 +70,7 @@ type ConversationListProps = {
   scheduleSyncEntries?: readonly AssistantScheduleSyncEntry[];
   retryingScheduleSync?: readonly string[];
   onScheduleSyncRetry?: (reference: AssistantRecoveryReference) => void;
+  onResultDisplayed?: (result: AssistantDisplayedResult) => Promise<boolean>;
 };
 
 export function ConversationList({
@@ -93,6 +96,7 @@ export function ConversationList({
   scheduleSyncEntries,
   retryingScheduleSync,
   onScheduleSyncRetry,
+  onResultDisplayed,
 }: ConversationListProps) {
   const listRef = useRef<FlatList<ConversationMessage>>(null);
   const messageCount = messages.length;
@@ -103,6 +107,60 @@ export function ConversationList({
   const keyboardVisibleRef = useRef(Keyboard.isVisible());
   const scrollFrameRef = useRef<number | null>(null);
   const followNewMessagesRef = useRef(false);
+  const focusedRef = useRef(false), mountedRef = useRef(true);
+  const textRefs = useRef(new Map<string, { token: string; node: ComponentRef<typeof Text> }>());
+  const displayedCallback = useRef(onResultDisplayed);
+  const visibilityRef = useRef<ReturnType<typeof createAssistantResultVisibility> | null>(null);
+  const visibleResults = useMemo(() => {
+    const results = new Map<string, AssistantVisibleResult>();
+    for (const message of messages) if (message.role === "assistant" && message.apiExecution?.kind === "completed" &&
+      ["outcome", "failure"].includes(message.apiExecution.response.data.result.kind)) results.set(message.id, {
+        messageId: message.id, reference: message.apiExecution.reference, executionToken: JSON.stringify(message.apiExecution),
+        contentToken: JSON.stringify([message.text, message.apiExecution.response.data]),
+      });
+    return results;
+  }, [messages]);
+  useLayoutEffect(() => {
+    displayedCallback.current = onResultDisplayed;
+  }, [onResultDisplayed]);
+  useLayoutEffect(() => {
+    if (visibilityRef.current === null) visibilityRef.current = createAssistantResultVisibility({
+    isActive: () => mountedRef.current && focusedRef.current && AppState.currentState === "active",
+    onDisplayed: result => displayedCallback.current?.({ ...result,
+      isCurrent: () => result.isCurrent() && textRefs.current.get(result.messageId)?.token === result.executionToken,
+    }) ?? Promise.resolve(false),
+    measure: result => new Promise(resolve => {
+      const viewport = listRef.current?.getNativeScrollRef();
+      const text = textRefs.current.get(result.messageId);
+      if (!viewport || !("measureInWindow" in viewport) || typeof viewport.measureInWindow !== "function" ||
+        !text || text.token !== result.executionToken || typeof text.node.measureInWindow !== "function") { resolve(false); return; }
+      viewport.measureInWindow((x: number, y: number, width: number, height: number) => {
+        try {
+          text.node.measureInWindow((tx, ty, tw, th) => {
+            try { resolve(textRefs.current.get(result.messageId) === text && isAssistantResultFullyVisible(
+              { x: tx, y: ty, width: tw, height: th }, { x, y, width, height }, Dimensions.get("window"))); }
+            catch { resolve(false); }
+          });
+        } catch { resolve(false); }
+      });
+    }),
+    });
+    // 커밋된 후보만 갱신한다. 정리는 별도의 native 레이아웃·측정 증거를 기다린다.
+    visibilityRef.current.update([...visibleResults.values()]);
+    visibilityRef.current.refresh();
+  }, [visibleResults]);
+  useFocusEffect(useCallback(() => {
+    const visibility = visibilityRef.current;
+    focusedRef.current = true; visibility?.refresh();
+    return () => { focusedRef.current = false; visibility?.invalidate(); };
+  }, []));
+  useEffect(() => {
+    const visibility = visibilityRef.current;
+    mountedRef.current = true;
+    const subscription = AppState.addEventListener("change", () => visibility?.refresh());
+    visibility?.refresh();
+    return () => { mountedRef.current = false; visibility?.invalidate(); subscription.remove(); };
+  }, []);
 
   const scheduleScrollToEnd = useCallback((animated: boolean) => {
     if (scrollFrameRef.current !== null) {
@@ -194,14 +252,17 @@ export function ConversationList({
           offsetY: nativeEvent.contentOffset.y,
         };
         updateNearBottom();
+        visibilityRef.current?.refresh();
       }}
       scrollEventThrottle={16}
       onContentSizeChange={(_, height) => {
+        visibilityRef.current?.refresh();
         scrollMetricsRef.current.contentHeight = height;
         updateNearBottom();
         if (followNewMessagesRef.current) scheduleScrollToEnd(false);
       }}
       onLayout={({ nativeEvent }) => {
+        visibilityRef.current?.refresh();
         const height = nativeEvent.layout.height;
         const shrank = height < scrollMetricsRef.current.viewportHeight;
         // 키보드 표시 이벤트보다 레이아웃 변경이 먼저 오는 경우도 위치를 보존한다.
@@ -215,6 +276,7 @@ export function ConversationList({
         }
       }}
       onScrollBeginDrag={() => {
+        visibilityRef.current?.invalidate();
         followNewMessagesRef.current = false;
         if (scrollFrameRef.current !== null) {
           cancelAnimationFrame(scrollFrameRef.current);
@@ -241,6 +303,7 @@ export function ConversationList({
           {recoveryControls?.filter(control => !messages.some(message => message.role === "assistant" && message.apiExecution &&
             assistantRecoveryKey(message.apiExecution.reference) === assistantRecoveryKey(control.reference))).map(control => (
             <AssistantMessage key={`recovery-${assistantRecoveryKey(control.reference)}`} text="이전 요청의 로컬 복구 기록이 남아 있어요."
+              recoveryIssue
               recoveryControl={control} onRecoveryAction={onRecoveryAction ? action => onRecoveryAction(control, action) : undefined} />
           ))}
           {recoveryStorageError && <AssistantMessage text="로컬 복구 기록을 읽지 못했어요. 기록을 삭제하지 않았으며 저장 상태 확인이 필요해요." />}
@@ -254,12 +317,20 @@ export function ConversationList({
           <UserMessage text={item.text} />
         ) : (
           <AssistantMessage
+            resultTextKey={visibleResults.get(item.id)?.contentToken}
+            resultTextRef={visibleResults.has(item.id) ? node => {
+              const result = visibleResults.get(item.id)!;
+              if (node) textRefs.current.set(item.id, { token: result.executionToken, node });
+              else if (textRefs.current.get(item.id)?.token === result.executionToken) textRefs.current.delete(item.id);
+            } : undefined}
+            onResultTextLayout={visibleResults.has(item.id) ? () => visibilityRef.current?.laidOut(visibleResults.get(item.id)!) : undefined}
             text={item.text}
             scheduleSyncEntry={scheduleSyncForMessage(item, scheduleSyncEntries)}
             scheduleSyncRetrying={Boolean(item.apiExecution && retryingScheduleSync?.includes(assistantRecoveryKey(item.apiExecution.reference)))}
             onScheduleSyncRetry={item.apiExecution && onScheduleSyncRetry ? () => onScheduleSyncRetry(item.apiExecution!.reference) : undefined}
             recoveryControl={item.apiExecution ? recoveryControls?.find(control =>
               assistantRecoveryKey(control.reference) === assistantRecoveryKey(item.apiExecution!.reference)) : undefined}
+            recoveryIssue={item.apiExecution?.kind === "needs-attention"}
             onRecoveryAction={item.apiExecution && onRecoveryAction ? action => {
               const control = recoveryControls?.find(control => assistantRecoveryKey(control.reference) === assistantRecoveryKey(item.apiExecution!.reference));
               if (control) onRecoveryAction(control, action);
