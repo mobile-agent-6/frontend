@@ -13,6 +13,7 @@ import { ThemedView } from "@/components/ui/themed-view";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useTheme } from "@/hooks/use-theme";
 import { assistantHttpClient } from "@/services/api/assistant";
+import { assistantLifecycle, type AssistantLifecycleSnapshot } from "@/services/api/assistant-lifecycle";
 import { assistantOrchestrator, type AssistantExecutionResult, type AssistantRequestTask } from "@/services/api/assistant-orchestrator";
 import {
   resolveMockDeleteConfirmation,
@@ -24,6 +25,7 @@ import type { AssistantInteraction, AssistantStatus } from "@/types/assistant";
 import { useScheduleStore } from "@/stores/scheduleStore";
 import { isMockScheduleMode, scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
 import { parseAssistantRequestCreate, validateAssistantJsonBodySize, validateAssistantText } from "@/utils/assistant-validation";
+import { upsertAssistantExecutionMessage } from "@/utils/assistant-recovery-messages";
 
 // processing UI를 보여주기 위한 Mock 지연이며, 실제 API timeout이 아니다.
 const MOCK_PROCESSING_DELAY_MS = 700;
@@ -41,6 +43,7 @@ export default function AssistantScreen() {
   const [inputText, setInputText] = useState("");
   const [status, setStatus] = useState<AssistantStatus>("idle");
   const [isBusy, setIsBusy] = useState(false);
+  const [recoverySnapshot, setRecoverySnapshot] = useState(assistantLifecycle.getSnapshot);
   const sendLockedRef = useRef(false);
   const inputTextRef = useRef("");
   const inputRevisionRef = useRef(0);
@@ -74,14 +77,33 @@ export default function AssistantScreen() {
   }, [invalidateActiveInteraction]);
 
   const reportError = useCallback((text: string, apiExecution?: AssistantExecutionResult) => {
+    if (apiExecution) {
+      setMessages(current => upsertAssistantExecutionMessage(current, apiExecution, "request"));
+      return;
+    }
     // UUID 생성 예외가 발생한 경우에도 기존 대화 UI로 오류를 안내한다.
     const id = `assistant-error-${++errorIdRef.current}`;
     setMessages((current) => [...current, {
       id,
       role: "assistant",
       text,
-      apiExecution,
+      ...(isMockScheduleMode() ? {} : { serverId: assistantHttpClient.getServerId() }),
     }]);
+  }, []);
+
+  const reportRecoveryIssue = useCallback((snapshot: AssistantLifecycleSnapshot, serverId: string | null) => {
+    const id = `assistant-recovery-notice-${JSON.stringify(serverId)}`;
+    const { phase, initialCheck, initialization, issue } = snapshot;
+    const message: ConversationMessage = { id, role: "assistant", serverId,
+      text: initialCheck === "pending" && !issue ? "이전 요청을 확인하고 있어요. 확인 뒤 전송해 주세요."
+        : issue === "server-mismatch" ? "서버 설정이 달라 이전 요청을 확인하지 못했어요."
+        : "이전 요청의 복구 정보를 확인하지 못했어요. 결과 확인이 필요해요.",
+      recoveryIssue: { serverId: snapshot.serverId, phase, initialCheck, initialization, issue } };
+    setMessages(current => {
+      const index = current.findIndex(item => item.id === id);
+      if (index < 0) return [...current, message];
+      return JSON.stringify(current[index]) === JSON.stringify(message) ? current : current.map((item, n) => n === index ? message : item);
+    });
   }, []);
 
   const restoreInput = useCallback((text: string) => {
@@ -127,6 +149,49 @@ export default function AssistantScreen() {
       processingTimerRef.current = null;
     };
   }, []);
+
+  useEffect(() => {
+    let subscribed = true;
+    const consume = () => {
+      if (!subscribed || !mountedRef.current) return;
+      const snapshot = assistantLifecycle.getSnapshot();
+      setRecoverySnapshot(snapshot);
+      if (isMockScheduleMode()) return;
+      const serverId = assistantHttpClient.getServerId();
+      if (snapshot.serverId !== serverId) {
+        if (snapshot.serverId !== null) reportRecoveryIssue({ ...snapshot, issue: "server-mismatch" }, serverId);
+        return;
+      }
+      setMessages(current => {
+        let next = snapshot.initialCheck === "checked" && !snapshot.issue && !snapshot.initialization
+          ? current.filter(message => message.role !== "assistant" || !message.recoveryIssue || message.serverId !== serverId) : current;
+        if (next.length === current.length) next = current;
+        for (const entry of snapshot.results) {
+          if (entry.reference.serverId !== serverId) continue;
+          let execution = entry.latestResult;
+          if (!execution && entry.phase === "status" && entry.lastResponse) {
+            const response = entry.lastResponse, data = response.data;
+            execution = data.status === "completed"
+              ? { kind: "completed", reference: entry.reference, response: { ...response, data } }
+              : { kind: "observed", reference: entry.reference, response: { ...response, data } };
+          }
+          if (execution?.kind === "needs-attention" && !execution.lastResponse && entry.lastResponse) {
+            execution = { ...execution, lastResponse: entry.lastResponse };
+          }
+          if (execution && execution.reference.serverId === serverId &&
+            execution.reference.requestId.toLowerCase() === entry.reference.requestId.toLowerCase()) {
+            next = upsertAssistantExecutionMessage(next, execution, "recovery");
+          }
+        }
+        return next;
+      });
+      if (snapshot.initialization || snapshot.issue) reportRecoveryIssue(snapshot, serverId);
+    };
+    // 먼저 구독하고 즉시 다시 읽어 render와 effect 사이의 변경도 놓치지 않는다.
+    const unsubscribe = assistantLifecycle.subscribe(consume);
+    consume();
+    return () => { subscribed = false; unsubscribe(); };
+  }, [reportRecoveryIssue]);
 
   useEffect(() => {
     if (status !== "processing" || serverTaskRef.current !== null || !isMockScheduleMode()) return;
@@ -193,6 +258,13 @@ export default function AssistantScreen() {
       }
       const serverId = assistantHttpClient.getServerId();
       if (!serverId) { reportError("Assistant 서버 설정을 확인해 주세요."); return; }
+      const canStart = () => {
+        const snapshot = assistantLifecycle.getSnapshot();
+        if (snapshot.serverId === serverId && snapshot.initialCheck === "checked") return true;
+        reportRecoveryIssue(snapshot, serverId);
+        return false;
+      };
+      if (!canStart()) return;
       const requestId = Crypto.randomUUID();
       const body = parseAssistantRequestCreate({ requestId, input: { type: "text", text } });
       if (!body || !validateAssistantJsonBodySize(JSON.stringify(body)).ok) {
@@ -200,8 +272,9 @@ export default function AssistantScreen() {
         return;
       }
       if (!isCurrent() || assistantHttpClient.getServerId() !== serverId) return;
+      if (!canStart()) return;
       pendingInputRef.current = text;
-      setMessages((current) => [...current, { id: requestId, role: "user", text }]);
+      setMessages((current) => [...current, { id: requestId, role: "user", text, serverId }]);
       inputTextRef.current = "";
       setInputText("");
       setStatus("processing");
@@ -214,8 +287,7 @@ export default function AssistantScreen() {
       if (execution.kind === "completed") {
         completed = true;
         // 원본 처리 결과를 메시지에 보존하고 상세 표시는 ConversationList에 맡긴다.
-        publishResponse({ id: `assistant-${requestId}`, role: "assistant",
-          text: execution.response.data.result.text, apiExecution: execution }, false);
+        setMessages(current => upsertAssistantExecutionMessage(current, execution, "request"));
       } else {
         reportError("요청 결과를 확인하지 못했어요. 원래 요청의 확인이 필요해요.", execution);
       }
@@ -318,6 +390,20 @@ export default function AssistantScreen() {
     }
   };
 
+  const mockMode = isMockScheduleMode(), currentServerId = assistantHttpClient.getServerId();
+  const recoveryMatches = !mockMode && recoverySnapshot.serverId === currentServerId;
+  const recoveryPending = !mockMode && currentServerId !== null &&
+    (!recoveryMatches || recoverySnapshot.initialCheck === "pending") &&
+    ["idle", "recovering", "observing"].includes(recoverySnapshot.phase);
+  const recoveryProcessing = recoveryMatches && ["recovering", "observing"].includes(recoverySnapshot.phase) &&
+    recoverySnapshot.results.some(entry => entry.reference.serverId === currentServerId &&
+      entry.latestResult?.kind !== "needs-attention" && entry.lastResponse?.data.status !== "completed" && Boolean(entry.lastResponse));
+  const visibleMessages = messages.filter(message => {
+    const serverId = message.serverId !== undefined ? message.serverId
+      : message.role === "assistant" ? message.apiExecution?.reference.serverId : undefined;
+    return mockMode ? serverId === undefined : serverId !== undefined && serverId === currentServerId;
+  });
+
   return (
     <ThemedView
       style={[
@@ -335,8 +421,8 @@ export default function AssistantScreen() {
       >
         <ConversationList
           ref={conversationListRef}
-          messages={messages}
-          isProcessing={status === "processing"}
+          messages={visibleMessages.length === messages.length ? messages : visibleMessages}
+          isProcessing={status === "processing" || recoveryPending || recoveryProcessing}
           interactionsDisabled={isBusy || status === "processing"}
           onDeleteConfirmation={(messageId, confirmed) =>
             handleInteraction(messageId, { type: "confirmation", confirmed })}
@@ -352,7 +438,7 @@ export default function AssistantScreen() {
             setInputText(text);
           }}
           onSend={handleSend}
-          disabled={isBusy || status === "processing"}
+          disabled={isBusy || status === "processing" || recoveryPending}
         />
       </KeyboardAvoidingView>
     </ThemedView>

@@ -43,6 +43,7 @@ function harness(initialMode = "mock") {
       // 서버 설정이 없는 기존 경계 검증은 통신 계층을 실행하지 않는다.
       if (name === "@/services/api/assistant") return { assistantHttpClient: { getServerId: () => null } };
       if (name === "@/services/api/assistant-orchestrator") return { assistantOrchestrator: { startRequest: () => { throw new Error("서버 설정 없이 전송 금지"); } } };
+      if (name === "@/services/api/assistant-lifecycle") return { assistantLifecycle: { getSnapshot: () => ({ phase: "idle", initialCheck: "pending", serverId: null, results: [] }), subscribe: () => () => {} } };
       if (name === "react") return react;
       if (name === "react/jsx-runtime") return { jsx: (type, props) => ({ type, props }), jsxs: (type, props) => ({ type, props }) };
       if (name === "react-native") return { KeyboardAvoidingView: "KeyboardAvoidingView", Platform: { OS: "ios" }, StyleSheet: { create: (s) => s } };
@@ -214,8 +215,9 @@ test("모드 변경 전 후보·확인 callback은 서버 및 Mock 복귀 후 �
       h.send(input); h.fire(); const interaction = messages(h).at(-1), callbacks = h.find("ConversationList");
       h.switchMode("server");
       callbacks.onCandidateSelection(interaction.id, id(1)); callbacks.onDeleteConfirmation(interaction.id, true); h.render();
-      assert.equal(messages(h).find((m) => m.id === interaction.id).interaction.resolved, true);
-      h.switchMode("mock"); callbacks.onDeleteConfirmation(interaction.id, true); h.render();
+      assert.equal(messages(h).find((m) => m.id === interaction.id), undefined);
+      h.switchMode("mock"); assert.equal(messages(h).find((m) => m.id === interaction.id).interaction.resolved, true);
+      callbacks.onDeleteConfirmation(interaction.id, true); h.render();
       assert.equal(h.mock.getState().schedules.length, 10); assert.equal(h.find("MessageInput").disabled, false);
     } finally { h.close(); }
   }

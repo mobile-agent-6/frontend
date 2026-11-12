@@ -20,6 +20,8 @@ export type AssistantLifecycleSnapshot = Readonly<{
   // 로컬 복구 실행 상태이며 일정 변경 성공이나 uncertain 해소를 뜻하지 않는다.
   phase: "idle" | "recovering" | "observing" | "settled" | "paused" | "unavailable" | "needs-attention" | "stopped";
   serverId: string | null;
+  // 최초 GET 확인과 이후 polling을 구분한다. checked는 작업 성공이나 불확실 해소가 아니다.
+  initialCheck: "pending" | "checked" | "failed";
   results: readonly AssistantLifecycleEntry[];
   initialization?: Exclude<AssistantRecoveryInitialization, { kind: "initialized" }>;
   issue?: "server-not-ready" | "server-mismatch" | "policy" | "unexpected";
@@ -52,20 +54,21 @@ export function createAssistantLifecycle({
   // 기존 복구 metadata와 구분되는 실행 세션 내 최신 결과만 보관하며 영속 저장하지 않는다.
   const entries = new Map<string, AssistantLifecycleEntry>();
   const owners = new Set<symbol>(), subscribers = new Set<() => void>();
-  let snapshot: AssistantLifecycleSnapshot = freeze({ phase: "idle", serverId: null, results: [] });
+  let initialCheck: AssistantLifecycleSnapshot["initialCheck"] = "pending";
+  let snapshot: AssistantLifecycleSnapshot = freeze({ phase: "idle", serverId: null, initialCheck, results: [] });
   let epoch = 0, active = false, listening = false;
   let controller: AbortController | null = null;
   let unsubscribeApp: (() => void) | undefined, unsubscribeMode: (() => void) | undefined;
   let tail: Promise<void> = Promise.resolve();
 
-  function publish(update: Omit<AssistantLifecycleSnapshot, "results">) {
-    snapshot = freeze({ ...update, results: [...entries.values()] });
+  function publish(update: Omit<AssistantLifecycleSnapshot, "results" | "initialCheck">) {
+    snapshot = freeze({ ...update, initialCheck, results: [...entries.values()] });
     for (const subscriber of [...subscribers]) {
       // 화면 구독자 예외로 앱 초기화·다른 구독자·요청 제어를 중단하지 않는다.
       try { subscriber(); } catch {}
     }
   }
-  function stopCycle() { epoch++; controller?.abort(); controller = null; }
+  function stopCycle() { epoch++; initialCheck = "pending"; controller?.abort(); controller = null; }
   function context() {
     try { return { serverId: http.getServerId(), ...mode.getState() }; }
     catch { return { serverId: null, mode: "server" as const, generation: -1 }; }
@@ -74,11 +77,13 @@ export function createAssistantLifecycle({
     const scope = context();
     if (!owners.size || !active) return;
     if (!scope.serverId || scope.mode !== "server") {
+      initialCheck = "failed";
       publish({ phase: "unavailable", serverId: scope.serverId, issue: scope.mode === "mock" ? "policy" : "server-not-ready" });
       return;
     }
     if (snapshot.serverId !== scope.serverId) entries.clear();
     const serverId = scope.serverId, current = ++epoch, signalController = new AbortController();
+    initialCheck = "pending";
     controller = signalController;
     publish({ phase: "recovering", serverId });
     function valid() {
@@ -111,12 +116,18 @@ export function createAssistantLifecycle({
         if (initialized.kind === "initialized") tasks = initialized.requests;
         if (!valid()) return;
         if (initialized.kind === "needs-attention") {
+          initialCheck = "failed";
           publish({ phase: "needs-attention", serverId, initialization: copy(initialized) });
           return;
         }
         const keys = new Set(tasks.map(item => keyOf(item.reference)));
         for (const key of entries.keys()) if (!keys.has(key)) entries.delete(key);
         tasks.forEach(item => capture(item.initial));
+        // 예약 충돌·저장소 실패 등으로 GET 자체를 시작하지 못한 항목은 확인 완료로 취급하지 않는다.
+        initialCheck = tasks.some(({ initial }) => initial.kind === "needs-attention" &&
+          (!initial.recoveryResult || (initial.recoveryResult.kind === "unconfirmed" &&
+            (!initial.recoveryResult.getResult || (!initial.recoveryResult.getResult.ok &&
+              initial.recoveryResult.getResult.error.requestState === "not-sent"))))) ? "failed" : "checked";
         publish({ phase: "observing", serverId });
         await Promise.all(tasks.map(async item => {
           capture(await item.task.completion);
@@ -124,7 +135,7 @@ export function createAssistantLifecycle({
         }));
         if (valid()) publish({ phase: [...entries.values()].some(item => item.latestResult?.kind === "needs-attention") ? "needs-attention" : "settled", serverId });
       } catch {
-        if (valid()) publish({ phase: "needs-attention", serverId, issue: "unexpected" });
+        if (valid()) { initialCheck = "failed"; publish({ phase: "needs-attention", serverId, issue: "unexpected" }); }
       } finally {
         // 다음 active 복구는 이전 처리의 중단·예약 해제를 기다린다. cancel은 로컬 중단만 수행한다.
         if (!valid()) tasks.forEach(item => item.task.cancel());

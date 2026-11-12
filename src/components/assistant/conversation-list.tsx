@@ -7,6 +7,7 @@ import { ThemedView } from "@/components/ui/themed-view";
 import { Spacing } from "@/constants/theme";
 import { useTheme } from "@/hooks/use-theme";
 import type { AssistantExecutionResult } from "@/services/api/assistant-orchestrator";
+import type { AssistantLifecycleSnapshot } from "@/services/api/assistant-lifecycle";
 import type { AssistantInteraction } from "@/types/assistant";
 import type { Schedule } from "@/types/schedule";
 import { assistantResultToDisplay } from "@/utils/assistant-mapper";
@@ -15,6 +16,8 @@ import { assistantResultToDisplay } from "@/utils/assistant-mapper";
 export type ConversationMessage = {
   id: string;
   text: string;
+  // undefined는 Mock, null은 서버 설정 확인 전의 서버 메시지를 뜻한다.
+  serverId?: string | null;
 } & (
   | { role: "user" }
   | {
@@ -22,6 +25,8 @@ export type ConversationMessage = {
       schedules?: readonly Schedule[];
       interaction?: AssistantInteraction;
       apiExecution?: AssistantExecutionResult;
+      apiSource?: "request" | "recovery";
+      recoveryIssue?: Pick<AssistantLifecycleSnapshot, "serverId" | "phase" | "initialCheck" | "initialization" | "issue">;
     }
 );
 

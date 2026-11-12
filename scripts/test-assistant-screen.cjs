@@ -24,11 +24,13 @@ const deferred = () => { let resolve; const promise = new Promise(r => { resolve
 
 // 실제 화면 Hook·HTTP·복구·polling을 실행하고 native·시계·storage·fetch만 프로세스 대역으로 둔다.
 // 실제 단말 렌더링·키보드·네트워크 시험은 아니다.
-function harness({ initialMode = "server", readOnly = false, data = new Map() } = {}) {
+function harness({ initialMode = "server", readOnly = false, data = new Map(), initialSnapshot, actualLifecycle = false, snapshotAtSubscribe, notifyOnSubscribe = false } = {}) {
   const cache = new Map(), slots = [], effects = [], timers = new Map(), listeners = new Set();
   let cursor = 0, dirty = false, tree, wall = 1000, mono = 0, timerId = 0, closed = false, displaying = false;
   const state = { app: "active", calls: [], starts: [], uuidCalls: 0, failUuid: false, failStorage: false, throwMessage: false,
-    cleanup: 0, lateUpdates: 0, mockRuns: 0, beforeUuid: null, config: null,
+    cleanup: 0, lateUpdates: 0, mockRuns: 0, beforeUuid: null, config: null, failRead: false, beforeRead: null,
+    recoveryListeners: new Set(), lastRecoveryListener: null, beforeSubscribe: null, initializations: 0, unsubscribed: 0,
+    snapshot: initialSnapshot ?? { phase: "settled", initialCheck: "checked", serverId, results: [] },
     handle: async (url, init) => init.method === "POST" ? json(status(JSON.parse(init.body).requestId), 202) : json(done(url.split("/").pop())) };
   const same = (a, b) => a && b && a.length === b.length && a.every((v, i) => Object.is(v, b[i]));
   const react = {
@@ -47,7 +49,7 @@ function harness({ initialMode = "server", readOnly = false, data = new Map() } 
   const setTimer = (fn, ms) => { const token = ++timerId; timers.set(token, { fn, at: mono + ms, ms }); return token; };
   const clearTimer = token => timers.delete(token);
   const send = (url, init) => { state.calls.push({ url, init }); return state.handle(url, init); };
-  const adapter = { async getItem(key) { return data.get(key) ?? null; }, async setItem(key, value) { if (state.failStorage) throw Error("저장 실패"); data.set(key, value); } };
+  const adapter = { async getItem(key) { if (state.beforeRead) await state.beforeRead(); if (state.failRead) throw Error("조회 실패"); return data.get(key) ?? null; }, async setItem(key, value) { if (state.failStorage) throw Error("저장 실패"); data.set(key, value); } };
   const native = { AppState: { get currentState() { return state.app; }, addEventListener(event, listener) { assert.equal(event, "change"); listeners.add(listener); return { remove: () => listeners.delete(listener) }; } },
     KeyboardAvoidingView: "KeyboardAvoidingView", FlatList: "FlatList", Keyboard: { isVisible: () => false }, Platform: { OS: "ios" }, StyleSheet: { create: s => s }, Text: "Text", View: "View", Pressable: "Pressable" };
   function load(file) {
@@ -84,6 +86,15 @@ function harness({ initialMode = "server", readOnly = false, data = new Map() } 
   const orchestrator = api.createAssistantOrchestrator({ http, requests: recovery, storage: { ...storage, cleanup: async (...args) => { state.cleanup++; return storage.cleanup(...args); } }, clock: { now: () => wall, monotonicNow: () => mono } });
   const delegate = { startRequest: (...args) => { state.starts.push(args); return orchestrator.startRequest(...args); } }; api.assistantOrchestrator = delegate;
   const mode = source("src/stores/scheduleDataModeStore.ts"), mock = source("src/stores/scheduleStore.ts").useScheduleStore;
+  const lifecycleModule = source("src/services/api/assistant-lifecycle.ts");
+  const realLifecycle = lifecycleModule.createAssistantLifecycle({ http, orchestrator: { initializeRecovery: options => { state.initializations++; return orchestrator.initializeRecovery(options); } } });
+  const lifecycle = actualLifecycle ? realLifecycle : { getSnapshot: () => state.snapshot, subscribe(listener) {
+    state.recoveryListeners.add(listener); state.lastRecoveryListener = listener;
+    if (snapshotAtSubscribe) state.snapshot = snapshotAtSubscribe;
+    state.beforeSubscribe?.(); if (notifyOnSubscribe) listener();
+    return () => { state.recoveryListeners.delete(listener); state.unsubscribed++; };
+  } };
+  lifecycleModule.assistantLifecycle = lifecycle;
   const mockService = source("src/services/mock/assistant.ts"), originalMock = mockService.runMockAssistantScenario;
   mockService.runMockAssistantScenario = (...args) => { state.mockRuns++; return originalMock(...args); };
   const Screen = source("src/app/(tabs)/assistant.tsx").default;
@@ -108,13 +119,16 @@ function harness({ initialMode = "server", readOnly = false, data = new Map() } 
     return { list, components, rows: messages.map(item => expand(list.props.renderItem({ item }))) };
   }
   render();
-  return { state, source, storage, data, mock, mode, delegate, render, renderConversation, find, settle, advance, timers, listeners,
+  return { state, source, storage, data, mock, mode, delegate, lifecycle, render, renderConversation, find, settle, advance, timers, listeners,
+    get wall() { return wall; }, set wall(value) { wall = value; },
     messages: () => find("ConversationList").messages,
     edit(text) { find("MessageInput").onChangeText(text); render(); },
     send(text) { this.edit(text); find("MessageInput").onSend(); render(); },
     switchMode(value) { mode.scheduleDataModeStore.getState().setMode(value); render(); },
+    publishSnapshot(snapshot) { state.snapshot = snapshot; for (const listener of [...state.recoveryListeners]) listener(); render(); },
+    attachLifecycle: () => realLifecycle.attach(),
     app(value) { state.app = value; for (const listener of [...listeners]) listener(value); },
-    close() { closed = true; slots.forEach(slot => slot?.cleanup?.()); },
+    close() { if (closed) return; closed = true; slots.forEach(slot => slot?.cleanup?.()); },
   };
 }
 
@@ -384,5 +398,192 @@ test("완료되지 않은 API 오류 메시지는 과거 응답으로 상세 성
     h.state.handle = async () => { throw Error("네트워크 실패"); }; h.send("조회"); await h.settle();
     const view = h.renderConversation(); assert.equal(cards(view).length, 0); assert.equal(nodes(view.rows, "Pressable").length, 0);
     assert.equal(h.messages().at(-1).apiExecution.kind, "needs-attention"); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
+
+const recoveryRef = (requestId = id(600), server = serverId) => ({ requestId, serverId: server });
+const recovered = (kind = "outcome", requestId = id(600), server = serverId) => ({ kind: "completed", reference: recoveryRef(requestId, server),
+  response: { ok: true, data: done(requestId, kind), status: 200, serverId: server, httpRequestId: id(900), metadata: { status: "updated" } } });
+const observedRecovery = (value = "processing", requestId = id(600)) => ({ kind: "observed", reference: recoveryRef(requestId),
+  response: { ok: true, data: status(requestId, value), status: 200, serverId, httpRequestId: id(900), metadata: { status: "updated" } } });
+function snapshotOf(executions = [], extra = {}) {
+  return { phase: "settled", initialCheck: "checked", serverId, results: executions.map(execution => ({ reference: execution.reference,
+    latestResult: execution, lastResponse: execution.kind === "needs-attention" ? execution.lastResponse : execution.response })), ...extra };
+}
+const recoveredError = (kind, httpStatus, code) => ({ kind: "needs-attention", reason: "unconfirmed", reference: recoveryRef(),
+  recoveryResult: { kind: "unconfirmed", reason: "http-error", reference: recoveryRef(), retransmitted: false,
+    getResult: { ok: false, error: { kind, operation: "get", requestState: "response-received", status: httpStatus, serverId, assistantRequestId: id(600),
+      ...(code ? { problem: { type: "https://example.invalid/problem", title: "오류", status: httpStatus, detail: "문구 파싱 금지", instance: "/api/v1/assistant/requests", requestId: id(900), code, assistantRequestId: id(600), blockingRequestId: id(601), activeQuestionId: id(602), activeQuestionRequestId: id(603) } } : {}) } } } });
+
+for (const kind of Object.keys(results)) test(`초기 복구 ${kind}: 실제 상세 표시·원본 context 유지·UserMessage/POST/정리 0회`, async () => {
+  const execution = recovered(kind), snapshot = snapshotOf([execution]);
+  const h = harness({ initialSnapshot: snapshot }); try {
+    await h.settle(); assert.equal(h.messages().length, 1); assert.equal(h.messages()[0].role, "assistant");
+    assert.deepEqual(h.messages()[0].apiExecution, execution); const view = h.renderConversation();
+    assert.equal(nodes(view.rows, "Text")[0].props.children, results[kind].text); assert.equal(h.state.calls.length, 0); assert.equal(h.state.uuidCalls, 0); assert.equal(h.state.cleanup, 0);
+    for (const button of nodes(view.rows, "Pressable")) { assert.equal(button.props.disabled, true); assert.equal(button.props.onPress, undefined); }
+    assert.equal(h.state.initializations, 0); assert.equal(h.state.recoveryListeners.size, 1);
+  } finally { h.close(); }
+});
+
+for (const notifyOnSubscribe of [false, true]) test(`구독 경계 ${notifyOnSubscribe ? "동기 알림" : "알림 누락"}도 최신 snapshot을 다시 읽어 표시`, async () => {
+  const h = harness({ initialSnapshot: snapshotOf(), snapshotAtSubscribe: snapshotOf([recovered()]), notifyOnSubscribe });
+  try { await h.settle(); assert.equal(h.messages().length, 1); assert.equal(h.messages()[0].text, results.outcome.text); assert.equal(h.state.calls.length, 0); }
+  finally { h.close(); }
+});
+
+test("구독 결과 갱신·반복 snapshot·UUID 대소문자는 같은 메시지 ID/위치 유지", async () => {
+  const h = harness(); try {
+    h.publishSnapshot(snapshotOf([observedRecovery("accepted")])); const messageId = h.messages()[0].id;
+    h.publishSnapshot(snapshotOf([observedRecovery("processing")])); assert.equal(h.messages()[0].id, messageId);
+    h.publishSnapshot(snapshotOf([recovered("uncertain", id(600).toUpperCase())]));
+    for (let n = 0; n < 4; n++) h.publishSnapshot(snapshotOf([recovered("uncertain")]));
+    assert.equal(h.messages().length, 1); assert.equal(h.messages()[0].id, messageId); assert.equal(h.messages()[0].apiExecution.response.data.result.kind, "uncertain");
+    h.publishSnapshot(snapshotOf([recovered("outcome")])); assert.equal(h.messages().length, 1); assert.equal(h.messages()[0].id, messageId); assert.equal(h.messages()[0].apiExecution.response.data.result.kind, "outcome");
+    assert.equal(h.state.calls.length, 0);
+  } finally { h.close(); }
+});
+
+test("5-A 완료 후 복구 완료도 기존 사용자/응답 ID·순서를 유지하며 중복 추가 없음", async () => {
+  const h = harness(); try {
+    h.send("원래 입력"); await h.settle(); const ids = h.messages().map(m => m.id), execution = h.messages().at(-1).apiExecution;
+    h.publishSnapshot(snapshotOf([execution])); h.publishSnapshot(snapshotOf([execution]));
+    assert.deepEqual(h.messages().map(m => m.id), ids); assert.equal(h.messages().filter(m => m.role === "user").length, 1); assert.equal(h.state.starts.length, 1);
+  } finally { h.close(); }
+});
+
+test("복구 완료 뒤 늦은 최초 완료·중단 callback은 최신 outcome을 되돌리지 않음", async () => {
+  for (const lateKind of ["completed", "needs-attention"]) {
+    const h = harness(), gate = deferred(); h.delegate.startRequest = (body, options) => { h.state.starts.push([body, options]); return { initial: gate.promise, completion: gate.promise, cancel() {} }; };
+    try {
+      h.send("원래 입력"); const requestId = h.state.starts[0][0].requestId;
+      h.publishSnapshot(snapshotOf([recovered("outcome", requestId)])); const ids = h.messages().map(m => m.id);
+      gate.resolve(lateKind === "completed" ? recovered("uncertain", requestId) : { kind: "needs-attention", reason: "paused", reference: recoveryRef(requestId) }); await h.settle();
+      assert.deepEqual(h.messages().map(m => m.id), ids); assert.equal(h.messages().at(-1).apiExecution.response.data.result.kind, "outcome"); assert.equal(h.state.starts.length, 1);
+    } finally { h.close(); }
+  }
+});
+
+test("accepted/processing 복구는 processing 표시만 사용하며 completed 카드로 변환하지 않음", async () => {
+  const h = harness(); try {
+    for (const value of ["accepted", "processing"]) {
+      h.publishSnapshot(snapshotOf([observedRecovery(value)], { phase: "observing" }));
+      assert.equal(h.find("ConversationList").isProcessing, true); assert.equal(cards(h.renderConversation()).length, 0);
+      assert.equal(h.messages()[0].apiExecution.kind, "observed"); assert.equal(Object.hasOwn(h.messages()[0].apiExecution.response.data, "result"), false);
+    }
+    h.publishSnapshot(snapshotOf([recovered()])); assert.equal(h.find("ConversationList").isProcessing, false); assert.equal(h.messages().length, 1);
+  } finally { h.close(); }
+});
+
+test("과거 완료 응답을 포함한 조회 실패는 최신 오류로 보존하고 성공 카드 재표시 없음", async () => {
+  const h = harness({ initialSnapshot: snapshotOf([recovered()]) }); try {
+    const failure = recoveredError("http", 503, "ASSISTANT_UNAVAILABLE"), lastResponse = recovered().response;
+    h.publishSnapshot({ ...snapshotOf([failure], { phase: "needs-attention" }), results: [{ reference: failure.reference, latestResult: failure, lastResponse }] });
+    const message = h.messages()[0]; assert.equal(message.apiExecution.kind, "needs-attention"); assert.deepEqual(message.apiExecution.lastResponse, lastResponse); assert.equal(cards(h.renderConversation()).length, 0);
+    assert.equal(message.apiExecution.recoveryResult.getResult.error.problem.code, "ASSISTANT_UNAVAILABLE"); assert.equal(h.state.calls.length, 0);
+  } finally { h.close(); }
+});
+
+for (const [kind, code, errorCode] of [["http", 404, "ASSISTANT_REQUEST_NOT_FOUND"], ["http", 404, "ROUTE_NOT_FOUND"], ["http", 410, "REQUEST_EXPIRED"], ["http", 503, "ASSISTANT_UNAVAILABLE"], ["timeout"], ["network"], ["response"]]) test(`복구 오류 ${errorCode ?? kind}: 빈 대화와 구분·원인/복구 필드 보존·POST 없음`, async () => {
+  const failure = recoveredError(kind, code, errorCode), h = harness({ initialSnapshot: snapshotOf([failure], { phase: "needs-attention" }) });
+  try { assert.equal(h.messages().length, 1); assert.equal(h.messages()[0].apiExecution.kind, "needs-attention");
+    assert.deepEqual(h.messages()[0].apiExecution.recoveryResult.getResult.error, failure.recoveryResult.getResult.error);
+    assert.equal(h.state.calls.length, 0); assert.equal(h.state.cleanup, 0); assert.equal(cards(h.renderConversation()).length, 0);
+  } finally { h.close(); }
+});
+
+test("빈 복구와 저장소 초기화 실패를 구분하고 실패 중 신규 POST는 차단", async () => {
+  const h = harness(); try {
+    assert.deepEqual(h.messages(), []); const snapshot = snapshotOf([], { phase: "needs-attention", initialCheck: "failed", initialization: { kind: "needs-attention", reason: "storage", storageCode: "unknown" } });
+    h.publishSnapshot(snapshot); assert.equal(h.messages().length, 1); assert.deepEqual(h.messages()[0].recoveryIssue.initialization, snapshot.initialization);
+    h.send("새 입력"); assert.equal(h.state.starts.length, 0); assert.equal(h.state.uuidCalls, 0); assert.equal(h.find("MessageInput").value, "새 입력"); assert.equal(h.messages().length, 1);
+    h.publishSnapshot(snapshotOf()); assert.deepEqual(h.messages(), []); h.find("MessageInput").onSend(); await h.settle(); assert.equal(h.state.starts.length, 1);
+  } finally { h.close(); }
+});
+
+test("최초 snapshot 확인 전 잠금·UUID 생성 중 새 복구 시작도 POST 이전 재검사", async () => {
+  const pendingSnapshot = snapshotOf([], { phase: "recovering", initialCheck: "pending" }), h = harness({ initialSnapshot: pendingSnapshot });
+  try {
+    h.send("새 입력"); assert.equal(h.state.starts.length, 0); assert.equal(h.state.uuidCalls, 0); assert.equal(h.find("MessageInput").disabled, true);
+    h.publishSnapshot(snapshotOf()); h.state.beforeUuid = () => h.publishSnapshot(pendingSnapshot);
+    h.find("MessageInput").onSend(); await h.settle(); assert.equal(h.state.starts.length, 0); assert.equal(h.find("MessageInput").value, "새 입력"); assert.equal(h.state.calls.length, 0);
+  } finally { h.close(); }
+});
+
+test("Mock에서 복구 결과 숨김·서버 복귀 구독 표시·Mock 후보 기능 유지", async () => {
+  const h = harness({ initialMode: "mock", initialSnapshot: snapshotOf([recovered()]) }); try {
+    assert.deepEqual(h.messages(), []); h.send("재고 일정 삭제해 줘"); await h.advance(700); const mockId = h.messages().at(-1).id;
+    h.publishSnapshot(snapshotOf([recovered("confirmation")])); assert.equal(h.messages().some(m => m.apiExecution), false);
+    h.switchMode("server"); h.publishSnapshot(snapshotOf([recovered("confirmation")])); assert.equal(h.messages().some(m => m.id === mockId), false); assert.equal(h.messages().filter(m => m.apiExecution).length, 1);
+    h.switchMode("mock"); assert.equal(h.messages().some(m => m.apiExecution), false); assert.ok(h.messages().some(m => m.id === mockId)); assert.equal(h.state.calls.length, 0);
+  } finally { h.close(); }
+});
+
+test("서버 변경 뒤 이전 서버·같은 ID의 늦은 결과는 숨기고 새 서버 결과만 표시", async () => {
+  const h = harness({ initialSnapshot: snapshotOf([recovered()]) }), other = "development:https://other.example.invalid";
+  try {
+    h.state.config = h.source("src/services/api/config.ts").parseDevelopmentServerConfig("https://other.example.invalid");
+    h.publishSnapshot(snapshotOf([recovered("uncertain")])); assert.equal(h.messages().some(m => m.apiExecution), false);
+    h.publishSnapshot(snapshotOf([recovered("failure", id(600), other)], { serverId: other })); assert.equal(h.messages().filter(m => m.apiExecution).length, 1); assert.equal(h.messages().at(-1).apiExecution.reference.serverId, other);
+    assert.equal(h.state.calls.length, 0);
+  } finally { h.close(); }
+});
+
+test("화면 재렌더는 구독 1개·세션 유지, unmount 후 늦은 구독 callback 갱신 0회", async () => {
+  const h = harness({ initialSnapshot: snapshotOf([recovered()]) }); const messages = h.messages();
+  for (let n = 0; n < 5; n++) h.render(); assert.equal(h.state.recoveryListeners.size, 1); assert.strictEqual(h.messages(), messages);
+  h.close(); assert.equal(h.state.recoveryListeners.size, 0); assert.equal(h.state.unsubscribed, 1);
+  h.state.snapshot = snapshotOf([recovered("failure")]); h.state.lastRecoveryListener(); await h.settle(); assert.equal(h.state.lateUpdates, 0); assert.strictEqual(h.messages(), messages);
+});
+
+test("실제 lifecycle cold start: GET-only 복구·과거 UserMessage/채팅/body 저장 0회", async () => {
+  const h = harness({ actualLifecycle: true }); await h.storage.saveBeforePost(recoveryRef(), 1000); const detach = h.attachLifecycle();
+  try {
+    await h.settle(); assert.deepEqual(h.state.calls.map(c => c.init.method), ["GET"]); assert.equal(h.messages().length, 1); assert.equal(h.messages()[0].role, "assistant");
+    assert.equal(h.messages()[0].apiExecution.reference.requestId, id(600)); assert.equal(h.lifecycle.getSnapshot().initialCheck, "checked"); assert.equal(h.state.initializations, 1); assert.equal(h.state.cleanup, 0);
+    const persisted = [...h.data.values()].join(""); assert.equal(persisted.includes('"messages"'), false); assert.equal(persisted.includes('"input"'), false);
+    const restarted = harness({ actualLifecycle: true, data: h.data }); try { assert.deepEqual(restarted.messages(), []); assert.equal(restarted.state.calls.length, 0); } finally { restarted.close(); }
+  } finally { h.close(); detach(); await h.settle(); }
+});
+
+test("실제 lifecycle의 모든 최초 GET 완료 전 POST 차단·pending 기록 존재만으로 영구 차단 안 함", async () => {
+  const h = harness({ actualLifecycle: true }), gate = deferred();
+  await h.storage.saveBeforePost(recoveryRef(), 1000); await h.storage.saveBeforePost(recoveryRef(id(601)), 1000);
+  h.state.handle = async (url, init) => init.method === "POST" ? json(status(JSON.parse(init.body).requestId), 202)
+    : url.endsWith(id(601)) ? gate.promise : json(url.endsWith(id(600)) ? status(id(600), "processing") : done(url.split("/").pop()));
+  const detach = h.attachLifecycle();
+  try {
+    await h.settle(); assert.equal(h.state.calls.length, 2); assert.equal(h.lifecycle.getSnapshot().initialCheck, "pending"); h.send("새 독립 작업"); assert.equal(h.state.starts.length, 0);
+    gate.resolve(json(done(id(601)))); await h.settle(); assert.equal(h.lifecycle.getSnapshot().initialCheck, "checked"); assert.equal(h.lifecycle.getSnapshot().phase, "observing");
+    assert.equal(h.find("MessageInput").disabled, false); h.find("MessageInput").onSend(); await h.settle(); assert.equal(h.state.starts.length, 1);
+    assert.equal(h.state.calls.filter(c => c.init.method === "POST").length, 1); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); detach(); await h.settle(); }
+});
+
+test("실제 lifecycle 저장소 읽기 실패는 원인 보존·데이터 삭제/POST 0회", async () => {
+  const h = harness({ actualLifecycle: true }); await h.storage.saveBeforePost(recoveryRef(), 1000); const before = [...h.data.values()].join(""); h.state.failRead = true; const detach = h.attachLifecycle();
+  try {
+    await h.settle(); assert.equal(h.lifecycle.getSnapshot().initialCheck, "failed"); assert.equal(h.messages()[0].recoveryIssue.initialization.reason, "storage");
+    h.send("새 입력"); assert.equal(h.state.starts.length, 0); assert.equal(h.state.calls.length, 0); assert.equal([...h.data.values()].join(""), before); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); detach(); await h.settle(); }
+});
+
+test("실제 foreground의 120초 경과 단발 GET·deadline 안내·중복 메시지/POST 없음", async () => {
+  const h = harness({ actualLifecycle: true }); await h.storage.saveBeforePost(recoveryRef(), 1000); h.wall = 121000;
+  h.state.handle = async url => json(status(url.split("/").pop(), "processing")); const detach = h.attachLifecycle();
+  try {
+    await h.settle(); assert.equal(h.state.calls.length, 1); assert.equal(h.messages()[0].apiExecution.reason, "deadline"); assert.equal(h.find("ConversationList").isProcessing, false); const messageId = h.messages()[0].id;
+    h.app("background"); await h.settle(); h.app("active"); await h.settle(); assert.equal(h.state.calls.length, 2); assert.equal(h.messages().length, 1); assert.equal(h.messages()[0].id, messageId); assert.equal(h.state.cleanup, 0);
+    assert.ok(h.state.calls.every(c => c.init.method === "GET"));
+  } finally { h.close(); detach(); await h.settle(); }
+});
+
+test("uncertain 복구 수신은 위험 인지가 아니며 새 text에도 acknowledgement 자동 추가 없음", async () => {
+  const h = harness({ initialSnapshot: snapshotOf([recovered("uncertain")]) });
+  h.state.handle = async () => ({ status: 409, headers: new Headers({ "Content-Type": "application/problem+json", "X-Request-ID": id(900) }), text: async () => JSON.stringify({ type: "https://example.invalid/problem", title: "보류", status: 409, detail: "문구 파싱 금지", instance: "/api/v1/assistant/requests", requestId: id(900), code: "UNRESOLVED_UNCERTAIN", blockingRequestId: id(600) }) });
+  try {
+    assert.equal(h.messages()[0].apiExecution.response.data.result.kind, "uncertain"); assert.equal(h.state.calls.length, 0); h.send("새 독립 작업"); await h.settle();
+    assert.equal(h.state.calls.length, 1); const body = JSON.parse(h.state.calls[0].init.body); assert.equal(Object.hasOwn(body, "acknowledgedUncertainRequestId"), false); assert.equal(Object.hasOwn(body, "conversationId"), false);
+    assert.equal(h.messages().at(-1).apiExecution.recoveryResult.postResult.error.problem.code, "UNRESOLVED_UNCERTAIN"); assert.equal(h.find("MessageInput").value, "새 독립 작업"); assert.equal(h.state.cleanup, 0);
   } finally { h.close(); }
 });
