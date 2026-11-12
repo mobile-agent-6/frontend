@@ -182,6 +182,69 @@ const dto = (id, category = "INVENTORY", completed = false) => ({ id, title: id,
   scheduledAt: "2026-11-07T03:00:00Z", createdAt: "2026-11-01T00:00:00Z", updatedAt: "2026-11-01T00:00:00Z" });
 const states = (screen) => screen.all("ScheduleListState").map((s) => s.state);
 
+const syncRequestId = "80000001-abcd-4abc-8abc-abcdef123456", syncScheduleId = "80000002-abcd-4abc-8abc-abcdef123456";
+const syncOutcome = (operation = "update") => ({ requestId: syncRequestId, conversationId: "80000003-abcd-4abc-8abc-abcdef123456", status: "completed",
+  result: { kind: "outcome", text: "Assistant 서버 변경 성공", outcome: "success", operation, schedulesChanged: true, affectedScheduleIds: [syncScheduleId] } });
+
+for (const operation of ["create", "update", "delete", "completed"]) test(`8-A 실제 목록·캘린더 ${operation}: 정식 GET의 카드·날짜·dot와 기존 필터 유지`, async () => {
+  const h = harness("server"); try {
+    const list = h.mount("index"), calendar = h.mount("calendar"); await h.settle();
+    const original = dto(syncScheduleId, "OTHER");
+    for (let n = 0; n < h.calls.length; n++) h.respond(n, operation === "create" ? [] : [original]); await h.settle();
+    list.one("CategoryFilter").onSelectCategory("기타"); h.flush();
+    const month = calendar.one("MonthCalendar").visibleMonth, selected = calendar.one("MonthCalendar").selectedDate;
+    const start = h.calls.length, sync = h.source("src/services/api/assistant-schedule-sync.ts").assistantScheduleSync;
+    const result = syncOutcome(operation === "completed" ? "update" : operation);
+    const pending = sync.observe({ serverId: "development:https://example.invalid", requestId: syncRequestId }, result); await h.settle();
+    const updated = { ...original, title: "Schedule GET으로 확인한 제목", completed: operation === "completed",
+      ...(operation === "update" ? { scheduledAt: "2026-11-08T03:00:00Z" } : {}) };
+    for (let n = start; n < h.calls.length; n++) { assert.equal(h.calls[n].method, "GET"); h.respond(n, operation === "delete" ? [] : [updated]); }
+    assert.equal((await pending).phase, "synchronized"); await h.settle();
+    assert.equal(list.one("CategoryFilter").selectedCategory, "기타");
+    assert.equal(calendar.one("MonthCalendar").visibleMonth, month); assert.equal(calendar.one("MonthCalendar").selectedDate, selected);
+    const items = list.one("FlatList").data;
+    if (operation === "delete") { assert.deepEqual(items, []); assert.deepEqual(calendar.one("MonthCalendar").scheduleDates, []); assert.equal(calendar.all("ScheduleCard").length, 0); }
+    else {
+      assert.equal(items[0].title, updated.title); assert.equal(items[0].completed, updated.completed);
+      assert.ok(calendar.one("MonthCalendar").scheduleDates.includes(operation === "update" ? "2026-11-08" : "2026-11-07"));
+      if (operation === "update") { assert.equal(calendar.all("ScheduleCard").length, 0); assert.equal(items[0].date, "2026-11-08"); }
+      else assert.strictEqual(calendar.all("ScheduleCard")[0].schedule, items[0]);
+    }
+    const count = h.calls.length; for (let n = 0; n < 3; n++) { await sync.observe({ serverId: "development:https://example.invalid", requestId: syncRequestId }, result); list.focus(false); list.focus(true); calendar.focus(false); calendar.focus(true); }
+    await h.settle(); assert.equal(h.calls.length, count); assert.ok(h.calls.every(call => call.method === "GET"));
+  } finally { h.close(); }
+});
+
+test("8-A 사용자가 고른 다른 캘린더 월·날짜는 동기화 뒤에도 유지", async () => {
+  const h = harness("server"); try {
+    const list = h.mount("index"), calendar = h.mount("calendar"); await h.settle();
+    for (let n = 0; n < h.calls.length; n++) h.respond(n, []); await h.settle();
+    calendar.one("MonthCalendar").onMonthChange({ dateString: "2026-12-01" }); calendar.one("MonthCalendar").onSelectDate({ dateString: "2026-12-05" }); h.flush(); await h.settle();
+    for (let n = 2; n < h.calls.length; n++) h.respond(n, []); await h.settle();
+    const start = h.calls.length, sync = h.source("src/services/api/assistant-schedule-sync.ts").assistantScheduleSync;
+    const pending = sync.observe({ serverId: "development:https://example.invalid", requestId: syncRequestId }, syncOutcome("create")); await h.settle();
+    const item = { ...dto(syncScheduleId), scheduledAt: "2026-12-05T03:00:00Z" };
+    for (let n = start; n < h.calls.length; n++) h.respond(n, [item]); await pending; await h.settle();
+    assert.equal(calendar.one("MonthCalendar").visibleMonth, "2026-12-01"); assert.equal(calendar.one("MonthCalendar").selectedDate, "2026-12-05");
+    assert.ok(calendar.one("MonthCalendar").scheduleDates.includes("2026-12-05")); assert.equal(calendar.all("ScheduleCard")[0].schedule.id, syncScheduleId);
+    assert.equal(list.one("FlatList").data[0].id, syncScheduleId);
+  } finally { h.close(); }
+});
+
+test("8-A 화면 해제 중 성공은 기존 조건을 무효화하고 재진입 GET으로 갱신·무한 조회 없음", async () => {
+  const h = harness("server"); try {
+    let list = h.mount("index"), calendar = h.mount("calendar"); await h.settle();
+    for (let n = 0; n < h.calls.length; n++) h.respond(n, [dto(syncScheduleId)]); await h.settle(); list.close(); calendar.close();
+    const start = h.calls.length, sync = h.source("src/services/api/assistant-schedule-sync.ts").assistantScheduleSync;
+    const pending = sync.observe({ serverId: "development:https://example.invalid", requestId: syncRequestId }, syncOutcome("delete")); await h.settle();
+    for (let n = start; n < h.calls.length; n++) h.respond(n, []); await pending;
+    list = h.mount("index"); calendar = h.mount("calendar"); await h.settle();
+    for (let n = start + 1; n < h.calls.length; n++) h.respond(n, []); await h.settle();
+    assert.deepEqual(list.one("FlatList").data, []); assert.deepEqual(calendar.one("MonthCalendar").scheduleDates, []);
+    const count = h.calls.length; list.focus(false); list.focus(true); calendar.focus(false); calendar.focus(true); await h.settle(); assert.equal(h.calls.length, count);
+  } finally { h.close(); }
+});
+
 test("기본 Mock 두 화면·CRUD·완료 변경과 서버 요청 0회", async () => {
   const h = harness("mock"); try {
     const list = h.mount("index"), cal = h.mount("calendar"); await h.settle();

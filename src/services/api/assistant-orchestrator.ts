@@ -1,6 +1,7 @@
 import { AppState } from "react-native";
 
 import { assistantHttpClient, type AssistantHttpResult } from "@/services/api/assistant";
+import { assistantScheduleSync } from "@/services/api/assistant-schedule-sync";
 import {
   acquireAssistantRequestLease,
   assistantRequestRecovery,
@@ -66,6 +67,7 @@ export function createAssistantOrchestrator({
     subscribe: listener => { const subscription = AppState.addEventListener("change", listener); return () => subscription.remove(); },
   },
   mode = scheduleDataModeStore,
+  scheduleSync = assistantScheduleSync,
   setTimer = (callback: () => void, ms: number) => setTimeout(callback, ms),
   clearTimer = (timer: ReturnType<typeof setTimeout>) => clearTimeout(timer),
 }: {
@@ -75,6 +77,7 @@ export function createAssistantOrchestrator({
   clock?: Clock;
   lifecycle?: Lifecycle;
   mode?: { getState: () => { mode: "server" | "mock"; generation: number }; subscribe: (listener: () => void) => () => void };
+  scheduleSync?: Pick<typeof assistantScheduleSync, "observe">;
   setTimer?: (callback: () => void, ms: number) => ReturnType<typeof setTimeout>;
   clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
 } = {}) {
@@ -177,6 +180,9 @@ export function createAssistantOrchestrator({
       lastRecovery = result;
       if (result.kind === "confirmed") {
         lastResponse = immutableResponse(result.response);
+        // 결과 수신 경계를 공유해 화면 완료·복구·수동 GET에서 같은 성공을 한 번만 동기화한다.
+        // 후속 Schedule GET의 실패는 이미 확인된 Assistant 결과를 바꾸지 않는다.
+        void scheduleSync.observe(ref, lastResponse.data);
         emit({ phase: "status", reference: ref, response: lastResponse, via: result.via });
       }
     }

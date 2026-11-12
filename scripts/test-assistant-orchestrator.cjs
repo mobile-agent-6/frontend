@@ -38,6 +38,7 @@ function harness({data=new Map()}={}){
   const send=(url,init)=>{state.calls.push({url,init,at:mono,wall});return state.handle(url,init);};
   const native={AppState:{get currentState(){return state.app;},addEventListener(event,listener){assert.equal(event,"change");appListeners.add(listener);return{remove:()=>appListeners.delete(listener)};}}};
   function load(name){
+    if(name==="@/services/api/assistant-schedule-sync")return{assistantScheduleSync:{observe:async()=>null}};
     if(name==="expo/fetch")return{fetch:send};if(name==="react-native")return native;
     if(name==="@react-native-async-storage/async-storage")return adapter;if(name==="zustand/vanilla")return require(name);
     assert.ok(name.startsWith("@/"));assert.notEqual(name,"@/services/api/http");

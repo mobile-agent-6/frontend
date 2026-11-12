@@ -57,6 +57,8 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
     const module = { exports: {} }; cache.set(file, module);
     const code = ts.transpileModule(fs.readFileSync(file, "utf8"), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX }, fileName: file }).outputText;
     function resolve(name) {
+      // Schedule GET 통합은 전용 동기화·화면 회귀에서 검증하고 기존 Assistant 시험은 독립시킨다.
+      if (name === "@/services/api/assistant-schedule-sync") return { assistantScheduleSync: { observe: async () => null } };
       if (name === "react") return react;
       if (name === "react/jsx-runtime") return { Fragment: "Fragment", jsx: (type, props, key) => ({ type, props, key }), jsxs: (type, props, key) => ({ type, props, key }) };
       if (name === "react-native") return native;

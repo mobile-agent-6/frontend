@@ -37,6 +37,7 @@ function harness({initialMode="server",baseUrl=origin,readOnly=false}={}){
   }};
   const Stack=()=>null;Stack.Screen=function StackScreen(){return null;};
   function load(name){
+    if(name==="@/services/api/assistant-schedule-sync")return{assistantScheduleSync:{observe:async()=>null}};
     if(name==="expo/fetch")return{fetch:send};if(name==="react-native")return native;
     if(name==="@react-native-async-storage/async-storage")return adapter;if(name==="zustand/vanilla")return require(name);
     if(name==="react")return react;if(name==="react/jsx-runtime")return{jsx:(type,props)=>({type,props}),jsxs:(type,props)=>({type,props})};
