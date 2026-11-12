@@ -53,6 +53,8 @@ function harness(initialMode, { readOnly = false } = {}) {
       module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX,
     }, fileName: filename }).outputText;
     const resolve = (name) => {
+      // Schedule 화면 검증은 앱 복구와 분리하고 실제 root 연결은 lifecycle 테스트에서 검증한다.
+      if (name === "@/services/api/assistant-lifecycle") return { assistantLifecycle: { attach: () => () => {} } };
       if (name === "react") return react;
       if (name === "react/jsx-runtime") return { jsx: (type, props, key) => ({ type, props, key }), jsxs: (type, props, key) => ({ type, props, key }) };
       if (name === "zustand/vanilla") return require(name);
