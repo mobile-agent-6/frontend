@@ -195,6 +195,38 @@ test("기본 Mock 두 화면·CRUD·완료 변경과 서버 요청 0회", async 
     assert.equal(h.calls.length, 0);
   } finally { h.close(); }
 });
+
+test("Assistant Mock 등록·수정·완료·삭제는 실제 목록/캘린더에 같은 store로 반영", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const h = harness("mock"); try {
+    const list = h.mount("index"), calendar = h.mount("calendar"), assistant = h.mount("assistant");
+    const send = text => {
+      assistant.one("MessageInput").onChangeText(text); h.flush();
+      assistant.one("MessageInput").onSend(); h.flush();
+      t.mock.timers.tick(700); h.flush();
+    };
+    const showDate = date => { calendar.one("MonthCalendar").onSelectDate({ dateString: date }); h.flush(); };
+    const listItem = id => list.one("FlatList").data.find(item => item.id === id);
+    const calendarItem = id => calendar.all("ScheduleCard").find(item => item.schedule.id === id)?.schedule;
+    const originalIds = new Set(h.mock.getState().schedules.map(item => item.id));
+    send("내일 오후 3시 팀 회의 추가해 줘");
+    const created = h.mock.getState().schedules.find(item => !originalIds.has(item.id)); assert.ok(created);
+    showDate(created.date); assert.strictEqual(listItem(created.id), created); assert.strictEqual(calendarItem(created.id), created);
+    assert.ok(calendar.one("MonthCalendar").scheduleDates.includes(created.date));
+    send("팀 주간 회의를 오후 4시로 바꿔 줘");
+    const changed = h.mock.getState().schedules.find(item => item.id === "10000000-0000-4000-8000-000000000002");
+    showDate(changed.date); assert.equal(changed.time, "16:00"); assert.strictEqual(listItem(changed.id), changed); assert.strictEqual(calendarItem(changed.id), changed);
+    send("A구역 재고 실사 완료 처리해 줘");
+    const completed = h.mock.getState().schedules.find(item => item.id === "10000000-0000-4000-8000-000000000001");
+    showDate(completed.date); assert.equal(completed.completed, true); assert.strictEqual(listItem(completed.id), completed); assert.strictEqual(calendarItem(completed.id), completed);
+    send("작업장 안전 점검 삭제해 줘");
+    const confirmation = assistant.one("ConversationList").messages.at(-1), targetId = confirmation.interaction.scheduleId;
+    showDate(h.mock.getState().schedules.find(item => item.id === targetId).date);
+    assistant.one("ConversationList").onDeleteConfirmation(confirmation.id, true); h.flush();
+    assert.equal(listItem(targetId), undefined); assert.equal(calendarItem(targetId), undefined);
+    assert.equal(assistant.one("MessageInput").disabled, false); assert.equal(h.calls.length, 0);
+  } finally { h.close(); }
+});
 test("서버 메인 3개월·서버 순서·로컬 카테고리 필터·완료 차단", async () => {
   const h = harness("mock", { readOnly: true }); try {
     h.mode("server"); const list = h.mount("index"); await h.settle();

@@ -385,6 +385,21 @@ test("실제 Mock 후보·예/아니요는 활성 상태와 기존 삭제 동작
   } finally { h.close(); }
 });
 
+test("실제 Mock 삭제 거절 버튼은 데이터 유지·이전 승인 무효화·HTTP 0회", async () => {
+  const h = harness({ initialMode: "mock" }); try {
+    h.send("작업장 안전 점검 삭제해 줘"); await h.advance(700);
+    const before = h.mock.getState().schedules, message = h.messages().at(-1);
+    const buttons = nodes(h.renderConversation().rows.at(-1), "Pressable");
+    assert.deepEqual(buttons.map(textOf), ["아니요", "예"]); assert.ok(buttons.every(button => !button.props.disabled));
+    const lateApproval = buttons[1].props.onPress; buttons[0].props.onPress(); h.render();
+    assert.strictEqual(h.mock.getState().schedules, before);
+    assert.equal(h.messages().find(item => item.id === message.id).interaction.resolved, true);
+    const count = h.messages().length; lateApproval(); h.render();
+    assert.equal(h.messages().length, count); assert.strictEqual(h.mock.getState().schedules, before);
+    assert.equal(h.find("MessageInput").disabled, false); assert.equal(h.state.calls.length, 0);
+  } finally { h.close(); }
+});
+
 test("표시 반복·키 추출은 원본 메시지와 API metadata를 변경하거나 정리하지 않음", async () => {
   await showResult(results.outcome, (h, view) => {
     const messages = h.messages(), ids = messages.map(view.list.props.keyExtractor), raw = JSON.stringify(messages);
