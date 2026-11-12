@@ -7,7 +7,9 @@ import { useTheme } from "@/hooks/use-theme";
 import type { Schedule } from "@/types/schedule";
 
 type AssistantScheduleCardProps = {
-  schedule: Schedule;
+  // 후보 DTO에 없는 일정 ID·완료 여부를 표시 때문에 만들어 넣지 않는다.
+  schedule: Pick<Schedule, "title" | "date" | "time" | "category"> & { completed?: boolean };
+  showCompleted?: boolean;
 };
 
 function formatCardDate(date: string) {
@@ -26,7 +28,11 @@ function formatCardTime(time: string) {
   return `${period} ${hour % 12 || 12}:${String(minute).padStart(2, "0")}`;
 }
 
-export function AssistantScheduleCard({ schedule }: AssistantScheduleCardProps) {
+export function formatAssistantCardDateTime(date: string, time: string) {
+  return `${formatCardDate(date)} ${formatCardTime(time)}`;
+}
+
+export function AssistantScheduleCard({ schedule, showCompleted = false }: AssistantScheduleCardProps) {
   const theme = useTheme();
 
   return (
@@ -38,8 +44,13 @@ export function AssistantScheduleCard({ schedule }: AssistantScheduleCardProps) 
       </View>
       <ThemedText style={styles.title}>{schedule.title}</ThemedText>
       <ThemedText type="small" themeColor="textSecondary">
-        {`${formatCardDate(schedule.date)} ${formatCardTime(schedule.time)}`}
+        {formatAssistantCardDateTime(schedule.date, schedule.time)}
       </ThemedText>
+      {showCompleted && schedule.completed !== undefined && (
+        <ThemedText type="small" themeColor="textSecondary">
+          {schedule.completed ? "완료" : "미완료"}
+        </ThemedText>
+      )}
     </ThemedView>
   );
 }

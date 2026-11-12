@@ -1,6 +1,6 @@
 import { Pressable, StyleSheet, Text, View } from "react-native";
 
-import { AssistantScheduleCard } from "@/components/assistant/assistant-schedule-card";
+import { AssistantScheduleCard, formatAssistantCardDateTime } from "@/components/assistant/assistant-schedule-card";
 import { ThemedText } from "@/components/ui/themed-text";
 import { ThemedView } from "@/components/ui/themed-view";
 import { Spacing } from "@/constants/theme";
@@ -10,9 +10,11 @@ import type {
   AssistantInteraction,
 } from "@/types/assistant";
 import type { Schedule } from "@/types/schedule";
+import type { AssistantResultDisplay } from "@/utils/assistant-mapper";
 
 type AssistantMessageProps = {
   text: string;
+  apiResult?: AssistantResultDisplay;
   schedules?: readonly Schedule[];
   interaction?: AssistantInteraction;
   interactionsDisabled?: boolean;
@@ -22,6 +24,7 @@ type AssistantMessageProps = {
 
 export function AssistantMessage({
   text,
+  apiResult,
   schedules,
   interaction,
   interactionsDisabled = false,
@@ -38,39 +41,14 @@ export function AssistantMessage({
       >
         {text}
       </Text>
-      {schedules?.map((schedule) => (
+      {apiResult && <ApiResultDetails result={apiResult} />}
+      {!apiResult && schedules?.map((schedule) => (
         <AssistantScheduleCard key={schedule.id} schedule={schedule} />
       ))}
-      {interaction?.type === "delete-confirmation" && (
-        <View style={styles.actions}>
-          {([false, true] as const).map((confirmed) => (
-            <Pressable
-              key={String(confirmed)}
-              accessibilityRole="button"
-              accessibilityState={{ disabled: confirmationDisabled }}
-              disabled={confirmationDisabled}
-              onPress={() => onDeleteConfirmation?.(confirmed)}
-              style={[
-                styles.buttonBase,
-                styles.action,
-                {
-                  backgroundColor: confirmed
-                    ? theme.primaryForeground
-                    : "#FC8957",
-                },
-                confirmationDisabled && styles.disabled,
-              ]}
-            >
-              <ThemedText
-                themeColor={confirmed ? "primary" : "primaryForeground"}
-              >
-                {confirmed ? "예" : "아니요"}
-              </ThemedText>
-            </Pressable>
-          ))}
-        </View>
+      {!apiResult && interaction?.type === "delete-confirmation" && (
+        <ConfirmationActions disabled={Boolean(confirmationDisabled)} onConfirm={onDeleteConfirmation} />
       )}
-      {interaction?.type === "candidate-selection" && (
+      {!apiResult && interaction?.type === "candidate-selection" && (
         <CandidateSelectionInteraction
           interaction={interaction}
           onSelect={onCandidateSelection}
@@ -78,6 +56,86 @@ export function AssistantMessage({
         />
       )}
     </ThemedView>
+  );
+}
+
+// API 상세는 표시 전용이다. Mock interaction으로 바꾸거나 실행 callback을 받지 않는다.
+function ApiResultDetails({ result }: { result: AssistantResultDisplay }) {
+  const theme = useTheme();
+  switch (result.kind) {
+    case "need_more_info": return null;
+    case "candidate_selection": return (
+      <View style={styles.candidates}>
+        {result.candidates.map(candidate => (
+          <Pressable key={candidate.candidateId} accessibilityRole="button"
+            accessibilityState={{ disabled: true }} disabled
+            style={[styles.buttonBase, styles.candidate, { backgroundColor: theme.primaryForeground }, styles.disabled]}>
+            <AssistantScheduleCard schedule={candidate} />
+          </Pressable>
+        ))}
+      </View>
+    );
+    case "confirmation": return (
+      <>
+        <ThemedText type="small" themeColor="primaryForeground">
+          {result.operation === "delete" ? "삭제 대상" : "수정 대상"}
+        </ThemedText>
+        <AssistantScheduleCard schedule={result.target} showCompleted />
+        {result.operation === "update" && (
+          <View style={styles.candidates}>
+            {result.changes.title !== undefined && (
+              <ThemedText themeColor="primaryForeground">{`제목: ${result.target.title} → ${result.changes.title}`}</ThemedText>
+            )}
+            {result.changes.date !== undefined && result.changes.time !== undefined && (
+              <ThemedText themeColor="primaryForeground">
+                {`일시: ${formatAssistantCardDateTime(result.target.date, result.target.time)} → ${formatAssistantCardDateTime(result.changes.date, result.changes.time)}`}
+              </ThemedText>
+            )}
+            {result.changes.category !== undefined && (
+              <ThemedText themeColor="primaryForeground">{`분류: ${result.target.category} → ${result.changes.category}`}</ThemedText>
+            )}
+            {result.changes.completed !== undefined && (
+              <ThemedText themeColor="primaryForeground">
+                {`완료 상태: ${result.target.completed ? "완료" : "미완료"} → ${result.changes.completed ? "완료" : "미완료"}`}
+              </ThemedText>
+            )}
+          </View>
+        )}
+        <ConfirmationActions disabled />
+      </>
+    );
+    case "outcome": {
+      const operation = result.operation === undefined ? undefined : {
+        create: "등록", list: "조회", update: "수정", delete: "삭제",
+      }[result.operation];
+      const label = result.outcome === "success" ? "완료"
+        : result.outcome === "cancelled" ? "취소됨" : "대상 없음";
+      return (
+        <>
+          <ThemedText type="small" themeColor="primaryForeground">{operation === undefined ? label : `${operation} ${label}`}</ThemedText>
+          {result.outcome === "success" && result.operation === "list" && result.items.map(item => (
+            <AssistantScheduleCard key={item.id} schedule={item} showCompleted />
+          ))}
+        </>
+      );
+    }
+    case "failure": return <ThemedText type="small" themeColor="primaryForeground">처리 실패</ThemedText>;
+    case "uncertain": return <ThemedText type="small" themeColor="primaryForeground">결과 미확인</ThemedText>;
+  }
+}
+
+function ConfirmationActions({ disabled, onConfirm }: { disabled: boolean; onConfirm?: (confirmed: boolean) => void }) {
+  const theme = useTheme();
+  return (
+    <View style={styles.actions}>
+      {([false, true] as const).map(confirmed => (
+        <Pressable key={String(confirmed)} accessibilityRole="button" accessibilityState={{ disabled }} disabled={disabled}
+          onPress={disabled ? undefined : () => onConfirm?.(confirmed)}
+          style={[styles.buttonBase, styles.action, { backgroundColor: confirmed ? theme.primaryForeground : "#FC8957" }, disabled && styles.disabled]}>
+          <ThemedText themeColor={confirmed ? "primary" : "primaryForeground"}>{confirmed ? "예" : "아니요"}</ThemedText>
+        </Pressable>
+      ))}
+    </View>
   );
 }
 

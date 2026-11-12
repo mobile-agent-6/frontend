@@ -26,7 +26,7 @@ const deferred = () => { let resolve; const promise = new Promise(r => { resolve
 // 실제 단말 렌더링·키보드·네트워크 시험은 아니다.
 function harness({ initialMode = "server", readOnly = false, data = new Map() } = {}) {
   const cache = new Map(), slots = [], effects = [], timers = new Map(), listeners = new Set();
-  let cursor = 0, dirty = false, tree, wall = 1000, mono = 0, timerId = 0, closed = false;
+  let cursor = 0, dirty = false, tree, wall = 1000, mono = 0, timerId = 0, closed = false, displaying = false;
   const state = { app: "active", calls: [], starts: [], uuidCalls: 0, failUuid: false, failStorage: false, throwMessage: false,
     cleanup: 0, lateUpdates: 0, mockRuns: 0, beforeUuid: null, config: null,
     handle: async (url, init) => init.method === "POST" ? json(status(JSON.parse(init.body).requestId), 202) : json(done(url.split("/").pop())) };
@@ -39,30 +39,32 @@ function harness({ initialMode = "server", readOnly = false, data = new Map() } 
         if (state.throwMessage && Array.isArray(value) && value.at(-1)?.role === "assistant" && value.at(-1).apiExecution?.kind === "completed") { state.throwMessage = false; throw Error("응답 게시 실패"); }
         if (!Object.is(value, slots[i].value)) { slots[i].value = value; dirty = true; }
       }]; },
-    useRef(initial) { return slots[cursor++] ??= { current: initial }; },
-    useCallback(fn, deps) { const i = cursor++; if (!same(slots[i]?.deps, deps)) slots[i] = { deps, value: fn }; return slots[i].value; },
-    useEffect(fn, deps) { const i = cursor++; if (!same(slots[i]?.deps, deps)) effects.push(() => { slots[i]?.cleanup?.(); slots[i] = { deps, cleanup: fn() }; }); },
+    useRef(initial) { if (displaying) return { current: initial }; return slots[cursor++] ??= { current: initial }; },
+    useCallback(fn, deps) { if (displaying) return fn; const i = cursor++; if (!same(slots[i]?.deps, deps)) slots[i] = { deps, value: fn }; return slots[i].value; },
+    useEffect(fn, deps) { if (displaying) return; const i = cursor++; if (!same(slots[i]?.deps, deps)) effects.push(() => { slots[i]?.cleanup?.(); slots[i] = { deps, cleanup: fn() }; }); },
+    useImperativeHandle() {},
   };
   const setTimer = (fn, ms) => { const token = ++timerId; timers.set(token, { fn, at: mono + ms, ms }); return token; };
   const clearTimer = token => timers.delete(token);
   const send = (url, init) => { state.calls.push({ url, init }); return state.handle(url, init); };
   const adapter = { async getItem(key) { return data.get(key) ?? null; }, async setItem(key, value) { if (state.failStorage) throw Error("저장 실패"); data.set(key, value); } };
   const native = { AppState: { get currentState() { return state.app; }, addEventListener(event, listener) { assert.equal(event, "change"); listeners.add(listener); return { remove: () => listeners.delete(listener) }; } },
-    KeyboardAvoidingView: "KeyboardAvoidingView", Platform: { OS: "ios" }, StyleSheet: { create: s => s }, Text: "Text", View: "View", Pressable: "Pressable" };
+    KeyboardAvoidingView: "KeyboardAvoidingView", FlatList: "FlatList", Keyboard: { isVisible: () => false }, Platform: { OS: "ios" }, StyleSheet: { create: s => s }, Text: "Text", View: "View", Pressable: "Pressable" };
   function load(file) {
     if (cache.has(file)) return cache.get(file).exports;
     const module = { exports: {} }; cache.set(file, module);
     const code = ts.transpileModule(fs.readFileSync(file, "utf8"), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX }, fileName: file }).outputText;
     function resolve(name) {
       if (name === "react") return react;
-      if (name === "react/jsx-runtime") return { jsx: (type, props) => ({ type, props }), jsxs: (type, props) => ({ type, props }) };
+      if (name === "react/jsx-runtime") return { Fragment: "Fragment", jsx: (type, props, key) => ({ type, props, key }), jsxs: (type, props, key) => ({ type, props, key }) };
       if (name === "react-native") return native;
       if (name === "zustand" || name === "zustand/vanilla") return require(name);
       if (name === "expo/fetch") return { fetch: send };
       if (name === "@react-native-async-storage/async-storage") return adapter;
       if (name === "expo-crypto") return { randomUUID: () => { state.uuidCalls++; state.beforeUuid?.(); if (state.failUuid) throw Error("UUID 실패"); return randomUUID(); } };
+      if (["@/components/assistant/assistant-message", "@/components/assistant/assistant-schedule-card"].includes(name)) return load(path.join(root, "src", `${name.slice(2)}.tsx`));
       if (name.startsWith("@/components/")) { const component = name.split("/").at(-1).split("-").map(s => s[0].toUpperCase() + s.slice(1)).join(""); return { [component]: component }; }
-      if (name === "@/constants/theme") return { Spacing: { two: 8, three: 16 } };
+      if (name === "@/constants/theme") return { Spacing: { one: 4, two: 8, three: 16 } };
       if (name === "@/hooks/use-color-scheme") return { useColorScheme: () => "light" };
       if (name === "@/hooks/use-theme") return { useTheme: () => ({ background: "white", primaryForeground: "white" }) };
       assert.ok(name.startsWith("@/"), name); assert.notEqual(name, "@/services/api/http");
@@ -90,8 +92,23 @@ function harness({ initialMode = "server", readOnly = false, data = new Map() } 
   async function settle() { for (let n = 0; n < 350; n++) await Promise.resolve(); if (!closed) render(); }
   async function advance(ms) { const target = mono + ms; let count = 0; while (true) { const next = Math.min(...[...timers.values()].map(t => t.at)); if (next > target) break; if (++count > 500) throw Error("타이머 반복"); wall += next - mono; mono = next;
       for (const [key, timer] of [...timers]) if (timer.at <= mono) { timers.delete(key); timer.fn(); } await settle(); } wall += target - mono; mono = target; await settle(); }
+  function renderConversation(messages = find("ConversationList").messages) {
+    // FlatList의 실제 renderItem과 표시 컴포넌트를 실행한다. 스크롤/native effect는 실행하지 않는다.
+    let list; displaying = true;
+    try { list = source("src/components/assistant/conversation-list.tsx").ConversationList({ ...find("ConversationList"), messages }); }
+    finally { displaying = false; }
+    assert.equal(list.type, "FlatList");
+    const components = [];
+    function expand(node) {
+      if (!node || typeof node !== "object") return node;
+      if (Array.isArray(node)) return node.map(expand);
+      if (typeof node.type === "function") { components.push({ name: node.type.name, props: node.props, key: node.key }); return expand(node.type(node.props)); }
+      return { ...node, props: { ...node.props, children: expand(node.props?.children) } };
+    }
+    return { list, components, rows: messages.map(item => expand(list.props.renderItem({ item }))) };
+  }
   render();
-  return { state, source, storage, data, mock, mode, delegate, render, find, settle, advance, timers, listeners,
+  return { state, source, storage, data, mock, mode, delegate, render, renderConversation, find, settle, advance, timers, listeners,
     messages: () => find("ConversationList").messages,
     edit(text) { find("MessageInput").onChangeText(text); render(); },
     send(text) { this.edit(text); find("MessageInput").onSend(); render(); },
@@ -123,7 +140,7 @@ test("accepted/processing은 최종 응답 없이 processing 유지·기존 2초
   } finally { h.close(); }
 });
 
-for (const kind of Object.keys(results)) test(`완료 결과 ${kind}: 서버 text·kind·전체 식별 정보 보존, 상세 카드/Mock interaction 없음`, async () => {
+for (const kind of Object.keys(results)) test(`완료 결과 ${kind}: 서버 text·kind·전체 식별 정보 보존, Mock interaction 없음`, async () => {
   const h = harness(); h.state.handle = async (url, init) => init.method === "POST" ? json(status(JSON.parse(init.body).requestId), 202) : json(done(url.split("/").pop(), kind));
   try { h.send("독립 요청"); await h.settle(); const message = h.messages().at(-1); assert.equal(message.text, results[kind].text);
     assert.equal(message.apiExecution.kind, "completed"); assert.equal(message.apiExecution.response.data.conversationId, id(100)); assert.deepEqual(message.apiExecution.response.data.result, results[kind]);
@@ -214,5 +231,158 @@ test("탭 왕복에 준하는 재렌더는 세션 대화 유지·새 실행은 �
 test("기존 Schedule read-only 정책은 유지하고 Assistant 전용 client 경계 재사용", async () => {
   const h = harness({ readOnly: true }); try { assert.equal(h.mode.isScheduleRequestAllowed("POST", "/schedules"), false); h.send("조회"); await h.settle();
     assert.equal(h.state.calls[0].init.method, "POST"); assert.equal(h.state.calls[0].url, `${origin}/api/v1/assistant/requests`); assert.equal(h.mode.isScheduleRequestAllowed("POST", "/schedules"), false);
+  } finally { h.close(); }
+});
+
+function nodes(node, type) {
+  if (!node || typeof node !== "object") return [];
+  if (Array.isArray(node)) return node.flatMap(item => nodes(item, type));
+  return [...(node.type === type ? [node] : []), ...nodes(node.props?.children, type)];
+}
+function textOf(node) {
+  if (node == null || typeof node === "boolean") return "";
+  if (typeof node !== "object") return String(node);
+  return Array.isArray(node) ? node.map(textOf).join("\n") : textOf(node.props?.children);
+}
+const cards = view => view.components.filter(item => item.name === "AssistantScheduleCard");
+function responseWith(result) {
+  return async (url, init) => init.method === "POST" ? json(status(JSON.parse(init.body).requestId), 202)
+    : json({ ...status(url.split("/").pop(), "completed"), result });
+}
+async function showResult(result, verify) {
+  const h = harness(), mockBefore = h.mock.getState().schedules;
+  h.state.handle = responseWith(result);
+  try {
+    h.send("표시 시험"); await h.settle(); const original = h.messages().at(-1).apiExecution, serialized = JSON.stringify(original);
+    assert.equal(original.kind, "completed"); const calls = h.state.calls.length, persisted = [...h.data.values()].join("");
+    const view = h.renderConversation(); await verify(h, view, original);
+    assert.equal(JSON.stringify(original), serialized); assert.equal(h.messages().at(-1).apiExecution, original);
+    assert.equal(h.state.calls.length, calls); assert.equal(h.state.starts.length, 1); assert.equal(h.state.cleanup, 0);
+    assert.equal([...h.data.values()].join(""), persisted); assert.strictEqual(h.mock.getState().schedules, mockBefore); assert.equal(h.state.mockRuns, 0);
+    assert.ok(h.state.calls.every(c => c.url.startsWith(`${origin}/api/v1/assistant/requests`)));
+  } finally { h.close(); }
+}
+
+for (const kind of Object.keys(results)) test(`실제 목록→메시지→카드: ${kind} 분기·text 원문·식별값과 부수 효과 0회`, async () => {
+  const result = { ...results[kind], text: "  서버 원문\n일정을 삭제했어요? 문구로 판단하지 않음  " };
+  await showResult(result, (h, view, original) => {
+    assert.equal(nodes(view.rows[1], "Text")[0].props.children, result.text);
+    const props = view.components.find(item => item.name === "AssistantMessage").props;
+    assert.equal(props.apiResult.kind, kind); assert.equal(props.onCandidateSelection, undefined); assert.equal(props.onDeleteConfirmation, undefined);
+    assert.deepEqual(original.response.data.result, result); assert.equal(original.reference.requestId, original.response.data.requestId); assert.equal(original.response.data.conversationId, id(100));
+    if ("questionId" in result) assert.equal(props.apiResult.questionId, result.questionId);
+    if ("expiresAt" in result) assert.equal(props.apiResult.expiresAt, result.expiresAt);
+    if (kind === "failure" || kind === "uncertain") {
+      assert.equal(props.apiResult.code, result.code); assert.equal(props.apiResult.nextAction, result.nextAction); assert.equal(cards(view).length, 0);
+      assert.ok(textOf(view.rows).includes(kind === "failure" ? "처리 실패" : "결과 미확인")); assert.equal(Object.hasOwn(props.apiResult, "schedulesChanged"), false);
+    }
+    for (const button of nodes(view.rows, "Pressable")) { assert.equal(button.props.disabled, true); assert.deepEqual(button.props.accessibilityState, { disabled: true }); assert.equal(button.props.onPress, undefined); button.props.onPress?.(); }
+    h.render(); assert.equal(h.state.starts.length, 1);
+  });
+});
+
+for (const count of [2, 10]) test(`후보 ${count}건 전체·opaque key·5종 category·KST 날짜 경계 표시`, async () => {
+  const categories = ["INBOUND", "INVENTORY", "OUTBOUND", "RETURN", "OTHER"], labels = ["입고", "재고", "출고", "반품", "기타"];
+  const candidates = Array.from({ length: count }, (_, n) => ({ candidateId: `opaque:/선택 값 ${n}`, title: `후보 ${n}`, scheduledAt: "2026-11-12T15:05:32.123456Z", category: categories[n % 5] }));
+  await showResult({ ...results.candidate_selection, candidates }, (h, view) => {
+    const buttons = nodes(view.rows, "Pressable"); assert.equal(buttons.length, count); assert.equal(cards(view).length, count);
+    for (let n = 0; n < count; n++) {
+      assert.equal(buttons[n].key, candidates[n].candidateId); const display = cards(view)[n].props.schedule;
+      assert.equal(display.candidateId, candidates[n].candidateId); assert.equal(display.title, candidates[n].title); assert.equal(display.category, labels[n % 5]);
+      assert.equal(display.date, "2026-11-13"); assert.equal(display.time, "00:05"); assert.equal(display.scheduledAt, candidates[n].scheduledAt);
+      for (const field of ["id", "scheduleId", "completed"]) assert.equal(Object.hasOwn(display, field), false);
+    }
+    assert.match(textOf(view.rows), /11월 13일 \(금\) 오전 12:05/);
+  });
+});
+
+test("update 확인의 실제 target·제목/일시/category/completed 변경 전후 표시", async () => {
+  const result = { ...results.confirmation, target: { ...summary, scheduledAt: "2026-11-12T15:05:00Z", category: "RETURN" }, changes: { title: "변경 제목", scheduledAt: "2026-11-13T04:10:00Z", category: "OUTBOUND", completed: true } };
+  await showResult(result, (h, view) => {
+    const body = textOf(view.rows); assert.match(body, /수정 대상/); assert.match(body, /제목: 원본 일정 → 변경 제목/);
+    assert.match(body, /일시: 11월 13일 \(금\) 오전 12:05 → 11월 13일 \(금\) 오후 1:10/); assert.match(body, /분류: 반품 → 출고/); assert.match(body, /완료 상태: 미완료 → 완료/);
+    assert.equal(cards(view).length, 1); assert.equal(cards(view)[0].props.schedule.id, summary.id); assert.equal(cards(view)[0].props.schedule.title, summary.title);
+    assert.equal(nodes(view.rows, "Pressable").length, 2);
+  });
+});
+
+test("delete 확인에는 target과 비활성 예/아니요만 있고 changes 합성 없음", async () => {
+  const { changes, ...base } = results.confirmation; assert.ok(changes);
+  await showResult({ ...base, operation: "delete" }, (h, view) => {
+    const props = view.components.find(item => item.name === "AssistantMessage").props;
+    assert.equal(props.apiResult.operation, "delete"); assert.equal(Object.hasOwn(props.apiResult, "changes"), false);
+    assert.match(textOf(view.rows), /삭제 대상/); assert.doesNotMatch(textOf(view.rows), /완료 상태:|제목:|일시:|분류:/); assert.equal(cards(view).length, 1);
+    assert.deepEqual(nodes(view.rows, "Pressable").map(button => textOf(button)), ["아니요", "예"]);
+  });
+});
+
+for (const completed of [true, false]) test(`완료 변경 ${completed}는 update changes.completed로 표시`, async () => {
+  await showResult({ ...results.confirmation, target: { ...summary, completed: !completed }, changes: { completed } }, (h, view) => {
+    const body = textOf(view.rows); assert.ok(body.includes(completed ? "완료 상태: 미완료 → 완료" : "완료 상태: 완료 → 미완료"));
+    assert.equal(cards(view).length, 1); assert.doesNotMatch(body, /분류:|제목:|일시:/);
+  });
+});
+
+for (const count of [0, 3]) test(`조회 items ${count}건: 정상 조회·실제 일정 ID/card key·선택/전송 없음`, async () => {
+  const items = Array.from({ length: count }, (_, n) => ({ ...summary, id: id(400 + n), title: `조회 일정 ${n}`, completed: n % 2 === 0 }));
+  await showResult({ ...results.outcome, items }, (h, view) => {
+    assert.equal(cards(view).length, count); assert.match(textOf(view.rows), /조회 완료/); assert.equal(nodes(view.rows, "Pressable").length, 0);
+    cards(view).forEach((card, n) => { assert.equal(card.key, items[n].id); assert.equal(card.props.schedule.id, items[n].id); assert.equal(card.props.schedule.completed, items[n].completed); assert.equal(card.props.showCompleted, true); });
+  });
+});
+
+for (const [operation, label] of [["create", "등록"], ["update", "수정"], ["delete", "삭제"]]) test(`outcome success/${operation}: 변경 ID 보존·추측 카드와 Schedule write 없음`, async () => {
+  const result = { kind: "outcome", text: "서버 완료 문구", outcome: "success", operation, schedulesChanged: true, affectedScheduleIds: [summary.id] };
+  await showResult(result, (h, view) => {
+    assert.ok(textOf(view.rows).includes(`${label} 완료`)); assert.equal(cards(view).length, 0);
+    const mapped = view.components.find(item => item.name === "AssistantMessage").props.apiResult; assert.equal(mapped.schedulesChanged, true); assert.deepEqual(mapped.affectedScheduleIds, [summary.id]); assert.equal(Object.hasOwn(mapped, "items"), false);
+  });
+});
+
+for (const outcome of ["cancelled", "no_match"]) test(`outcome ${outcome}: 성공과 분리·optional operation 보존`, async () => {
+  const result = { kind: "outcome", text: "서버 원문", outcome, schedulesChanged: false, ...(outcome === "no_match" ? { operation: "list" } : {}) };
+  await showResult(result, (h, view) => {
+    assert.ok(textOf(view.rows).includes(outcome === "cancelled" ? "취소됨" : "대상 없음")); assert.doesNotMatch(textOf(view.rows), /완료/); assert.equal(cards(view).length, 0);
+    const mapped = view.components.find(item => item.name === "AssistantMessage").props.apiResult; assert.equal(mapped.outcome, outcome); assert.equal(mapped.schedulesChanged, false); assert.equal(Object.hasOwn(mapped, "operation"), outcome === "no_match");
+  });
+});
+
+test("API 메시지에 Mock 필드를 섞어도 목록이 Mock 카드·interaction·callback을 전달하지 않음", async () => {
+  await showResult(results.candidate_selection, (h) => {
+    const message = h.messages().at(-1), mixed = { ...message, schedules: h.mock.getState().schedules, interaction: { type: "delete-confirmation", scheduleId: h.mock.getState().schedules[0].id, resolved: false } };
+    const view = h.renderConversation([mixed]), props = view.components.find(item => item.name === "AssistantMessage").props;
+    assert.equal(props.interaction, undefined); assert.equal(props.schedules, undefined); assert.equal(props.onDeleteConfirmation, undefined); assert.equal(props.onCandidateSelection, undefined); assert.equal(cards(view).length, 2);
+  });
+});
+
+test("취소 결과에 operation이 있으면 해당 작업만 표시하고 없던 작업을 생성하지 않음", async () => {
+  await showResult({ kind: "outcome", text: "취소 문구", outcome: "cancelled", operation: "delete", schedulesChanged: false }, (h, view) => {
+    assert.match(textOf(view.rows), /삭제 취소됨/); assert.equal(cards(view).length, 0);
+    assert.equal(view.components.find(item => item.name === "AssistantMessage").props.apiResult.operation, "delete");
+  });
+});
+
+test("실제 Mock 후보·예/아니요는 활성 상태와 기존 삭제 동작 유지", async () => {
+  const h = harness({ initialMode: "mock" }); try {
+    h.send("재고 일정 삭제해 줘"); await h.advance(700); let view = h.renderConversation(), buttons = nodes(view.rows, "Pressable");
+    assert.ok(buttons.length >= 2); assert.equal(buttons[0].props.disabled, false); buttons[0].props.onPress(); h.render();
+    view = h.renderConversation(); buttons = nodes(view.rows.at(-1), "Pressable"); assert.deepEqual(buttons.map(textOf), ["아니요", "예"]); assert.ok(buttons.every(button => !button.props.disabled));
+    const before = h.mock.getState().schedules.length; buttons[1].props.onPress(); h.render(); assert.equal(h.mock.getState().schedules.length, before - 1); assert.equal(h.state.calls.length, 0);
+  } finally { h.close(); }
+});
+
+test("표시 반복·키 추출은 원본 메시지와 API metadata를 변경하거나 정리하지 않음", async () => {
+  await showResult(results.outcome, (h, view) => {
+    const messages = h.messages(), ids = messages.map(view.list.props.keyExtractor), raw = JSON.stringify(messages);
+    for (let n = 0; n < 4; n++) { const repeated = h.renderConversation(); assert.deepEqual(messages.map(repeated.list.props.keyExtractor), ids); }
+    assert.equal(JSON.stringify(messages), raw); assert.strictEqual(h.messages(), messages); assert.equal(h.state.cleanup, 0);
+  });
+});
+
+test("완료되지 않은 API 오류 메시지는 과거 응답으로 상세 성공 카드를 만들지 않음", async () => {
+  const h = harness(); try {
+    h.state.handle = async () => { throw Error("네트워크 실패"); }; h.send("조회"); await h.settle();
+    const view = h.renderConversation(); assert.equal(cards(view).length, 0); assert.equal(nodes(view.rows, "Pressable").length, 0);
+    assert.equal(h.messages().at(-1).apiExecution.kind, "needs-attention"); assert.equal(h.state.cleanup, 0);
   } finally { h.close(); }
 });

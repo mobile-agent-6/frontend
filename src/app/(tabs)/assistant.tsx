@@ -213,7 +213,7 @@ export default function AssistantScreen() {
       if (!isCurrent() || assistantHttpClient.getServerId() !== serverId) return;
       if (execution.kind === "completed") {
         completed = true;
-        // 결과 종류·식별값·질문·상세 DTO는 보존하되 이번 단계에서는 텍스트만 표시한다.
+        // 원본 처리 결과를 메시지에 보존하고 상세 표시는 ConversationList에 맡긴다.
         publishResponse({ id: `assistant-${requestId}`, role: "assistant",
           text: execution.response.data.result.text, apiExecution: execution }, false);
       } else {

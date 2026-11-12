@@ -9,6 +9,7 @@ import { useTheme } from "@/hooks/use-theme";
 import type { AssistantExecutionResult } from "@/services/api/assistant-orchestrator";
 import type { AssistantInteraction } from "@/types/assistant";
 import type { Schedule } from "@/types/schedule";
+import { assistantResultToDisplay } from "@/utils/assistant-mapper";
 
 // 화면 메시지와 공개 API 결과를 구분하며 API 원형은 현재 실행 세션에만 보관한다.
 export type ConversationMessage = {
@@ -203,16 +204,18 @@ export function ConversationList({
         ) : (
           <AssistantMessage
             text={item.text}
-            schedules={item.schedules}
-            interaction={item.interaction}
-            interactionsDisabled={interactionsDisabled}
+            apiResult={item.apiExecution?.kind === "completed"
+              ? assistantResultToDisplay(item.apiExecution.response.data.result) : undefined}
+            schedules={item.apiExecution ? undefined : item.schedules}
+            interaction={item.apiExecution ? undefined : item.interaction}
+            interactionsDisabled={Boolean(item.apiExecution) || interactionsDisabled}
             onCandidateSelection={
-              onCandidateSelection
+              !item.apiExecution && onCandidateSelection
                 ? (scheduleId) => onCandidateSelection(item.id, scheduleId)
                 : undefined
             }
             onDeleteConfirmation={
-              onDeleteConfirmation
+              !item.apiExecution && onDeleteConfirmation
                 ? (confirmed) => onDeleteConfirmation(item.id, confirmed)
                 : undefined
             }
