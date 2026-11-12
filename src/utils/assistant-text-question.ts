@@ -13,7 +13,8 @@ type Observation = {
   source: Source;
 };
 export type AssistantTextQuestion = Pick<Observation, "requestId" | "conversationId"> & { questionId: string };
-export type AssistantCandidateQuestion = AssistantTextQuestion & { serverId: string; expiresAt: string; candidateIds: readonly string[] };
+export type AssistantConfirmationQuestion = AssistantTextQuestion & { serverId: string; expiresAt: string };
+export type AssistantCandidateQuestion = AssistantConfirmationQuestion & { candidateIds: readonly string[] };
 
 // 화면 실행 세션의 질문 식별값만 관리한다. 요청 본문·채팅·영속 복구 정보는 저장하지 않는다.
 export function createAssistantTextQuestionContext(serverId: string, generation: number) {
@@ -21,15 +22,17 @@ export function createAssistantTextQuestionContext(serverId: string, generation:
   const replaced = new Set<string>();
   const invalidQuestions = new Set<string>();
   const startedRequests = new Set<string>();
-  const blockedCandidates = new Set<string>();
+  const blockedQuestions = new Set<string>();
   const selections = new Map<string, string>();
+  const confirmations = new Map<string, boolean>();
   let currentRequestId: string | undefined;
-  let pending: { requestId: string; question?: AssistantTextQuestion; candidateId?: string } | undefined;
+  let pending: { requestId: string; question?: AssistantTextQuestion; candidateId?: string; approved?: boolean } | undefined;
 
-  function beginRequest(requestId: string, question?: AssistantTextQuestion, candidateId?: string) {
-    pending = { requestId: requestId.toLowerCase(), question, candidateId };
+  function beginRequest(requestId: string, question?: AssistantTextQuestion, candidateId?: string, approved?: boolean) {
+    pending = { requestId: requestId.toLowerCase(), question, candidateId, approved };
     startedRequests.add(pending.requestId);
     if (question && candidateId !== undefined) selections.set(question.requestId.toLowerCase(), candidateId);
+    if (question && approved !== undefined) confirmations.set(question.requestId.toLowerCase(), approved);
   }
 
   function observeResponse(data: AssistantRequestStatusResponse, source: Source, answering?: AssistantTextQuestion) {
@@ -49,13 +52,13 @@ export function createAssistantTextQuestionContext(serverId: string, generation:
     observations.set(key, {
       requestId: data.requestId, conversationId: data.conversationId, status: data.status, source,
       ...(data.status === "completed" ? { resultKind: data.result.kind } : {}),
-      ...(data.status === "completed" && (data.result.kind === "need_more_info" || data.result.kind === "candidate_selection")
+      ...(data.status === "completed" && (data.result.kind === "need_more_info" || data.result.kind === "candidate_selection" || data.result.kind === "confirmation")
         ? { questionId: data.result.questionId } : {}),
-      ...(data.status === "completed" && data.result.kind === "candidate_selection" ? {
+      ...(data.status === "completed" && (data.result.kind === "candidate_selection" || data.result.kind === "confirmation") ? {
         // 같은 질문을 GET으로 다시 받아도 최초 만료 시각보다 늘리지 않는다.
-        expiresAt: previous?.questionId === data.result.questionId && previous.expiresAt &&
+        expiresAt: previous?.questionId?.toLowerCase() === data.result.questionId.toLowerCase() && previous.expiresAt &&
           Date.parse(previous.expiresAt) < Date.parse(data.result.expiresAt) ? previous.expiresAt : data.result.expiresAt,
-        candidateIds: data.result.candidates.map(candidate => candidate.candidateId),
+        ...(data.result.kind === "candidate_selection" ? { candidateIds: data.result.candidates.map(candidate => candidate.candidateId) } : {}),
       } : {}),
     });
   }
@@ -67,13 +70,14 @@ export function createAssistantTextQuestionContext(serverId: string, generation:
       const post = recovery?.kind === "unconfirmed" ? recovery.postResult : undefined;
       const problem = post && !post.ok ? post.error.problem : undefined;
       const code = problem?.code;
-      if (pending?.requestId === execution.reference.requestId.toLowerCase() && pending.candidateId !== undefined && answering) {
-        // 접수 여부가 미확인인 선택을 새 ID로 다시 보내지 않는다. 미전송·확정 접수 거절만 재선택 가능하다.
+      if (pending?.requestId === execution.reference.requestId.toLowerCase() &&
+        (pending.candidateId !== undefined || pending.approved !== undefined) && answering) {
+        // 접수 여부가 미확인인 선택·확인을 새 ID로 다시 보내지 않는다. 미전송·확정 거절만 명시적 재시도 가능하다.
         const rejected = post && !post.ok && (post.error.requestState === "not-sent" || post.error.kind === "http");
-        if (!rejected) blockedCandidates.add(answering.requestId.toLowerCase());
+        if (!rejected) blockedQuestions.add(answering.requestId.toLowerCase());
       }
       if (source === "recovery" && recovery?.kind === "unconfirmed" && recovery.getResult) {
-        blockedCandidates.add(execution.reference.requestId.toLowerCase());
+        blockedQuestions.add(execution.reference.requestId.toLowerCase());
       }
       // 거절된 질문을 새 대화로 바꾸거나 오류의 activeQuestionId만으로 답변을 재전송하지 않는다.
       if (answering && code && ["STALE_QUESTION", "QUESTION_EXPIRED", "CONVERSATION_EXPIRED"].includes(code)) {
@@ -105,17 +109,32 @@ export function createAssistantTextQuestionContext(serverId: string, generation:
     return question && { requestId: question.requestId, conversationId: question.conversationId, questionId: question.questionId };
   }
 
-  function getCandidateQuestion(now: number): AssistantCandidateQuestion | undefined {
+  function getTimedQuestion(now: number, kind: "candidate_selection" | "confirmation"): Observation | undefined {
     if (!currentRequestId || !startedRequests.has(currentRequestId) || replaced.has(currentRequestId) ||
-      invalidQuestions.has(currentRequestId) || blockedCandidates.has(currentRequestId)) return;
+      invalidQuestions.has(currentRequestId) || blockedQuestions.has(currentRequestId)) return;
     const value = observations.get(currentRequestId);
     // 과거 GET 질문만으로는 서버 재시작 이후의 활성 여부를 증명할 수 없다.
-    if (!value || value.resultKind !== "candidate_selection" || !value.questionId || !value.expiresAt || !value.candidateIds ||
-      !Number.isFinite(now) || Date.parse(value.expiresAt) <= now) return;
-    return { serverId, requestId: value.requestId, conversationId: value.conversationId, questionId: value.questionId,
-      expiresAt: value.expiresAt, candidateIds: value.candidateIds };
+    if (!value || value.resultKind !== kind || !value.questionId || !value.expiresAt ||
+      !Number.isFinite(now) || !Number.isFinite(Date.parse(value.expiresAt)) || Date.parse(value.expiresAt) <= now) return;
+    return value;
+  }
+
+  function getConfirmationQuestion(now: number): AssistantConfirmationQuestion | undefined {
+    const value = getTimedQuestion(now, "confirmation");
+    return value?.questionId && value.expiresAt ? { serverId, requestId: value.requestId, conversationId: value.conversationId,
+      questionId: value.questionId, expiresAt: value.expiresAt } : undefined;
+  }
+
+  function getCandidateQuestion(now: number): AssistantCandidateQuestion | undefined {
+    const value = getTimedQuestion(now, "candidate_selection");
+    return value?.questionId && value.expiresAt && value.candidateIds ? { serverId, requestId: value.requestId,
+      conversationId: value.conversationId, questionId: value.questionId, expiresAt: value.expiresAt, candidateIds: value.candidateIds } : undefined;
   }
 
   return { serverId, generation, beginRequest, observeResponse, observeExecution, getQuestion, getCandidateQuestion,
-    getSelections: (): Readonly<Record<string, string>> => Object.fromEntries(selections) };
+    getConfirmationQuestion, getSelections: (): Readonly<Record<string, string>> => Object.fromEntries(selections),
+    getConfirmations: (): Readonly<Record<string, boolean>> => Object.fromEntries(confirmations),
+    getExpiredConfirmations: (now: number): readonly string[] => [...observations.entries()]
+      .filter(([, value]) => value.resultKind === "confirmation" && value.expiresAt && Date.parse(value.expiresAt) <= now)
+      .map(([key]) => key) };
 }

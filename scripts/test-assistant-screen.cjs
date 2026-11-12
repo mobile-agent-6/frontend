@@ -292,9 +292,9 @@ for (const kind of Object.keys(results)) test(`실제 목록→메시지→카�
       assert.ok(textOf(view.rows).includes(kind === "failure" ? "처리 실패" : "결과 미확인")); assert.equal(Object.hasOwn(props.apiResult, "schedulesChanged"), false);
     }
     for (const button of nodes(view.rows, "Pressable")) {
-      const candidate = kind === "candidate_selection";
-      assert.equal(button.props.disabled, !candidate); assert.equal(button.props.accessibilityState.disabled, !candidate);
-      if (candidate) { assert.equal(button.props.accessibilityState.selected, false); assert.equal(typeof button.props.onPress, "function"); }
+      const candidate = kind === "candidate_selection", interactive = candidate || kind === "confirmation";
+      assert.equal(button.props.disabled, !interactive); assert.equal(button.props.accessibilityState.disabled, !interactive);
+      if (interactive) { if (candidate) assert.equal(button.props.accessibilityState.selected, false); assert.equal(typeof button.props.onPress, "function"); }
       else { assert.equal(button.props.onPress, undefined); }
     }
     h.render(); assert.equal(h.state.starts.length, 1);
@@ -326,7 +326,7 @@ test("update 확인의 실제 target·제목/일시/category/completed 변경 �
   });
 });
 
-test("delete 확인에는 target과 비활성 예/아니요만 있고 changes 합성 없음", async () => {
+test("delete 확인에는 target과 예/아니요만 있고 changes 합성 없음", async () => {
   const { changes, ...base } = results.confirmation; assert.ok(changes);
   await showResult({ ...base, operation: "delete" }, (h, view) => {
     const props = view.components.find(item => item.name === "AssistantMessage").props;
@@ -646,13 +646,13 @@ test("연속 정보 보충은 최신 questionId·서버 conversationId만 사용
   } finally { h.close(); }
 });
 
-for (const kind of ["candidate_selection", "confirmation"]) test(`후속 응답 ${kind}: 상세 표시·식별값 보존·후보만 활성·추가 write 없음`, async () => {
+for (const kind of ["candidate_selection", "confirmation"]) test(`후속 응답 ${kind}: 상세 표시·식별값 보존·현재 질문 버튼만 활성·추가 write 없음`, async () => {
   const h = harness(); h.state.handle = responseWith(results.need_more_info);
   try {
     h.send("회의 수정"); await h.settle(); h.state.handle = responseWith(results[kind]); h.send("오후 3시"); await h.settle();
     const message = h.messages().at(-1); assert.deepEqual(message.apiExecution.response.data.result, results[kind]);
     const view = h.renderConversation(); assert.ok(cards(view).length > 0);
-    assert.ok(nodes(view.rows, "Pressable").every(button => button.props.disabled === (kind === "confirmation")));
+    assert.ok(nodes(view.rows, "Pressable").every(button => button.props.disabled === false));
     const count = h.state.calls.length; h.find("ConversationList").onCandidateSelection(message.id, "opaque/1");
     h.find("ConversationList").onDeleteConfirmation(message.id, true); await h.settle();
     assert.equal(h.state.calls.length, count); assert.equal(postedBodies(h).length, 2); assert.equal(h.state.mockRuns, 0); assert.equal(h.state.cleanup, 0);
@@ -872,7 +872,7 @@ test("6-B 실제 카드 선택: 새 UUID·서버 conversation/question·opaque c
     assert.equal(candidateButtons(h, message.id)[1].props.accessibilityState.selected, true);
     assert.ok(textOf(h.renderConversation().rows).includes("선택됨")); assert.equal(h.find("MessageInput").value, "보존할 초안");
     const confirmation = h.messages().at(-1); assert.equal(confirmation.apiExecution.response.data.result.kind, "confirmation");
-    assert.ok(candidateButtons(h, confirmation.id).every(button => button.props.disabled && button.props.onPress === undefined));
+    assert.ok(candidateButtons(h, confirmation.id).every(button => !button.props.disabled && typeof button.props.onPress === "function"));
     assert.strictEqual(h.mock.getState().schedules, before); assert.equal(h.state.mockRuns, 0); assert.equal(h.state.cleanup, 0);
     assert.ok(h.state.calls.every(call => call.url.includes("/assistant/requests"))); assert.ok([...h.data.values()].every(value => !value.includes("보존할 초안") && !value.includes("일정 후보")));
   } finally { h.close(); }
@@ -1054,5 +1054,249 @@ test("6-B unmount: 후보 만료 타이머·진행 작업 정리·늦은 응답�
     h.close(); gate.resolve(json(status(requestId), 202)); await h.settle();
     assert.equal(h.timers.size, 0); assert.equal(h.state.lateUpdates, 0); assert.equal(postedBodies(h).length, 2);
     assert.equal(h.state.calls.filter(call => call.init.method === "GET").length, 1); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
+
+// 확인 입력도 실제 버튼·공통 전송 경로·기존 HTTP/polling을 통과시킨다.
+async function liveConfirmation(h, overrides = {}) {
+  const result = { ...results.confirmation, questionId: id(330), expiresAt: new Date(h.wall + 600000).toISOString(), ...overrides };
+  if (result.operation === "delete") delete result.changes;
+  h.state.handle = responseWith(result); h.send("일정 변경해 줘"); await h.settle(); return h.messages().at(-1);
+}
+const confirmationButtons = (h, messageId) => candidateButtons(h, messageId);
+function confirmApi(h, messageId, approved) { h.find("ConversationList").onApiConfirmation(messageId, approved); h.render(); }
+const confirmationOutcome = approved => approved
+  ? { kind: "outcome", text: "변경을 완료했어요.", outcome: "success", operation: "update", schedulesChanged: true, affectedScheduleIds: [summary.id] }
+  : { kind: "outcome", text: "이번 변경안을 거절했어요.", outcome: "cancelled", operation: "update", schedulesChanged: false };
+
+for (const approved of [true, false]) test(`6-C 실제 ${approved ? "예" : "아니요"}: boolean confirmation·새 UUID·서버 ID만 전송, 직접 write/cancel 없음`, async () => {
+  const h = harness(), before = h.mock.getState().schedules;
+  try {
+    const message = await liveConfirmation(h), buttons = confirmationButtons(h, message.id);
+    assert.deepEqual(buttons.map(textOf), ["아니요", "예"]); assert.ok(buttons.every(button => !button.props.disabled));
+    h.edit("사용자 초안 유지"); h.state.handle = responseWith(confirmationOutcome(approved)); buttons[approved ? 1 : 0].props.onPress(); h.render(); await h.settle();
+    const [first, answer] = postedBodies(h); assert.notEqual(answer.requestId, first.requestId);
+    assert.match(answer.requestId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    assert.deepEqual(answer, { requestId: answer.requestId, conversationId: id(100), input: { type: "confirmation", questionId: id(330), approved } });
+    assert.equal(typeof answer.input.approved, "boolean"); assert.equal(h.messages().find(item => item.id === answer.requestId).text, approved ? "예" : "아니요");
+    assert.equal(confirmationButtons(h, message.id)[approved ? 1 : 0].props.accessibilityState.selected, true);
+    assert.ok(confirmationButtons(h, message.id).every(button => button.props.disabled));
+    assert.deepEqual(h.messages().at(-1).apiExecution.response.data.result, confirmationOutcome(approved));
+    assert.ok(textOf(h.renderConversation().rows).includes(approved ? "수정 완료" : "수정 취소됨"));
+    assert.equal(h.find("MessageInput").value, "사용자 초안 유지"); assert.equal(h.state.uuidCalls, 2);
+    assert.ok(h.state.calls.every(call => call.url.startsWith(`${origin}/api/v1/assistant/requests`)));
+    assert.strictEqual(h.mock.getState().schedules, before); assert.equal(h.state.mockRuns, 0); assert.equal(h.state.cleanup, 0);
+    assert.ok([...h.data.values()].every(value => !value.includes("사용자 초안 유지") && !value.includes('"approved"') && !value.includes('"messages"')));
+  } finally { h.close(); }
+});
+
+for (const [name, overrides, expected] of [
+  ["제목", { changes: { title: "변경된 일정 제목" } }, "제목: 원본 일정 → 변경된 일정 제목"],
+  ["날짜·시간·category", { changes: { scheduledAt: "2026-11-13T04:10:00Z", category: "OUTBOUND" } }, "오후 1:10"],
+  ["완료", { target: { ...summary, completed: false }, changes: { completed: true } }, "완료 상태: 미완료 → 완료"],
+  ["미완료", { target: { ...summary, completed: true }, changes: { completed: false } }, "완료 상태: 완료 → 미완료"],
+  ["삭제", { operation: "delete" }, "삭제 대상"],
+]) test(`6-C ${name} 확인: target 원형·실제 변경값·기존 카드 표시 보존`, async () => {
+  const h = harness(); try {
+    const message = await liveConfirmation(h, overrides), result = message.apiExecution.response.data.result, view = h.renderConversation();
+    assert.ok(textOf(view.rows).includes(expected)); assert.ok(confirmationButtons(h, message.id).every(button => !button.props.disabled));
+    const target = cards(view)[0].props.schedule; assert.equal(target.id, result.target.id); assert.equal(target.title, result.target.title);
+    assert.equal(target.date, "2026-11-12"); assert.equal(target.time, "09:00"); assert.equal(target.category, "기타"); assert.equal(target.completed, result.target.completed);
+    if (result.operation === "delete") assert.equal(Object.hasOwn(result, "changes"), false);
+    if (name === "날짜·시간·category") { assert.ok(textOf(view.rows).includes("11월 13일")); assert.ok(textOf(view.rows).includes("분류: 기타 → 출고")); }
+    h.state.handle = responseWith(confirmationOutcome(false)); confirmationButtons(h, message.id)[0].props.onPress(); h.render(); await h.settle();
+    assert.deepEqual(Object.keys(postedBodies(h).at(-1).input).sort(), ["approved", "questionId", "type"]);
+  } finally { h.close(); }
+});
+
+for (const [first, second] of [[true, true], [false, false], [true, false], [false, true]]) test(`6-C ${first}/${second} 연타: 처리 중 text·selection·반대 버튼 중복 실행 0회`, async () => {
+  const h = harness(), gate = deferred(); let gets = 0;
+  try {
+    const message = await liveConfirmation(h), buttons = confirmationButtons(h, message.id);
+    h.state.handle = (url, init) => init.method === "POST" ? json(status(JSON.parse(init.body).requestId), 202)
+      : ++gets === 1 ? json(status(url.split("/").pop(), "processing")) : gate.promise;
+    buttons[first ? 1 : 0].props.onPress(); buttons[second ? 1 : 0].props.onPress();
+    h.find("MessageInput").onSend(); selectApi(h, message.id, "없는 후보"); h.render(); await h.settle();
+    assert.equal(postedBodies(h).length, 2); assert.equal(postedBodies(h).at(-1).input.approved, first);
+    assert.equal(h.find("MessageInput").disabled, true); assert.equal(h.find("ConversationList").isProcessing, true);
+    assert.ok(confirmationButtons(h, message.id).every(button => button.props.disabled)); assert.equal(h.messages().filter(item => item.role === "assistant").length, 1);
+    await h.advance(1999); assert.equal(gets, 1); await h.advance(1); assert.equal(gets, 2);
+    gate.resolve(json({ ...done(postedBodies(h).at(-1).requestId), result: confirmationOutcome(first) })); await h.settle();
+    assert.equal(postedBodies(h).length, 2); assert.equal(h.find("MessageInput").disabled, false);
+  } finally { h.close(); }
+});
+
+for (const text of ["예", "아니요"]) test(`6-C 정보 보충에서 ${text} 답변은 기존 6-A text·questionId 유지`, async () => {
+  const h = harness(); try {
+    h.state.handle = responseWith({ ...results.need_more_info, text: "이 일정으로 등록할까요?" }); h.send("회의 등록"); await h.settle();
+    assert.equal(nodes(h.renderConversation().rows, "Pressable").length, 0); h.state.handle = responseWith(results.outcome); h.send(text); await h.settle();
+    assert.deepEqual(postedBodies(h).at(-1).input, { type: "text", text, questionId: id(300) });
+  } finally { h.close(); }
+});
+
+for (const approved of [true, false]) test(`6-C ${approved} 확인 만료: 정확한 경계·만료 안내·과거 callback POST 0회`, async () => {
+  const h = harness(); try {
+    const message = await liveConfirmation(h, { expiresAt: new Date(h.wall + 2000).toISOString() }), late = confirmationButtons(h, message.id)[approved ? 1 : 0].props.onPress;
+    await h.advance(1999); assert.ok(confirmationButtons(h, message.id).every(button => !button.props.disabled));
+    await h.advance(1); assert.ok(confirmationButtons(h, message.id).every(button => button.props.disabled));
+    assert.ok(textOf(h.renderConversation().rows).includes("확인 기한이 지났어요.")); assert.equal(h.timers.size, 0);
+    late(); confirmApi(h, message.id, approved); await h.settle(); assert.equal(postedBodies(h).length, 1); assert.equal(h.state.uuidCalls, 1);
+  } finally { h.close(); }
+});
+
+test("6-C GET 재수신·리렌더·UUID 대기에서 확인 만료 시각을 연장하지 않음", async () => {
+  const h = harness(); try {
+    const message = await liveConfirmation(h, { expiresAt: new Date(h.wall + 2000).toISOString() }), late = confirmationButtons(h, message.id)[1].props.onPress;
+    const execution = recovered("confirmation", message.apiExecution.reference.requestId);
+    execution.response.data.result = { ...message.apiExecution.response.data.result, expiresAt: new Date(h.wall + 9000).toISOString() };
+    h.publishSnapshot(snapshotOf([execution])); h.render(); h.state.beforeUuid = () => { h.wall += 2000; };
+    late(); h.render(); await h.settle(); assert.equal(postedBodies(h).length, 1);
+    h.publishSnapshot(snapshotOf([execution])); assert.ok(textOf(h.renderConversation().rows).includes("확인 기한이 지났어요."));
+    assert.ok(confirmationButtons(h, message.id).every(button => button.props.disabled));
+  } finally { h.close(); }
+});
+
+for (const approved of [true, false]) test(`6-C ${approved} 확인 저장 장벽 대기 중 만료: 늦은 저장 뒤 POST 0회`, async () => {
+  const h = harness(), gate = deferred(); try {
+    const message = await liveConfirmation(h, { expiresAt: new Date(h.wall + 2000).toISOString() });
+    h.state.beforeRead = () => gate.promise; confirmationButtons(h, message.id)[approved ? 1 : 0].props.onPress(); h.render(); await h.settle();
+    await h.advance(2000); h.state.beforeRead = null; gate.resolve(); await h.settle();
+    assert.equal(postedBodies(h).length, 1); assert.equal(h.state.cleanup, 0); assert.equal(h.find("MessageInput").disabled, false);
+  } finally { h.close(); }
+});
+
+test("6-C 접수 후 metadata 저장 대기에서 만료돼도 접수 증거 유지·POST 재실행 없음", async () => {
+  const h = harness(), gate = deferred(); try {
+    const message = await liveConfirmation(h, { expiresAt: new Date(h.wall + 2000).toISOString() });
+    h.state.handle = (url, init) => { if (init.method === "POST") { h.state.beforeRead = () => gate.promise; return json(status(JSON.parse(init.body).requestId), 202); }
+      return json({ ...done(url.split("/").pop()), result: confirmationOutcome(true) }); };
+    confirmationButtons(h, message.id)[1].props.onPress(); h.render(); await h.settle(); await h.advance(2000);
+    assert.equal(h.find("ConversationList").isProcessing, true); h.state.beforeRead = null; gate.resolve(); await h.settle();
+    assert.equal(h.messages().at(-1).apiExecution.kind, "completed"); assert.equal(postedBodies(h).length, 2);
+  } finally { h.close(); }
+});
+
+for (const reason of ["storage", "503"]) test(`6-C 접수 전 ${reason} 확정 실패: 원래 질문·초안 보존, 명시적 재시도만 허용`, async () => {
+  const h = harness(); try {
+    const message = await liveConfirmation(h); h.edit("새 초안");
+    if (reason === "storage") h.state.failStorage = true; else h.state.handle = () => problemResponse("ASSISTANT_UNAVAILABLE", 503);
+    confirmationButtons(h, message.id)[0].props.onPress(); h.render(); await h.settle();
+    assert.equal(postedBodies(h).length, reason === "storage" ? 1 : 2); assert.equal(h.state.starts.length, 2);
+    assert.equal(h.find("MessageInput").value, "새 초안"); assert.ok(confirmationButtons(h, message.id).every(button => !button.props.disabled));
+    h.state.failStorage = false; h.state.handle = responseWith(confirmationOutcome(true)); confirmationButtons(h, message.id)[1].props.onPress(); h.render(); await h.settle();
+    assert.equal(postedBodies(h).at(-1).input.approved, true); assert.equal(postedBodies(h).at(-1).input.questionId, id(330));
+  } finally { h.close(); }
+});
+
+for (const failure of ["network", "timeout", "response"]) test(`6-C 거절 POST ${failure} 미확인: GET-first 후 새 ID 승인/거절 재전송 0회`, async () => {
+  const h = harness(); try {
+    const message = await liveConfirmation(h), buttons = confirmationButtons(h, message.id);
+    h.state.handle = (url, init) => { if (init.method !== "POST") return problemResponse("ASSISTANT_UNAVAILABLE", 503);
+      if (failure === "network") throw Error("연결 실패"); if (failure === "timeout") return deferred().promise;
+      return { status: 202, headers: new Headers({ "Content-Type": "application/json", "X-Request-ID": id(900) }), text: async () => "{잘못된 JSON" }; };
+    buttons[0].props.onPress(); h.render(); await h.settle(); if (failure === "timeout") await h.advance(5000);
+    assert.equal(h.messages().at(-1).apiExecution.kind, "needs-attention"); const calls = h.state.calls.length;
+    buttons[1].props.onPress(); confirmApi(h, message.id, false); await h.settle();
+    assert.equal(h.state.calls.length, calls); assert.equal(postedBodies(h).length, 2); assert.ok(confirmationButtons(h, message.id).every(button => button.props.disabled));
+  } finally { h.close(); }
+});
+
+for (const metadataFailure of [false, true]) test(`6-C 접수 후 GET 실패${metadataFailure ? "·metadata 갱신 실패" : ""}: 과거 확인 재실행 0회`, async () => {
+  const h = harness(); try {
+    const message = await liveConfirmation(h), late = confirmationButtons(h, message.id)[1].props.onPress;
+    h.state.handle = (url, init) => { if (init.method !== "POST") return problemResponse("ASSISTANT_UNAVAILABLE", 503);
+      if (metadataFailure) h.state.failStorage = true; return json(status(JSON.parse(init.body).requestId), 202); };
+    late(); h.render(); await h.settle(); h.state.failStorage = false; h.publishSnapshot(snapshotOf([message.apiExecution]));
+    assert.equal(h.messages().at(-1).apiExecution.lastResponse.data.status, "accepted"); const count = h.state.calls.length;
+    late(); confirmApi(h, message.id, false); await h.settle(); assert.equal(h.state.calls.length, count); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
+
+for (const code of ["STALE_QUESTION", "QUESTION_EXPIRED", "CONVERSATION_EXPIRED"]) test(`6-C ${code}: 구조화 오류와 활성 질문 필드 보존·과거 확인 자동 재전송 없음`, async () => {
+  const h = harness(); try {
+    const message = await liveConfirmation(h), late = confirmationButtons(h, message.id)[1].props.onPress;
+    h.state.handle = () => problemResponse(code); late(); h.render(); await h.settle();
+    const problem = h.messages().at(-1).apiExecution.recoveryResult.postResult.error.problem; assert.equal(problem.code, code);
+    if (code === "STALE_QUESTION") { assert.equal(problem.activeQuestionId, id(305)); assert.equal(problem.activeQuestionRequestId, id(605)); }
+    h.publishSnapshot(snapshotOf([message.apiExecution])); late(); await h.settle();
+    assert.equal(postedBodies(h).length, 2); assert.ok(confirmationButtons(h, message.id).every(button => button.props.disabled));
+  } finally { h.close(); }
+});
+
+for (const kind of Object.keys(results)) test(`6-C 후속 ${kind}: 6종 원형 표시·이전 확인 버튼 비활성·성공 추측/write 없음`, async () => {
+  const h = harness(), before = h.mock.getState().schedules;
+  try {
+    const message = await liveConfirmation(h); h.state.handle = responseWith(results[kind]); confirmationButtons(h, message.id)[1].props.onPress(); h.render(); await h.settle();
+    const latest = h.messages().at(-1); assert.deepEqual(latest.apiExecution.response.data.result, results[kind]);
+    assert.ok(textOf(h.renderConversation().rows).includes(results[kind].text)); assert.ok(confirmationButtons(h, message.id).every(button => button.props.disabled));
+    if (kind === "failure" || kind === "uncertain") { assert.ok(textOf(h.renderConversation().rows).includes(kind === "failure" ? "처리 실패" : "결과 미확인")); assert.equal(latest.apiExecution.response.data.result.schedulesChanged, undefined); }
+    assert.strictEqual(h.mock.getState().schedules, before); assert.equal(h.state.mockRuns, 0); assert.equal(h.state.cleanup, 0);
+    assert.ok(h.state.calls.every(call => call.url.includes("/assistant/requests")));
+  } finally { h.close(); }
+});
+
+for (const change of ["server", "mode"]) test(`6-C ${change} 변경 후 과거 확인·늦은 callback 전송 0회`, async () => {
+  const h = harness(); try {
+    const message = await liveConfirmation(h), late = confirmationButtons(h, message.id)[1].props.onPress;
+    if (change === "mode") { h.switchMode("mock"); h.switchMode("server"); h.publishSnapshot(snapshotOf([message.apiExecution])); }
+    else { h.state.config = h.source("src/services/api/config.ts").parseDevelopmentServerConfig("https://other.example.invalid"); h.publishSnapshot(snapshotOf([], { serverId: "development:https://other.example.invalid" })); }
+    late(); confirmApi(h, message.id, false); await h.settle(); assert.equal(postedBodies(h).length, 1); assert.equal(h.state.mockRuns, 0);
+  } finally { h.close(); }
+});
+
+test("6-C cold start 과거 GET confirmation은 활성 추측 없이 읽기 전용·승인/거절 POST 0회", async () => {
+  const execution = recovered("confirmation"), h = harness({ initialSnapshot: snapshotOf([execution]) });
+  try {
+    const message = h.messages()[0]; assert.ok(confirmationButtons(h, message.id).every(button => button.props.disabled));
+    confirmApi(h, message.id, true); confirmApi(h, message.id, false); await h.settle(); assert.equal(h.state.calls.length, 0); assert.equal(h.state.uuidCalls, 0);
+  } finally { h.close(); }
+});
+
+test("6-C 최신 확인 결과 우선·이전 callback 재활성 금지·동일 요청 메시지 하나 유지", async () => {
+  const h = harness(), gate = deferred(); try {
+    const message = await liveConfirmation(h), oldButton = confirmationButtons(h, message.id)[1].props.onPress;
+    h.delegate.startRequest = (body, options) => { h.state.starts.push([body, options]); return { initial: gate.promise, completion: gate.promise, cancel() {} }; };
+    oldButton(); h.render(); const requestId = h.state.starts.at(-1)[0].requestId;
+    const latest = recovered("confirmation", requestId); latest.response.data.result = { ...results.confirmation, questionId: id(331), expiresAt: new Date(h.wall + 600000).toISOString() };
+    h.publishSnapshot(snapshotOf([message.apiExecution, latest])); gate.resolve(recovered("outcome", requestId)); await h.settle();
+    assert.equal(h.messages().at(-1).apiExecution.response.data.result.questionId, id(331)); assert.equal(h.messages().filter(item => item.apiExecution?.reference.requestId === requestId).length, 1);
+    const count = h.state.starts.length; oldButton(); await h.settle(); assert.equal(h.state.starts.length, count);
+    confirmationButtons(h, h.messages().at(-1).id)[0].props.onPress(); h.render(); assert.equal(h.state.starts.at(-1)[0].input.questionId, id(331));
+  } finally { h.close(); }
+});
+
+test("6-C boolean 이외의 approved·과거 메시지 ID는 UUID/POST 이전 차단", async () => {
+  const h = harness(); try {
+    const message = await liveConfirmation(h); for (const value of ["true", "false", 0, 1, null, undefined]) confirmApi(h, message.id, value);
+    confirmApi(h, "없는 메시지", true); await h.settle(); assert.equal(postedBodies(h).length, 1); assert.equal(h.state.uuidCalls, 1);
+    assert.ok(confirmationButtons(h, message.id).every(button => !button.props.disabled));
+  } finally { h.close(); }
+});
+
+test("6-C unmount 시 만료 타이머·진행 작업 정리, 늦은 응답 UI 반영·서버 cancel 없음", async () => {
+  const h = harness(), gate = deferred(); try {
+    const message = await liveConfirmation(h); h.state.handle = () => gate.promise;
+    confirmationButtons(h, message.id)[0].props.onPress(); h.render(); await h.settle(); const requestId = postedBodies(h).at(-1).requestId;
+    h.close(); gate.resolve(json(status(requestId), 202)); await h.settle();
+    assert.equal(h.timers.size, 0); assert.equal(h.state.lateUpdates, 0); assert.ok(h.state.calls.every(call => call.url.includes("/assistant/requests"))); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
+
+for (const approved of [true, false]) test(`작업 6 통합: 첫 text → 정보 보충 → selection → confirmation ${approved} → outcome`, async () => {
+  const h = harness(), before = h.mock.getState().schedules;
+  try {
+    h.state.handle = responseWith(results.need_more_info); h.send("순찰 일정 바꿔 줘"); await h.settle();
+    h.state.handle = responseWith(results.candidate_selection); h.send("이번 주 일정"); await h.settle();
+    const candidate = h.messages().at(-1), oldChoice = candidateButtons(h, candidate.id)[1].props.onPress;
+    h.state.handle = responseWith({ ...results.confirmation, questionId: id(331), expiresAt: new Date(h.wall + 600000).toISOString() });
+    oldChoice(); h.render(); await h.settle(); const confirmation = h.messages().at(-1);
+    h.state.handle = responseWith(confirmationOutcome(approved)); confirmationButtons(h, confirmation.id)[approved ? 1 : 0].props.onPress(); h.render(); await h.settle();
+    const bodies = postedBodies(h); assert.equal(bodies.length, 4); assert.equal(new Set(bodies.map(body => body.requestId)).size, 4);
+    assert.deepEqual(bodies.map(body => body.input.type), ["text", "text", "selection", "confirmation"]); assert.equal(Object.hasOwn(bodies[0], "conversationId"), false);
+    assert.ok(bodies.slice(1).every(body => body.conversationId === id(100))); assert.equal(bodies[1].input.questionId, id(300));
+    assert.equal(bodies[2].input.candidateId, results.candidate_selection.candidates[1].candidateId); assert.equal(bodies[3].input.questionId, id(331)); assert.equal(bodies[3].input.approved, approved);
+    assert.equal(h.messages().length, 8); assert.deepEqual(h.messages().map(message => message.role), ["user", "assistant", "user", "assistant", "user", "assistant", "user", "assistant"]);
+    assert.deepEqual(h.messages().at(-1).apiExecution.response.data.result, confirmationOutcome(approved)); oldChoice(); await h.settle(); assert.equal(postedBodies(h).length, 4);
+    assert.strictEqual(h.mock.getState().schedules, before); assert.equal(h.state.mockRuns, 0); assert.equal(h.state.cleanup, 0);
   } finally { h.close(); }
 });

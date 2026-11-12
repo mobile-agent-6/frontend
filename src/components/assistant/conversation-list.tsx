@@ -11,7 +11,7 @@ import type { AssistantLifecycleSnapshot } from "@/services/api/assistant-lifecy
 import type { AssistantInteraction } from "@/types/assistant";
 import type { Schedule } from "@/types/schedule";
 import { assistantResultToDisplay } from "@/utils/assistant-mapper";
-import type { AssistantCandidateQuestion } from "@/utils/assistant-text-question";
+import type { AssistantCandidateQuestion, AssistantConfirmationQuestion } from "@/utils/assistant-text-question";
 
 // 화면 메시지와 공개 API 결과를 구분하며 API 원형은 현재 실행 세션에만 보관한다.
 export type ConversationMessage = {
@@ -48,6 +48,10 @@ type ConversationListProps = {
   activeApiCandidate?: AssistantCandidateQuestion;
   apiCandidateSelections?: Readonly<Record<string, string>>;
   onApiCandidateSelection?: (messageId: string, candidateId: string) => void;
+  activeApiConfirmation?: AssistantConfirmationQuestion;
+  apiConfirmations?: Readonly<Record<string, boolean>>;
+  expiredApiConfirmations?: readonly string[];
+  onApiConfirmation?: (messageId: string, approved: boolean) => void;
 };
 
 export function ConversationList({
@@ -60,6 +64,10 @@ export function ConversationList({
   activeApiCandidate,
   apiCandidateSelections,
   onApiCandidateSelection,
+  activeApiConfirmation,
+  apiConfirmations,
+  expiredApiConfirmations,
+  onApiConfirmation,
 }: ConversationListProps) {
   const listRef = useRef<FlatList<ConversationMessage>>(null);
   const messageCount = messages.length;
@@ -222,6 +230,16 @@ export function ConversationList({
             interaction={item.apiExecution ? undefined : item.interaction}
             interactionsDisabled={Boolean(item.apiExecution) || interactionsDisabled}
             selectedApiCandidateId={item.apiExecution ? apiCandidateSelections?.[item.apiExecution.reference.requestId.toLowerCase()] : undefined}
+            selectedApiApproval={item.apiExecution ? apiConfirmations?.[item.apiExecution.reference.requestId.toLowerCase()] : undefined}
+            apiConfirmationExpired={item.apiExecution ? expiredApiConfirmations?.includes(item.apiExecution.reference.requestId.toLowerCase()) : undefined}
+            onApiConfirmation={
+              !interactionsDisabled && activeApiConfirmation && onApiConfirmation && item.apiExecution?.kind === "completed" &&
+              item.apiExecution.reference.serverId === activeApiConfirmation.serverId &&
+              item.apiExecution.reference.requestId.toLowerCase() === activeApiConfirmation.requestId.toLowerCase() &&
+              item.apiExecution.response.data.result.kind === "confirmation" &&
+              item.apiExecution.response.data.result.questionId.toLowerCase() === activeApiConfirmation.questionId.toLowerCase()
+                ? approved => onApiConfirmation(item.id, approved) : undefined
+            }
             onApiCandidateSelection={
               !interactionsDisabled && activeApiCandidate && onApiCandidateSelection && item.apiExecution?.kind === "completed" &&
               item.apiExecution.reference.serverId === activeApiCandidate.serverId &&

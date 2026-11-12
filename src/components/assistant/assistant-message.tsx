@@ -22,6 +22,9 @@ type AssistantMessageProps = {
   onCandidateSelection?: (scheduleId: string) => void;
   onApiCandidateSelection?: (candidateId: string) => void;
   selectedApiCandidateId?: string;
+  onApiConfirmation?: (approved: boolean) => void;
+  selectedApiApproval?: boolean;
+  apiConfirmationExpired?: boolean;
 };
 
 export function AssistantMessage({
@@ -34,6 +37,9 @@ export function AssistantMessage({
   onCandidateSelection,
   onApiCandidateSelection,
   selectedApiCandidateId,
+  onApiConfirmation,
+  selectedApiApproval,
+  apiConfirmationExpired,
 }: AssistantMessageProps) {
   const theme = useTheme();
   const confirmationDisabled = interactionsDisabled || interaction?.resolved || !onDeleteConfirmation;
@@ -45,7 +51,8 @@ export function AssistantMessage({
       >
         {text}
       </Text>
-      {apiResult && <ApiResultDetails result={apiResult} onCandidateSelection={onApiCandidateSelection} selectedCandidateId={selectedApiCandidateId} />}
+      {apiResult && <ApiResultDetails result={apiResult} onCandidateSelection={onApiCandidateSelection} selectedCandidateId={selectedApiCandidateId}
+        onConfirmation={onApiConfirmation} selectedApproval={selectedApiApproval} confirmationExpired={apiConfirmationExpired} />}
       {!apiResult && schedules?.map((schedule) => (
         <AssistantScheduleCard key={schedule.id} schedule={schedule} />
       ))}
@@ -63,11 +70,14 @@ export function AssistantMessage({
   );
 }
 
-// 서버 후보 선택 callback은 Mock interaction·confirmation 실행과 분리한다.
-function ApiResultDetails({ result, onCandidateSelection, selectedCandidateId }: {
+// 서버 후속 입력 callback은 Mock interaction 실행과 분리한다.
+function ApiResultDetails({ result, onCandidateSelection, selectedCandidateId, onConfirmation, selectedApproval, confirmationExpired }: {
   result: AssistantResultDisplay;
   onCandidateSelection?: (candidateId: string) => void;
   selectedCandidateId?: string;
+  onConfirmation?: (approved: boolean) => void;
+  selectedApproval?: boolean;
+  confirmationExpired?: boolean;
 }) {
   const theme = useTheme();
   switch (result.kind) {
@@ -114,7 +124,8 @@ function ApiResultDetails({ result, onCandidateSelection, selectedCandidateId }:
             )}
           </View>
         )}
-        <ConfirmationActions disabled />
+        {confirmationExpired && <ThemedText type="small" themeColor="primaryForeground">확인 기한이 지났어요.</ThemedText>}
+        <ConfirmationActions disabled={!onConfirmation || Boolean(confirmationExpired)} onConfirm={onConfirmation} selectedApproved={selectedApproval} />
       </>
     );
     case "outcome": {
@@ -137,12 +148,15 @@ function ApiResultDetails({ result, onCandidateSelection, selectedCandidateId }:
   }
 }
 
-function ConfirmationActions({ disabled, onConfirm }: { disabled: boolean; onConfirm?: (confirmed: boolean) => void }) {
+function ConfirmationActions({ disabled, onConfirm, selectedApproved }: {
+  disabled: boolean; onConfirm?: (confirmed: boolean) => void; selectedApproved?: boolean;
+}) {
   const theme = useTheme();
   return (
     <View style={styles.actions}>
       {([false, true] as const).map(confirmed => (
-        <Pressable key={String(confirmed)} accessibilityRole="button" accessibilityState={{ disabled }} disabled={disabled}
+        <Pressable key={String(confirmed)} accessibilityRole="button"
+          accessibilityState={{ disabled, ...(selectedApproved !== undefined ? { selected: selectedApproved === confirmed } : {}) }} disabled={disabled}
           onPress={disabled ? undefined : () => onConfirm?.(confirmed)}
           style={[styles.buttonBase, styles.action, { backgroundColor: confirmed ? theme.primaryForeground : "#FC8957" }, disabled && styles.disabled]}>
           <ThemedText themeColor={confirmed ? "primary" : "primaryForeground"}>{confirmed ? "예" : "아니요"}</ThemedText>
