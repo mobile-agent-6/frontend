@@ -6,10 +6,11 @@ import { ThemedText } from "@/components/ui/themed-text";
 import { ThemedView } from "@/components/ui/themed-view";
 import { Spacing } from "@/constants/theme";
 import { useTheme } from "@/hooks/use-theme";
+import type { AssistantExecutionResult } from "@/services/api/assistant-orchestrator";
 import type { AssistantInteraction } from "@/types/assistant";
 import type { Schedule } from "@/types/schedule";
 
-// 화면 표시용 메시지 데이터이며, 향후 Assistant API 계약과는 별개다.
+// 화면 메시지와 공개 API 결과를 구분하며 API 원형은 현재 실행 세션에만 보관한다.
 export type ConversationMessage = {
   id: string;
   text: string;
@@ -19,6 +20,7 @@ export type ConversationMessage = {
       role: "assistant";
       schedules?: readonly Schedule[];
       interaction?: AssistantInteraction;
+      apiExecution?: AssistantExecutionResult;
     }
 );
 
