@@ -11,6 +11,7 @@ import type {
 } from "@/types/assistant";
 import type { Schedule } from "@/types/schedule";
 import type { AssistantResultDisplay } from "@/utils/assistant-mapper";
+import { assistantFailureAdvice } from "@/utils/assistant-errors";
 
 type AssistantMessageProps = {
   text: string;
@@ -25,6 +26,7 @@ type AssistantMessageProps = {
   onApiConfirmation?: (approved: boolean) => void;
   selectedApiApproval?: boolean;
   apiConfirmationExpired?: boolean;
+  apiRecoveryText?: string;
 };
 
 export function AssistantMessage({
@@ -40,6 +42,7 @@ export function AssistantMessage({
   onApiConfirmation,
   selectedApiApproval,
   apiConfirmationExpired,
+  apiRecoveryText,
 }: AssistantMessageProps) {
   const theme = useTheme();
   const confirmationDisabled = interactionsDisabled || interaction?.resolved || !onDeleteConfirmation;
@@ -51,6 +54,7 @@ export function AssistantMessage({
       >
         {text}
       </Text>
+      {apiRecoveryText && <ThemedText type="small" themeColor="primaryForeground">{apiRecoveryText}</ThemedText>}
       {apiResult && <ApiResultDetails result={apiResult} onCandidateSelection={onApiCandidateSelection} selectedCandidateId={selectedApiCandidateId}
         onConfirmation={onApiConfirmation} selectedApproval={selectedApiApproval} confirmationExpired={apiConfirmationExpired} />}
       {!apiResult && schedules?.map((schedule) => (
@@ -143,7 +147,10 @@ function ApiResultDetails({ result, onCandidateSelection, selectedCandidateId, o
         </>
       );
     }
-    case "failure": return <ThemedText type="small" themeColor="primaryForeground">처리 실패</ThemedText>;
+    case "failure": return <>
+      <ThemedText type="small" themeColor="primaryForeground">처리 실패</ThemedText>
+      <ThemedText type="small" themeColor="primaryForeground">{assistantFailureAdvice(result.nextAction)}</ThemedText>
+    </>;
     case "uncertain": return <ThemedText type="small" themeColor="primaryForeground">결과 미확인</ThemedText>;
   }
 }

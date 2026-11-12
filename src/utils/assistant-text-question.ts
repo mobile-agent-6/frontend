@@ -25,6 +25,8 @@ export function createAssistantTextQuestionContext(serverId: string, generation:
   const blockedQuestions = new Set<string>();
   const selections = new Map<string, string>();
   const confirmations = new Map<string, boolean>();
+  const activeProofs = new Set<string>();
+  const expiredConversations = new Set<string>();
   let currentRequestId: string | undefined;
   let pending: { requestId: string; question?: AssistantTextQuestion; candidateId?: string; approved?: boolean } | undefined;
 
@@ -70,6 +72,16 @@ export function createAssistantTextQuestionContext(serverId: string, generation:
       const post = recovery?.kind === "unconfirmed" ? recovery.postResult : undefined;
       const problem = post && !post.ok ? post.error.problem : undefined;
       const code = problem?.code;
+      const conversationId = answering?.conversationId ?? (post && !post.ok ? post.error.conversationId : undefined);
+      if (conversationId && (code === "CONVERSATION_EXPIRED" || code === "CONVERSATION_BUSY" ||
+        code === "STALE_QUESTION" && !problem?.activeQuestionId && !problem?.activeQuestionRequestId)) {
+        // 활성 질문 없음·대화 만료·진행 중 작업에서 과거 GET 질문을 다시 활성화하지 않는다.
+        if (code === "CONVERSATION_EXPIRED") expiredConversations.add(conversationId.toLowerCase());
+        for (const [key, value] of observations) if (value.conversationId.toLowerCase() === conversationId.toLowerCase()) {
+          replaced.add(key); invalidQuestions.delete(key);
+          if (currentRequestId === key) currentRequestId = undefined;
+        }
+      }
       if (pending?.requestId === execution.reference.requestId.toLowerCase() &&
         (pending.candidateId !== undefined || pending.approved !== undefined) && answering) {
         // 접수 여부가 미확인인 선택·확인을 새 ID로 다시 보내지 않는다. 미전송·확정 거절만 명시적 재시도 가능하다.
@@ -95,10 +107,13 @@ export function createAssistantTextQuestionContext(serverId: string, generation:
 
   function getQuestion(): AssistantTextQuestion | "ambiguous" | "unavailable" | "unsupported" | undefined {
     const candidates = currentRequestId ? [observations.get(currentRequestId)]
-      : [...observations.entries()].filter(([key]) => !replaced.has(key)).map(([, value]) => value);
+      : [...observations.entries()].filter(([key, value]) => !replaced.has(key) &&
+        !expiredConversations.has(value.conversationId.toLowerCase())).map(([, value]) => value);
     const questions = candidates.filter((value): value is Observation & { questionId: string } =>
-      value?.resultKind === "need_more_info" && value.questionId !== undefined && !invalidQuestions.has(value.requestId.toLowerCase()));
-    const interactions = candidates.filter(value => value?.resultKind === "candidate_selection" || value?.resultKind === "confirmation");
+      value?.resultKind === "need_more_info" && value.questionId !== undefined && !invalidQuestions.has(value.requestId.toLowerCase()) &&
+      !expiredConversations.has(value.conversationId.toLowerCase()));
+    const interactions = candidates.filter(value => value && !expiredConversations.has(value.conversationId.toLowerCase()) &&
+      (value.resultKind === "candidate_selection" || value.resultKind === "confirmation"));
     // 여러 과거 GET 결과의 순서로 활성 질문을 추측하지 않는다. 상세 질문 복구는 후속 작업에서 처리한다.
     if (questions.length + interactions.length > 1) return "ambiguous";
     // 후보·확인에 일반 text를 보내거나 새 대화로 우회하지 않는다.
@@ -110,11 +125,11 @@ export function createAssistantTextQuestionContext(serverId: string, generation:
   }
 
   function getTimedQuestion(now: number, kind: "candidate_selection" | "confirmation"): Observation | undefined {
-    if (!currentRequestId || !startedRequests.has(currentRequestId) || replaced.has(currentRequestId) ||
+    if (!currentRequestId || !(startedRequests.has(currentRequestId) || activeProofs.has(currentRequestId)) || replaced.has(currentRequestId) ||
       invalidQuestions.has(currentRequestId) || blockedQuestions.has(currentRequestId)) return;
     const value = observations.get(currentRequestId);
     // 과거 GET 질문만으로는 서버 재시작 이후의 활성 여부를 증명할 수 없다.
-    if (!value || value.resultKind !== kind || !value.questionId || !value.expiresAt ||
+    if (!value || expiredConversations.has(value.conversationId.toLowerCase()) || value.resultKind !== kind || !value.questionId || !value.expiresAt ||
       !Number.isFinite(now) || !Number.isFinite(Date.parse(value.expiresAt)) || Date.parse(value.expiresAt) <= now) return;
     return value;
   }
@@ -131,8 +146,33 @@ export function createAssistantTextQuestionContext(serverId: string, generation:
       conversationId: value.conversationId, questionId: value.questionId, expiresAt: value.expiresAt, candidateIds: value.candidateIds } : undefined;
   }
 
+  function getRecoveryToken(): string {
+    return JSON.stringify([currentRequestId, pending?.requestId, [...replaced], [...invalidQuestions], [...blockedQuestions],
+      [...expiredConversations], [...activeProofs], [...observations].map(([key, value]) => [key, { ...value, source: undefined }])]);
+  }
+
+  function restoreActiveQuestion(execution: AssistantExecutionResult, proof: { requestId: string; questionId: string;
+    conversationId: string }, token: string, now: number): boolean {
+    if (token !== getRecoveryToken() || execution.kind !== "completed" || execution.reference.serverId !== serverId ||
+      execution.response.serverId !== serverId || execution.reference.requestId.toLowerCase() !== proof.requestId.toLowerCase()) return false;
+    const data = execution.response.data, result = data.result, key = data.requestId.toLowerCase();
+    if (key !== proof.requestId.toLowerCase() || replaced.has(key) || expiredConversations.has(data.conversationId.toLowerCase()) ||
+      data.conversationId.toLowerCase() !== proof.conversationId.toLowerCase() ||
+      !["need_more_info", "candidate_selection", "confirmation"].includes(result.kind) || !("questionId" in result) ||
+      result.questionId.toLowerCase() !== proof.questionId.toLowerCase() ||
+      "expiresAt" in result && Date.parse(result.expiresAt) <= now) return false;
+    const previous = observations.get(key);
+    if (previous?.questionId?.toLowerCase() === result.questionId.toLowerCase() && previous.expiresAt &&
+      Date.parse(previous.expiresAt) <= now) return false;
+    // 오류의 활성 ID와 같은 대화의 검증된 GET을 함께 확인한 경우에만 명시적 답변을 허용한다.
+    currentRequestId = key; activeProofs.add(key); invalidQuestions.delete(key); blockedQuestions.delete(key);
+    observeResponse(data, "recovery");
+    return true;
+  }
+
   return { serverId, generation, beginRequest, observeResponse, observeExecution, getQuestion, getCandidateQuestion,
-    getConfirmationQuestion, getSelections: (): Readonly<Record<string, string>> => Object.fromEntries(selections),
+    getConfirmationQuestion, getRecoveryToken, restoreActiveQuestion,
+    getSelections: (): Readonly<Record<string, string>> => Object.fromEntries(selections),
     getConfirmations: (): Readonly<Record<string, boolean>> => Object.fromEntries(confirmations),
     getExpiredConfirmations: (now: number): readonly string[] => [...observations.entries()]
       .filter(([, value]) => value.resultKind === "confirmation" && value.expiresAt && Date.parse(value.expiresAt) <= now)

@@ -29,6 +29,7 @@ import { parseAssistantRequestCreate, validateAssistantJsonBodySize, validateAss
 import { upsertAssistantExecutionMessage } from "@/utils/assistant-recovery-messages";
 import { createAssistantTextQuestionContext, type AssistantCandidateQuestion, type AssistantConfirmationQuestion, type AssistantTextQuestion } from "@/utils/assistant-text-question";
 import { assistantCandidateToDisplay } from "@/utils/assistant-mapper";
+import { getAssistantErrorRecoveryTarget, type AssistantErrorRecoveryNotice } from "@/utils/assistant-errors";
 
 // processing UI를 보여주기 위한 Mock 지연이며, 실제 API timeout이 아니다.
 const MOCK_PROCESSING_DELAY_MS = 700;
@@ -402,6 +403,7 @@ export default function AssistantScreen() {
       if (!isCurrent()) { task.cancel(); return; }
       serverTaskRef.current = task;
       const execution = await task.completion;
+      clearInputExpiry?.();
       if (!isCurrent() || assistantHttpClient.getServerId() !== serverId) return;
       context.observeExecution(execution, "request", question);
       syncQuestionUi(context);
@@ -411,6 +413,35 @@ export default function AssistantScreen() {
         setMessages(current => upsertAssistantExecutionMessage(current, execution, "request"));
       } else {
         reportError("요청 결과를 확인하지 못했어요. 원래 요청의 확인이 필요해요.", execution);
+        const target = getAssistantErrorRecoveryTarget(execution);
+        if (target) {
+          const token = context.getRecoveryToken();
+          const updateRecovery = (status: AssistantErrorRecoveryNotice["status"], result?: AssistantExecutionResult) => {
+            if (!isCurrent() || assistantHttpClient.getServerId() !== serverId) return;
+            setMessages(current => current.map(message => message.role === "assistant" &&
+              message.apiExecution?.reference.serverId === serverId && message.apiExecution.reference.requestId.toLowerCase() === requestId.toLowerCase()
+                ? { ...message, apiErrorRecovery: { targetRequestId: target.requestId, kind: target.kind, status, result } } : message));
+          };
+          updateRecovery("checking");
+          // 단발 GET은 기존 서버 경계·공유 요청 잠금을 사용하며 새 polling·POST를 만들지 않는다.
+          const recoveryTask = assistantOrchestrator.queryRequestOnce({ serverId, requestId: target.requestId });
+          serverTaskRef.current = recoveryTask;
+          const recovered = await recoveryTask.completion;
+          if (!isCurrent() || assistantHttpClient.getServerId() !== serverId) return;
+          if (token !== context.getRecoveryToken()) {
+            updateRecovery("context-changed", recovered);
+          } else if (recovered.kind === "needs-attention" && recovered.reason === "busy") {
+            updateRecovery("busy", recovered);
+          } else {
+            setMessages(current => upsertAssistantExecutionMessage(current, recovered, "recovery"));
+            const restored = target.kind === "question" && target.questionId && body.conversationId &&
+              context.restoreActiveQuestion(recovered, { requestId: target.requestId, questionId: target.questionId,
+                conversationId: body.conversationId }, token, Date.now());
+            syncQuestionUi(context);
+            updateRecovery(recovered.kind === "needs-attention" ? "unconfirmed"
+              : target.kind === "question" ? restored ? "restored" : "mismatch" : "observed", recovered);
+          }
+        }
       }
     } catch {
       if (isCurrent()) {

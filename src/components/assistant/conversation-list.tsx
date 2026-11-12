@@ -12,6 +12,7 @@ import type { AssistantInteraction } from "@/types/assistant";
 import type { Schedule } from "@/types/schedule";
 import { assistantResultToDisplay } from "@/utils/assistant-mapper";
 import type { AssistantCandidateQuestion, AssistantConfirmationQuestion } from "@/utils/assistant-text-question";
+import { assistantErrorRecoveryNotice, type AssistantErrorRecoveryNotice } from "@/utils/assistant-errors";
 
 // 화면 메시지와 공개 API 결과를 구분하며 API 원형은 현재 실행 세션에만 보관한다.
 export type ConversationMessage = {
@@ -27,6 +28,7 @@ export type ConversationMessage = {
       interaction?: AssistantInteraction;
       apiExecution?: AssistantExecutionResult;
       apiSource?: "request" | "recovery";
+      apiErrorRecovery?: AssistantErrorRecoveryNotice;
       recoveryIssue?: Pick<AssistantLifecycleSnapshot, "serverId" | "phase" | "initialCheck" | "initialization" | "issue">;
     }
 );
@@ -224,6 +226,7 @@ export function ConversationList({
         ) : (
           <AssistantMessage
             text={item.text}
+            apiRecoveryText={item.apiErrorRecovery ? assistantErrorRecoveryNotice(item.apiErrorRecovery) : undefined}
             apiResult={item.apiExecution?.kind === "completed"
               ? assistantResultToDisplay(item.apiExecution.response.data.result) : undefined}
             schedules={item.apiExecution ? undefined : item.schedules}

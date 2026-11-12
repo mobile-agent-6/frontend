@@ -231,7 +231,8 @@ export function createAssistantOrchestrator({
             if (!needsFirstGet) settleInitial(observed());
           }
         }
-        if (!budget && !await loadBudget()) return attention(reason ?? "storage");
+        // 서버가 알려 준 미저장 복구 ID도 단발 GET할 수 있다. POST 시각을 만들거나 polling을 시작하지 않는다.
+        if (action !== "once" && !budget && !await loadBudget()) return attention(reason ?? "storage");
         if (needsFirstGet) {
           // 앱 복구·명시적 재조회는 120초 뒤에도 한 번 허용한다. 자동 POST 후 첫 GET만 deadline 적용.
           if (action === "start" && remaining() <= 0) return attention(reason ?? "deadline");

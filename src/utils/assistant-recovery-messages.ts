@@ -1,6 +1,7 @@
 import type { ConversationMessage } from "@/components/assistant/conversation-list";
 import type { AssistantExecutionResult } from "@/services/api/assistant-orchestrator";
 import type { AssistantRecoveryReference } from "@/types/assistant-recovery";
+import { assistantHttpErrorNotice, getAssistantExecutionError } from "@/utils/assistant-errors";
 
 const sameRequest = (a: AssistantRecoveryReference, b: AssistantRecoveryReference) =>
   a.serverId === b.serverId && a.requestId.toLowerCase() === b.requestId.toLowerCase();
@@ -20,11 +21,14 @@ export function upsertAssistantExecutionMessage(messages: ConversationMessage[],
       old?.kind === "needs-attention" && old.recoveryResult?.kind === "unconfirmed" && old.recoveryResult.getResult)) return messages;
     if (execution.kind === "needs-attention" && source === "request" && old?.kind === "completed") return messages;
   }
+  const error = getAssistantExecutionError(execution);
   const text = execution.kind === "completed" ? execution.response.data.result.text
     : execution.kind === "observed" ? "서버에서 요청을 처리하고 있어요."
     : execution.reason === "deadline" ? "자동 확인 시간이 끝났어요. 요청 결과는 아직 확인이 필요해요."
+    : error ? assistantHttpErrorNotice(error)
     : "요청 결과를 확인하지 못했어요. 원래 요청의 확인이 필요해요.";
-  const next: ConversationMessage = { id: previous?.id ?? (source === "request" ? `assistant-${execution.reference.requestId}` : `assistant-recovery-${JSON.stringify([
+  const next: ConversationMessage = { ...(previous?.role === "assistant" && previous.apiErrorRecovery ? { apiErrorRecovery: previous.apiErrorRecovery } : {}),
+    id: previous?.id ?? (source === "request" ? `assistant-${execution.reference.requestId}` : `assistant-recovery-${JSON.stringify([
     execution.reference.serverId, execution.reference.requestId.toLowerCase(),
   ])}`), role: "assistant", serverId: execution.reference.serverId, text, apiExecution: execution, apiSource: source };
   if (previous && JSON.stringify(previous) === JSON.stringify(next)) return messages;

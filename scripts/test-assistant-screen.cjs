@@ -85,7 +85,8 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
   const recovery = source("src/services/api/assistant-request-recovery.ts").createAssistantRequestRecovery({ http, recovery: storage, now: () => wall });
   const api = source("src/services/api/assistant-orchestrator.ts");
   const orchestrator = api.createAssistantOrchestrator({ http, requests: recovery, storage: { ...storage, cleanup: async (...args) => { state.cleanup++; return storage.cleanup(...args); } }, clock: { now: () => wall, monotonicNow: () => mono } });
-  const delegate = { startRequest: (...args) => { state.starts.push(args); return orchestrator.startRequest(...args); } }; api.assistantOrchestrator = delegate;
+  const delegate = { startRequest: (...args) => { state.starts.push(args); return orchestrator.startRequest(...args); },
+    queryRequestOnce: (...args) => orchestrator.queryRequestOnce(...args) }; api.assistantOrchestrator = delegate;
   const mode = source("src/stores/scheduleDataModeStore.ts"), mock = source("src/stores/scheduleStore.ts").useScheduleStore;
   const lifecycleModule = source("src/services/api/assistant-lifecycle.ts");
   const realLifecycle = lifecycleModule.createAssistantLifecycle({ http, orchestrator: { initializeRecovery: options => { state.initializations++; return orchestrator.initializeRecovery(options); } } });
@@ -611,6 +612,7 @@ test("uncertain 복구 수신은 위험 인지가 아니며 새 text에도 ackno
 
 // 정보 보충 후속 text도 실제 화면·저장 장벽·HTTP·polling 경계를 통과시킨다.
 const postedBodies = h => h.state.calls.filter(call => call.init.method === "POST").map(call => JSON.parse(call.init.body));
+const lastPostExecution = h => h.messages().find(message => message.apiExecution?.reference.requestId === postedBodies(h).at(-1).requestId)?.apiExecution;
 const problemResponse = (code, statusCode = 409, activeQuestion = true) => ({ status: statusCode,
   headers: new Headers({ "Content-Type": "application/problem+json", "X-Request-ID": id(900) }),
   text: async () => JSON.stringify({ type: "https://example.invalid/problem", title: "접수 거절", status: statusCode,
@@ -715,7 +717,7 @@ for (const code of ["STALE_QUESTION", "QUESTION_EXPIRED", "CONVERSATION_EXPIRED"
   try {
     h.send("회의 등록"); await h.settle(); const firstId = postedBodies(h)[0].requestId;
     h.state.handle = () => problemResponse(code); h.send("오후 3시"); await h.settle();
-    const problem = h.messages().at(-1).apiExecution.recoveryResult.postResult.error.problem; assert.equal(problem.code, code);
+    const problem = lastPostExecution(h).recoveryResult.postResult.error.problem; assert.equal(problem.code, code);
     if (code === "STALE_QUESTION") { assert.equal(problem.activeQuestionId, id(305)); assert.equal(problem.activeQuestionRequestId, id(605)); }
     h.publishSnapshot(snapshotOf([recovered("need_more_info", firstId)]));
     assert.equal(postedBodies(h).length, 2); assert.equal(h.find("MessageInput").value, "오후 3시");
@@ -974,7 +976,7 @@ for (const code of ["STALE_QUESTION", "QUESTION_EXPIRED", "CONVERSATION_EXPIRED"
   const h = harness(); try {
     const message = await liveCandidates(h), late = candidateButtons(h, message.id)[0].props.onPress;
     h.state.handle = () => problemResponse(code); late(); h.render(); await h.settle();
-    assert.equal(h.messages().at(-1).apiExecution.recoveryResult.postResult.error.problem.code, code);
+    assert.equal(lastPostExecution(h).recoveryResult.postResult.error.problem.code, code);
     h.publishSnapshot(snapshotOf([message.apiExecution])); assert.ok(candidateButtons(h, message.id).every(button => button.props.disabled));
     late(); await h.settle(); assert.equal(postedBodies(h).length, 2); assert.equal(h.state.cleanup, 0);
   } finally { h.close(); }
@@ -1216,7 +1218,7 @@ for (const code of ["STALE_QUESTION", "QUESTION_EXPIRED", "CONVERSATION_EXPIRED"
   const h = harness(); try {
     const message = await liveConfirmation(h), late = confirmationButtons(h, message.id)[1].props.onPress;
     h.state.handle = () => problemResponse(code); late(); h.render(); await h.settle();
-    const problem = h.messages().at(-1).apiExecution.recoveryResult.postResult.error.problem; assert.equal(problem.code, code);
+    const problem = lastPostExecution(h).recoveryResult.postResult.error.problem; assert.equal(problem.code, code);
     if (code === "STALE_QUESTION") { assert.equal(problem.activeQuestionId, id(305)); assert.equal(problem.activeQuestionRequestId, id(605)); }
     h.publishSnapshot(snapshotOf([message.apiExecution])); late(); await h.settle();
     assert.equal(postedBodies(h).length, 2); assert.ok(confirmationButtons(h, message.id).every(button => button.props.disabled));
@@ -1298,5 +1300,211 @@ for (const approved of [true, false]) test(`작업 6 통합: 첫 text → 정보
     assert.equal(h.messages().length, 8); assert.deepEqual(h.messages().map(message => message.role), ["user", "assistant", "user", "assistant", "user", "assistant", "user", "assistant"]);
     assert.deepEqual(h.messages().at(-1).apiExecution.response.data.result, confirmationOutcome(approved)); oldChoice(); await h.settle(); assert.equal(postedBodies(h).length, 4);
     assert.strictEqual(h.mock.getState().schedules, before); assert.equal(h.state.mockRuns, 0); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
+
+// 접수 오류·복구 GET·접수 후 failure를 실제 화면 경로에서 구분한다.
+const error7a = (code, statusCode, extra = {}) => ({ status: statusCode,
+  headers: new Headers({ "Content-Type": "application/problem+json", "X-Request-ID": id(900) }),
+  text: async () => JSON.stringify({ type: "https://example.invalid/problem", title: "INTERNAL_JSON", detail: "STACK_MODEL_RAW_SECRET",
+    instance: "/api/v1/assistant/requests", status: statusCode, requestId: id(900), code,
+    ...(code === "VALIDATION_ERROR" ? { errors: [{ location: "body", pointer: "/input/text", code: "INVALID_VALUE", detail: "STACK_MODEL_RAW_SECRET" }] } : {}), ...extra }) });
+const postMessage = h => h.messages().find(message => message.apiExecution?.reference.requestId === postedBodies(h).at(-1).requestId);
+const active7a = (kind = "confirmation", extra = {}) => ({ ...done(id(640), kind), result: {
+  ...results[kind], ...(["need_more_info", "candidate_selection", "confirmation"].includes(kind) ? { questionId: id(340) } : {}),
+  ...(["candidate_selection", "confirmation"].includes(kind) ? { expiresAt: "2026-11-12T01:00:00Z" } : {}), ...extra } });
+const stale7a = (extra = {}) => error7a("STALE_QUESTION", 409, { activeQuestionId: id(340), activeQuestionRequestId: id(640), ...extra });
+
+for (const [code, httpStatus, expected] of [
+  ["MALFORMED_REQUEST", 400, "요청 형식"], ["REQUEST_BODY_TOO_LARGE", 413, "16 KiB"], ["VALIDATION_ERROR", 422, "입력 값이나 형식"],
+  ["REQUEST_ID_CONFLICT", 409, "같은 요청 ID"], ["CONVERSATION_BUSY", 409, "이미 처리 중인 작업"], ["STALE_QUESTION", 409, "새 요청을 입력"],
+  ["QUESTION_EXPIRED", 409, "응답 기한"], ["CONVERSATION_EXPIRED", 409, "대화가 만료"], ["REQUEST_EXPIRED", 409, "다시 접수할 수 없어요"],
+  ["ASSISTANT_REQUEST_NOT_FOUND", 404, "미실행을 뜻하지"], ["ASSISTANT_CONVERSATION_NOT_FOUND", 404, "대화 기록"],
+  ["ASSISTANT_TARGET_NOT_FOUND", 404, "취소 대상 기록"], ["ROUTE_NOT_FOUND", 404, "API 경로"], ["ASSISTANT_UNAVAILABLE", 503, "수동 일정 관리"],
+  ["DATABASE_UNAVAILABLE", 503, "데이터베이스"], ["INTERNAL_ERROR", 500, "서버 오류"],
+  ["UNRESOLVED_UNCERTAIN", 409, "새 작업이 보류"], ["ACKNOWLEDGEMENT_NOT_APPLICABLE", 409, "보류 해제는 확인되지"],
+]) test(`7-A ${httpStatus} ${code}: code별 안내·원형 보존·내부 출력/자동 POST 없음`, async () => {
+  const h = harness(); h.state.handle = () => error7a(code, httpStatus);
+  try {
+    h.send("입력 원문"); await h.settle(); const message = postMessage(h), error = message.apiExecution.recoveryResult.postResult.error;
+    assert.equal(error.status, httpStatus); assert.equal(error.problem.code, code); assert.ok(message.text.includes(expected));
+    assert.equal(message.apiExecution.kind, "needs-attention"); assert.equal(error.problem.detail, "STACK_MODEL_RAW_SECRET");
+    assert.ok(!textOf(h.renderConversation().rows).includes("STACK_MODEL_RAW_SECRET")); assert.ok(!textOf(h.renderConversation().rows).includes("INTERNAL_JSON"));
+    assert.equal(h.find("MessageInput").value, "입력 원문"); assert.equal(postedBodies(h).length, 1); assert.equal(h.state.uuidCalls, 1); assert.equal(h.state.cleanup, 0);
+    assert.equal(h.state.calls.length, 1);
+  } finally { h.close(); }
+});
+
+for (const [code, nextAction, expected] of [["MODEL_OUTPUT_INVALID", "revise_input", "입력 내용을 수정"],
+  ["MODEL_TIMEOUT", "retry_later", "나중에 다시 요청"], ["INTERNAL_ERROR", "none", "요청 결과를 확인"]]) test(`7-A completed failure ${nextAction}: HTTP 오류와 분리·서버 text 유지·자동 write 없음`, async () => {
+  const h = harness(), result = { kind: "failure", text: "서버가 제공한 사용자 안내 원문", code, nextAction };
+  h.state.handle = responseWith(result);
+  try { h.send("요청"); await h.settle(); const message = h.messages().at(-1);
+    assert.equal(message.text, result.text); assert.equal(message.apiExecution.kind, "completed"); assert.deepEqual(message.apiExecution.response.data.result, result);
+    assert.ok(textOf(h.renderConversation().rows).includes(expected)); assert.equal(postedBodies(h).length, 1); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
+
+for (const kind of ["need_more_info", "candidate_selection", "confirmation"]) test(`7-A STALE 현재 ${kind} 복구: 미저장 ID GET·동일 대화/질문 검증 후 명시적 입력만 허용`, async () => {
+  const h = harness(), before = h.mock.getState().schedules;
+  try {
+    const old = await liveConfirmation(h), oldClick = confirmationButtons(h, old.id)[1].props.onPress;
+    h.state.handle = (url, init) => init.method === "POST" ? stale7a() : json(active7a(kind));
+    oldClick(); h.render(); await h.settle(); assert.equal(postedBodies(h).length, 2);
+    assert.ok(h.state.calls.at(-1).url.endsWith(id(640))); assert.equal(h.state.calls.at(-1).init.method, "GET");
+    assert.equal(postMessage(h).apiErrorRecovery.status, "restored"); assert.equal(lastPostExecution(h).recoveryResult.postResult.error.problem.activeQuestionId, id(340));
+    assert.equal(await h.storage.read(recoveryRef(id(640))), null); assert.ok(confirmationButtons(h, old.id).every(button => button.props.disabled));
+    const recoveredMessage = h.messages().find(message => message.apiExecution?.reference.requestId === id(640));
+    assert.deepEqual(recoveredMessage.apiExecution.response.data.result, active7a(kind).result); const count = h.state.calls.length; oldClick(); await h.settle(); assert.equal(h.state.calls.length, count);
+    h.state.handle = responseWith(results.outcome);
+    if (kind === "need_more_info") h.send("복구 질문의 답변");
+    else candidateButtons(h, recoveredMessage.id)[0].props.onPress();
+    h.render(); await h.settle(); const body = postedBodies(h).at(-1);
+    assert.equal(body.conversationId, id(100)); assert.equal(body.input.questionId, id(340));
+    assert.equal(body.input.type, kind === "need_more_info" ? "text" : kind === "candidate_selection" ? "selection" : "confirmation");
+    if (kind === "confirmation") assert.equal(body.input.approved, false);
+    assert.strictEqual(h.mock.getState().schedules, before); assert.equal(h.state.mockRuns, 0); assert.equal(h.state.cleanup, 0);
+    assert.ok(h.state.calls.every(call => call.url.startsWith(`${origin}/api/v1/assistant/requests`)));
+  } finally { h.close(); }
+});
+
+for (const mismatch of ["question", "conversation", "kind", "expired", "missing-question-field"]) test(`7-A STALE ${mismatch} 불일치: 카드 표시와 활성화 분리·과거 승인 POST 0회`, async () => {
+  const h = harness(); try {
+    const old = await liveConfirmation(h), oldClick = confirmationButtons(h, old.id)[1].props.onPress;
+    const data = mismatch === "kind" ? active7a("outcome") : active7a("confirmation", mismatch === "question" ? { questionId: id(341) }
+      : mismatch === "expired" ? { expiresAt: "1970-01-01T00:00:00Z" } : {});
+    if (mismatch === "conversation") data.conversationId = id(101);
+    h.state.handle = (url, init) => init.method === "POST" ? stale7a(mismatch === "missing-question-field" ? { activeQuestionId: null } : {}) : json(data);
+    oldClick(); h.render(); await h.settle(); assert.equal(postMessage(h).apiErrorRecovery.status, "mismatch");
+    assert.ok(nodes(h.renderConversation().rows, "Pressable").every(button => button.props.disabled));
+    oldClick(); confirmApi(h, h.messages().at(-1).id, true); await h.settle(); assert.equal(postedBodies(h).length, 2); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
+
+for (const failure of ["503", "404", "timeout", "storage"]) test(`7-A STALE GET ${failure} 실패: 원인 보존·자동 승인/선택·metadata 삭제 없음`, async () => {
+  const h = harness(); try {
+    const old = await liveConfirmation(h), late = confirmationButtons(h, old.id)[1].props.onPress;
+    h.state.handle = (url, init) => {
+      if (init.method === "POST") { if (failure === "storage") h.state.failRead = true; return stale7a(); }
+      return failure === "timeout" ? deferred().promise : error7a(failure === "404" ? "ASSISTANT_REQUEST_NOT_FOUND" : "ASSISTANT_UNAVAILABLE", failure === "404" ? 404 : 503);
+    };
+    late(); h.render(); await h.settle(); if (failure === "timeout") await h.advance(5000);
+    assert.equal(postMessage(h).apiErrorRecovery.status, "unconfirmed"); assert.ok(confirmationButtons(h, old.id).every(button => button.props.disabled));
+    const count = h.state.calls.length; late(); await h.settle(); assert.equal(h.state.calls.length, count); assert.equal(postedBodies(h).length, 2); assert.equal(h.state.cleanup, 0);
+    assert.ok(postMessage(h).apiErrorRecovery.result.recoveryResult.getResult.error.kind);
+  } finally { h.state.failRead = false; h.close(); }
+});
+
+test("7-A STALE conversation을 확정할 수 없으면 GET 카드만 표시하고 대화 ID를 임의 재사용하지 않음", async () => {
+  const h = harness(); h.state.handle = (url, init) => init.method === "POST" ? stale7a() : json(active7a());
+  try { h.send("첫 독립 요청"); await h.settle(); assert.equal(postMessage(h).apiErrorRecovery.status, "mismatch");
+    assert.ok(nodes(h.renderConversation().rows, "Pressable").every(button => button.props.disabled));
+    h.state.handle = responseWith(results.outcome); h.send("명시적 새 요청"); await h.settle(); assert.equal(Object.hasOwn(postedBodies(h).at(-1), "conversationId"), false);
+  } finally { h.close(); }
+});
+
+test("7-A STALE 복구 중 새 lifecycle 질문 도착: 늦은 GET 적용·이전 승인 부활 없음", async () => {
+  const h = harness(), gate = deferred(); try {
+    const old = await liveConfirmation(h); h.state.handle = (url, init) => init.method === "POST" ? stale7a() : gate.promise;
+    confirmationButtons(h, old.id)[1].props.onPress(); h.render(); await h.settle(); h.edit("최신 초안");
+    const latest = recovered("need_more_info", id(650)); h.publishSnapshot(snapshotOf([latest]));
+    gate.resolve(json(active7a())); await h.settle(); assert.equal(postMessage(h).apiErrorRecovery.status, "context-changed");
+    assert.equal(h.messages().some(message => message.apiExecution?.reference.requestId === id(640)), false);
+    assert.equal(h.find("MessageInput").value, "최신 초안"); assert.equal(postedBodies(h).length, 2);
+  } finally { h.close(); }
+});
+
+test("7-A STALE 복구 중 동일 snapshot 반복은 새 질문으로 취급하지 않고 복구 메시지 중복 없음", async () => {
+  const h = harness(), gate = deferred(); try {
+    const old = await liveConfirmation(h); h.state.handle = (url, init) => init.method === "POST" ? stale7a() : gate.promise;
+    confirmationButtons(h, old.id)[0].props.onPress(); h.render(); await h.settle();
+    h.publishSnapshot(snapshotOf([old.apiExecution])); h.publishSnapshot(snapshotOf([old.apiExecution]));
+    gate.resolve(json(active7a())); await h.settle(); assert.equal(postMessage(h).apiErrorRecovery.status, "restored");
+    h.render(); h.render(); assert.equal(h.messages().filter(message => message.apiExecution?.reference.requestId === id(640)).length, 1);
+    assert.equal(h.state.calls.filter(call => call.url.endsWith(id(640))).length, 1); assert.equal(postedBodies(h).length, 2);
+  } finally { h.close(); }
+});
+
+for (const change of ["server", "mode", "unmount"]) test(`7-A 복구 GET 중 ${change}: 늦은 결과·다른 서버 조회·자동 POST 없음`, async () => {
+  const h = harness(), gate = deferred(); try {
+    const old = await liveConfirmation(h); h.state.handle = (url, init) => init.method === "POST" ? stale7a() : gate.promise;
+    confirmationButtons(h, old.id)[1].props.onPress(); h.render(); await h.settle(); const count = h.state.calls.length;
+    if (change === "server") { h.state.config = h.source("src/services/api/config.ts").parseDevelopmentServerConfig("https://other.example.invalid"); h.publishSnapshot(snapshotOf([], { serverId: "development:https://other.example.invalid" })); }
+    else if (change === "mode") h.switchMode("mock"); else h.close();
+    gate.resolve(json(active7a())); await h.settle(); assert.equal(h.state.calls.length, count); assert.equal(h.state.lateUpdates, 0); assert.equal(h.state.cleanup, 0);
+    if (change !== "unmount") assert.equal(h.messages().some(message => message.apiExecution?.reference.requestId === id(640)), false);
+  } finally { h.close(); }
+});
+
+for (const value of ["accepted", "processing", "completed"]) test(`7-A BUSY 미저장 blocking ID 단발 GET ${value}: 상태 원형·추가 polling/POST 없음`, async () => {
+  const h = harness(); h.state.handle = (url, init) => init.method === "POST" ? error7a("CONVERSATION_BUSY", 409, { blockingRequestId: id(640) })
+    : json(value === "completed" ? active7a("uncertain") : status(id(640), value));
+  try { h.send("새 요청"); await h.settle(); assert.equal(postMessage(h).apiErrorRecovery.status, "observed");
+    const target = h.messages().find(message => message.apiExecution?.reference.requestId === id(640)).apiExecution;
+    assert.equal(target.kind, value === "completed" ? "completed" : "observed"); assert.equal(target.response.data.status, value);
+    if (value === "completed") assert.equal(target.response.data.result.kind, "uncertain"); else assert.equal(Object.hasOwn(target.response.data, "result"), false);
+    const count = h.state.calls.length; await h.advance(4000); assert.equal(h.state.calls.length, count); assert.equal(postedBodies(h).length, 1);
+    assert.equal(await h.storage.read(recoveryRef(id(640))), null); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
+
+test("7-A BUSY GET 실패는 작업 실패 확정이 아니며 새 POST·질문 자동 실행 없음", async () => {
+  const h = harness(); h.state.handle = (url, init) => init.method === "POST" ? error7a("CONVERSATION_BUSY", 409, { blockingRequestId: id(640) }) : error7a("DATABASE_UNAVAILABLE", 503);
+  try { h.send("입력"); await h.settle(); assert.equal(postMessage(h).apiErrorRecovery.status, "unconfirmed");
+    assert.equal(h.messages().at(-1).apiExecution.kind, "needs-attention");
+    assert.equal(h.renderConversation().components.some(item => item.name === "AssistantMessage" && item.props.apiResult?.kind === "failure"), false);
+    assert.equal(postedBodies(h).length, 1); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
+
+test("7-A 기존 polling 조회 잠금과 BUSY 복구 경합: 추가 GET·새 polling·기존 작업 취소 없음", async () => {
+  const h = harness(), gate = deferred(); let external = false;
+  try {
+    h.state.handle = (url, init) => init.method === "POST" ? external ? error7a("CONVERSATION_BUSY", 409, { blockingRequestId: id(640) }) : json(status(JSON.parse(init.body).requestId), 202) : gate.promise;
+    const running = h.delegate.startRequest({ requestId: id(640), input: { type: "text", text: "기존 작업" } }, { expectedServerId: serverId });
+    await h.settle(); external = true; h.send("경합 요청"); await h.settle(); assert.equal(postMessage(h).apiErrorRecovery.status, "busy");
+    assert.equal(h.state.calls.filter(call => call.init.method === "GET").length, 1);
+    gate.resolve(json(done(id(640)))); await h.settle(); assert.equal((await running.completion).kind, "completed");
+    assert.equal(postedBodies(h).length, 2); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
+
+test("7-A 만료 conversation의 과거·새 GET 질문을 모두 재사용하지 않고 명시적 새 입력만 허용", async () => {
+  const h = harness(); h.state.handle = responseWith(results.need_more_info);
+  try { h.send("회의 등록"); await h.settle(); const old = h.messages().at(-1); h.state.handle = () => error7a("CONVERSATION_EXPIRED", 409);
+    h.send("오후 3시"); await h.settle(); h.publishSnapshot(snapshotOf([old.apiExecution, recovered("need_more_info", id(650))]));
+    h.state.handle = responseWith(results.outcome); h.send("명시적 새 일정 조회"); await h.settle();
+    assert.equal(postedBodies(h).length, 3); assert.equal(Object.hasOwn(postedBodies(h).at(-1), "conversationId"), false);
+    assert.equal(Object.hasOwn(postedBodies(h).at(-1).input, "questionId"), false); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
+
+test("7-A GET 410 상세 만료와 POST 409 재접수 금지 안내 구분·metadata 정리 없음", async () => {
+  const h = harness(); try {
+    await h.storage.saveBeforePost(recoveryRef(id(640)), h.wall); const before = [...h.data.values()].join("");
+    h.state.handle = () => error7a("REQUEST_EXPIRED", 410); const result = await h.delegate.queryRequestOnce(recoveryRef(id(640))).completion;
+    h.publishSnapshot(snapshotOf([result])); assert.ok(h.messages()[0].text.includes("상세 보관 기간")); assert.ok(h.messages()[0].text.includes("이전 성공·실패는 알 수 없어요"));
+    assert.ok(!h.messages()[0].text.includes("다시 접수할 수 없어요")); assert.equal([...h.data.values()].join(""), before);
+    h.state.handle = () => error7a("REQUEST_EXPIRED", 409); h.send("새 입력"); await h.settle(); assert.ok(postMessage(h).text.includes("다시 접수할 수 없어요"));
+    assert.equal(h.state.cleanup, 0); assert.equal(postedBodies(h).length, 1);
+  } finally { h.close(); }
+});
+
+test("7-A 120초 자동 조회 종료는 결과 확인 필요 상태·metadata 보존·추가 POST 없음", async () => {
+  const h = harness(); h.state.handle = (url, init) => init.method === "POST" ? json(status(JSON.parse(init.body).requestId), 202) : json(status(url.split("/").pop(), "processing"));
+  try { h.send("요청"); await h.settle(); await h.advance(120000); const message = h.messages().at(-1);
+    assert.equal(message.apiExecution.reason, "deadline"); assert.ok(message.text.includes("자동 확인 시간이 끝났어요"));
+    assert.ok(await h.storage.read(recoveryRef(postedBodies(h)[0].requestId))); assert.equal(h.state.cleanup, 0); assert.equal(postedBodies(h).length, 1);
+  } finally { h.close(); }
+});
+
+test("7-A 활성 질문 ID가 일치해도 같은 질문의 이전 만료 시각을 GET으로 연장하지 않음", async () => {
+  const h = harness(); try {
+    const old = await liveConfirmation(h);
+    const expired = recovered("confirmation", id(640)); expired.response.data.result = { ...active7a().result, expiresAt: "1970-01-01T00:00:00Z" };
+    h.publishSnapshot(snapshotOf([expired])); h.state.handle = (url, init) => init.method === "POST" ? stale7a() : json(active7a());
+    confirmationButtons(h, old.id)[1].props.onPress(); h.render(); await h.settle();
+    assert.equal(postMessage(h).apiErrorRecovery.status, "mismatch"); assert.ok(nodes(h.renderConversation().rows, "Pressable").every(button => button.props.disabled));
+    assert.equal(postedBodies(h).length, 2); assert.equal(h.state.cleanup, 0);
   } finally { h.close(); }
 });
