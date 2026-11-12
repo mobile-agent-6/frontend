@@ -1,5 +1,6 @@
 /* global __dirname: readonly */
 const assert = require("node:assert/strict");
+const { Buffer } = require("node:buffer");
 const fs = require("node:fs");
 const path = require("node:path");
 const { test } = require("node:test");
