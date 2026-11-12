@@ -26,6 +26,7 @@ import { useScheduleStore } from "@/stores/scheduleStore";
 import { isMockScheduleMode, scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
 import { parseAssistantRequestCreate, validateAssistantJsonBodySize, validateAssistantText } from "@/utils/assistant-validation";
 import { upsertAssistantExecutionMessage } from "@/utils/assistant-recovery-messages";
+import { createAssistantTextQuestionContext } from "@/utils/assistant-text-question";
 
 // processing UI를 보여주기 위한 Mock 지연이며, 실제 API timeout이 아니다.
 const MOCK_PROCESSING_DELAY_MS = 700;
@@ -48,6 +49,7 @@ export default function AssistantScreen() {
   const inputTextRef = useRef("");
   const inputRevisionRef = useRef(0);
   const serverTaskRef = useRef<AssistantRequestTask | null>(null);
+  const textQuestionRef = useRef<ReturnType<typeof createAssistantTextQuestionContext> | null>(null);
   const operationVersionRef = useRef(0);
   const mountedRef = useRef(true);
   const errorIdRef = useRef(0);
@@ -57,6 +59,14 @@ export default function AssistantScreen() {
   const resolvedInteractionIdsRef = useRef(new Set<string>());
   const conversationListRef = useRef<ConversationListHandle>(null);
   const processingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const getTextQuestionContext = useCallback((serverId: string) => {
+    const generation = scheduleDataModeStore.getState().generation;
+    if (textQuestionRef.current?.serverId !== serverId || textQuestionRef.current.generation !== generation) {
+      textQuestionRef.current = createAssistantTextQuestionContext(serverId, generation);
+    }
+    return textQuestionRef.current;
+  }, []);
 
   const invalidateActiveInteraction = useCallback(() => {
     const id = activeInteractionIdRef.current;
@@ -124,6 +134,7 @@ export default function AssistantScreen() {
     operationVersionRef.current += 1;
     serverTaskRef.current?.cancel();
     serverTaskRef.current = null;
+    textQuestionRef.current = null;
     if (processingTimerRef.current !== null) clearTimeout(processingTimerRef.current);
     processingTimerRef.current = null;
     pendingMockRef.current = null;
@@ -162,6 +173,18 @@ export default function AssistantScreen() {
         if (snapshot.serverId !== null) reportRecoveryIssue({ ...snapshot, issue: "server-mismatch" }, serverId);
         return;
       }
+      if (serverId) {
+        const context = getTextQuestionContext(serverId);
+        for (const entry of snapshot.results) {
+          if (entry.reference.serverId !== serverId) continue;
+          if (entry.latestResult && entry.latestResult.reference.requestId.toLowerCase() === entry.reference.requestId.toLowerCase()) {
+            context.observeExecution(entry.latestResult, "recovery");
+          } else if (!entry.latestResult && entry.phase === "status" && entry.lastResponse &&
+            entry.lastResponse.data.requestId.toLowerCase() === entry.reference.requestId.toLowerCase()) {
+            context.observeResponse(entry.lastResponse.data, "recovery");
+          }
+        }
+      }
       setMessages(current => {
         let next = snapshot.initialCheck === "checked" && !snapshot.issue && !snapshot.initialization
           ? current.filter(message => message.role !== "assistant" || !message.recoveryIssue || message.serverId !== serverId) : current;
@@ -191,7 +214,7 @@ export default function AssistantScreen() {
     const unsubscribe = assistantLifecycle.subscribe(consume);
     consume();
     return () => { subscribed = false; unsubscribe(); };
-  }, [reportRecoveryIssue]);
+  }, [getTextQuestionContext, reportRecoveryIssue]);
 
   useEffect(() => {
     if (status !== "processing" || serverTaskRef.current !== null || !isMockScheduleMode()) return;
@@ -266,24 +289,41 @@ export default function AssistantScreen() {
       };
       if (!canStart()) return;
       const requestId = Crypto.randomUUID();
-      const body = parseAssistantRequestCreate({ requestId, input: { type: "text", text } });
+      const context = getTextQuestionContext(serverId);
+      const question = context.getQuestion();
+      if (typeof question === "string") {
+        reportError(question === "unsupported" ? "현재 질문은 후보 선택 또는 확인이 필요해요."
+          : "현재 질문을 확인하지 못했어요. 원래 요청의 결과 확인이 필요해요.");
+        return;
+      }
+      const body = parseAssistantRequestCreate({ requestId,
+        ...(question ? { conversationId: question.conversationId } : {}),
+        input: { type: "text", text, ...(question ? { questionId: question.questionId } : {}) } });
       if (!body || !validateAssistantJsonBodySize(JSON.stringify(body)).ok) {
         reportError("메시지 형식이나 크기를 확인해 주세요.");
         return;
       }
       if (!isCurrent() || assistantHttpClient.getServerId() !== serverId) return;
       if (!canStart()) return;
+      // 본문을 만든 사이 질문이 바뀌었으면 오래된 ID로 보내지 않고 입력을 남긴다.
+      if (JSON.stringify(question) !== JSON.stringify(context.getQuestion())) return;
       pendingInputRef.current = text;
       setMessages((current) => [...current, { id: requestId, role: "user", text, serverId }]);
       inputTextRef.current = "";
       setInputText("");
       setStatus("processing");
+      context.beginRequest(requestId, question);
       // 저장 장벽·GET-first·polling·재전송은 기존 orchestration에만 맡긴다.
-      const task = assistantOrchestrator.startRequest(body, { expectedServerId: serverId });
+      const task = assistantOrchestrator.startRequest(body, { expectedServerId: serverId, onUpdate: event => {
+        if (!isCurrent() || assistantHttpClient.getServerId() !== serverId || event.reference.serverId !== serverId ||
+          event.reference.requestId.toLowerCase() !== requestId.toLowerCase()) return;
+        if (event.phase === "status") context.observeResponse(event.response.data, "request", question);
+      } });
       if (!isCurrent()) { task.cancel(); return; }
       serverTaskRef.current = task;
       const execution = await task.completion;
       if (!isCurrent() || assistantHttpClient.getServerId() !== serverId) return;
+      context.observeExecution(execution, "request", question);
       if (execution.kind === "completed") {
         completed = true;
         // 원본 처리 결과를 메시지에 보존하고 상세 표시는 ConversationList에 맡긴다.

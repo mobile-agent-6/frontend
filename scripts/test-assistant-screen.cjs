@@ -602,3 +602,226 @@ test("uncertain 복구 수신은 위험 인지가 아니며 새 text에도 ackno
     assert.equal(h.messages().at(-1).apiExecution.recoveryResult.postResult.error.problem.code, "UNRESOLVED_UNCERTAIN"); assert.equal(h.find("MessageInput").value, "새 독립 작업"); assert.equal(h.state.cleanup, 0);
   } finally { h.close(); }
 });
+
+// 정보 보충 후속 text도 실제 화면·저장 장벽·HTTP·polling 경계를 통과시킨다.
+const postedBodies = h => h.state.calls.filter(call => call.init.method === "POST").map(call => JSON.parse(call.init.body));
+const problemResponse = (code, statusCode = 409, activeQuestion = true) => ({ status: statusCode,
+  headers: new Headers({ "Content-Type": "application/problem+json", "X-Request-ID": id(900) }),
+  text: async () => JSON.stringify({ type: "https://example.invalid/problem", title: "접수 거절", status: statusCode,
+    detail: "질문이나 작업은 문구에서 추측하지 않음", instance: "/api/v1/assistant/requests", requestId: id(900), code,
+    ...(code === "STALE_QUESTION" && activeQuestion ? { activeQuestionId: id(305), activeQuestionRequestId: id(605) } : {}) }) });
+
+test("정보 보충: 최초 ID 생략·후속마다 새 UUID·원래 conversation/question 및 원문 보존", async () => {
+  const h = harness(); h.state.handle = responseWith(results.need_more_info);
+  try {
+    h.send("내일 회의 등록해 줘"); await h.settle(); const questionMessage = h.messages().at(-1);
+    h.state.handle = responseWith(results.outcome); h.send("  오후 3시  "); await h.settle();
+    const [first, follow] = postedBodies(h);
+    assert.equal(Object.hasOwn(first, "conversationId"), false); assert.equal(Object.hasOwn(first.input, "questionId"), false);
+    assert.notEqual(first.requestId, follow.requestId); assert.match(follow.requestId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    assert.deepEqual(follow, { requestId: follow.requestId, conversationId: id(100), input: { type: "text", text: "  오후 3시  ", questionId: id(300) } });
+    assert.equal(questionMessage.text, results.need_more_info.text); assert.equal(h.messages().at(-1).text, results.outcome.text);
+    assert.deepEqual(h.messages().map(message => message.role), ["user", "assistant", "user", "assistant"]);
+    assert.equal(h.state.uuidCalls, 2); assert.equal(h.state.starts.length, 2); assert.equal(h.state.cleanup, 0);
+    assert.equal(h.state.mockRuns, 0); assert.ok(h.state.calls.every(call => call.url.includes("/assistant/requests")));
+    const saved = [...h.data.values()].join(""); assert.equal(saved.includes("오후 3시"), false); assert.equal(saved.includes('"input"'), false);
+  } finally { h.close(); }
+});
+
+test("연속 정보 보충은 최신 questionId·서버 conversationId만 사용하고 자연어로 새 작업을 판별하지 않음", async () => {
+  const h = harness(); let question = 300;
+  h.state.handle = (url, init) => init.method === "POST" ? json(status(JSON.parse(init.body).requestId), 202)
+    : json({ ...done(url.split("/").pop()), result: { ...results.need_more_info, text: "등록을 완료했어요.", questionId: id(question++) } });
+  try {
+    for (const text of ["회의 등록", "오후 3시", "다른 일정을 새로 등록해 줘"]) { h.send(text); await h.settle(); }
+    const bodies = postedBodies(h); assert.equal(new Set(bodies.map(body => body.requestId)).size, 3);
+    assert.deepEqual(bodies.slice(1).map(body => body.input.questionId), [id(300), id(301)]);
+    assert.ok(bodies.slice(1).every(body => body.conversationId === id(100))); assert.equal(h.messages().at(-1).apiExecution.response.data.result.questionId, id(302));
+  } finally { h.close(); }
+});
+
+for (const kind of ["candidate_selection", "confirmation"]) test(`후속 응답 ${kind}: 상세 표시·식별값 보존·버튼 비활성·추가 write 없음`, async () => {
+  const h = harness(); h.state.handle = responseWith(results.need_more_info);
+  try {
+    h.send("회의 수정"); await h.settle(); h.state.handle = responseWith(results[kind]); h.send("오후 3시"); await h.settle();
+    const message = h.messages().at(-1); assert.deepEqual(message.apiExecution.response.data.result, results[kind]);
+    const view = h.renderConversation(); assert.ok(cards(view).length > 0);
+    assert.ok(nodes(view.rows, "Pressable").every(button => button.props.disabled === true));
+    const count = h.state.calls.length; h.find("ConversationList").onCandidateSelection(message.id, "opaque/1");
+    h.find("ConversationList").onDeleteConfirmation(message.id, true); await h.settle();
+    assert.equal(h.state.calls.length, count); assert.equal(postedBodies(h).length, 2); assert.equal(h.state.mockRuns, 0); assert.equal(h.state.cleanup, 0);
+    h.send("네, 다른 일정 등록해 줘"); await h.settle(); assert.equal(h.state.calls.length, count);
+    assert.equal(h.find("MessageInput").value, "네, 다른 일정 등록해 줘");
+  } finally { h.close(); }
+});
+
+for (const kind of ["outcome", "failure", "uncertain"]) test(`후속 완료 ${kind}를 질문으로 오인하지 않고 이전 ID를 재사용하지 않음`, async () => {
+  const h = harness(); h.state.handle = responseWith(results.need_more_info);
+  try {
+    h.send("회의 등록"); await h.settle(); h.state.handle = responseWith({ ...results[kind], text: "몇 시로 등록할까요?" });
+    h.send("오후 3시"); await h.settle(); h.send("다음 작업"); await h.settle();
+    const body = postedBodies(h).at(-1); assert.equal(Object.hasOwn(body, "conversationId"), false); assert.equal(Object.hasOwn(body.input, "questionId"), false);
+    assert.equal(Object.hasOwn(body, "acknowledgedUncertainRequestId"), false); assert.equal(h.messages().at(-1).apiExecution.response.data.result.kind, kind);
+  } finally { h.close(); }
+});
+
+test("후속 accepted/processing 동안 ref 잠금으로 text 및 interaction 중복 실행 차단", async () => {
+  const h = harness(); h.state.handle = responseWith(results.need_more_info); let gets = 0;
+  try {
+    h.send("회의 등록"); await h.settle();
+    h.state.handle = (url, init) => init.method === "POST" ? json(status(JSON.parse(init.body).requestId), 202)
+      : json(++gets === 1 ? status(url.split("/").pop()) : gets === 2 ? status(url.split("/").pop(), "processing") : done(url.split("/").pop()));
+    h.edit("오후 3시"); const send = h.find("MessageInput").onSend; send(); send(); h.render(); await h.settle();
+    assert.equal(postedBodies(h).length, 2); assert.equal(h.messages().filter(message => message.role === "assistant").length, 1);
+    assert.equal(h.find("MessageInput").disabled, true); assert.equal(h.find("ConversationList").isProcessing, true);
+    h.find("ConversationList").onDeleteConfirmation(h.messages()[1].id, true); h.find("MessageInput").onSend();
+    await h.advance(1999); assert.equal(gets, 1); await h.advance(1); assert.equal(gets, 2); assert.equal(postedBodies(h).length, 2);
+    await h.advance(2000); assert.equal(gets, 3); assert.equal(h.find("MessageInput").disabled, false); assert.equal(h.messages().length, 4);
+  } finally { h.close(); }
+});
+
+for (const [name, text] of [["공백", " \t\u3000"], ["길이 초과", "가".repeat(501)], ["제어문자", "답\u0001"], ["surrogate", "\ud800"]]) test(`후속 ${name}: POST·UUID 0회, 원래 질문 유지`, async () => {
+  const h = harness(); h.state.handle = responseWith(results.need_more_info);
+  try {
+    h.send("회의 등록"); await h.settle(); h.send(text); await h.settle(); assert.equal(postedBodies(h).length, 1); assert.equal(h.state.uuidCalls, 1);
+    assert.equal(h.find("MessageInput").value, text); assert.equal(h.find("MessageInput").disabled, false);
+    h.state.handle = responseWith(results.outcome); h.send("오후 3시"); await h.settle(); assert.equal(postedBodies(h).at(-1).input.questionId, id(300));
+  } finally { h.close(); }
+});
+
+for (const reason of ["storage", "503"]) test(`후속 접수 전 ${reason} 실패: 입력·질문·구조화 오류 보존, 자동 재전송 없음`, async () => {
+  const h = harness(); h.state.handle = responseWith(results.need_more_info);
+  try {
+    h.send("회의 등록"); await h.settle(); const initialCalls = h.state.calls.length;
+    if (reason === "storage") h.state.failStorage = true;
+    else h.state.handle = () => problemResponse(reason === "503" ? "ASSISTANT_UNAVAILABLE" : reason, reason === "503" ? 503 : 409);
+    h.send("오후 3시"); await h.settle();
+    assert.equal(h.state.calls.length - initialCalls, reason === "storage" ? 0 : 1); assert.equal(h.find("MessageInput").value, "오후 3시");
+    assert.equal(h.find("MessageInput").disabled, false); assert.equal(h.state.starts.length, 2); assert.equal(h.state.cleanup, 0);
+    const execution = h.messages().at(-1).apiExecution; assert.equal(execution.kind, "needs-attention");
+    h.state.failStorage = false; h.state.handle = responseWith(results.outcome); h.find("MessageInput").onSend(); await h.settle();
+    assert.equal(postedBodies(h).at(-1).input.questionId, id(300)); assert.equal(postedBodies(h).at(-1).conversationId, id(100));
+  } finally { h.close(); }
+});
+
+for (const code of ["STALE_QUESTION", "QUESTION_EXPIRED", "CONVERSATION_EXPIRED"]) test(`후속 ${code}: 오류 보존·과거 질문 재전송 없음·계약상 새 입력 경계`, async () => {
+  const h = harness(); h.state.handle = responseWith(results.need_more_info);
+  try {
+    h.send("회의 등록"); await h.settle(); const firstId = postedBodies(h)[0].requestId;
+    h.state.handle = () => problemResponse(code); h.send("오후 3시"); await h.settle();
+    const problem = h.messages().at(-1).apiExecution.recoveryResult.postResult.error.problem; assert.equal(problem.code, code);
+    if (code === "STALE_QUESTION") { assert.equal(problem.activeQuestionId, id(305)); assert.equal(problem.activeQuestionRequestId, id(605)); }
+    h.publishSnapshot(snapshotOf([recovered("need_more_info", firstId)]));
+    assert.equal(postedBodies(h).length, 2); assert.equal(h.find("MessageInput").value, "오후 3시");
+    h.state.handle = responseWith(results.outcome); h.find("MessageInput").onSend(); await h.settle();
+    if (code === "STALE_QUESTION") { assert.equal(postedBodies(h).length, 2); assert.equal(h.find("MessageInput").value, "오후 3시"); }
+    else { assert.equal(postedBodies(h).length, 3); assert.equal(Object.hasOwn(postedBodies(h).at(-1), "conversationId"), false);
+      assert.equal(Object.hasOwn(postedBodies(h).at(-1).input, "questionId"), false); }
+    assert.equal(h.find("MessageInput").disabled, false); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
+
+test("STALE_QUESTION에 활성 질문이 없으면 자동 POST 없이 지난 질문을 닫고 명시적 새 입력 허용", async () => {
+  const h = harness(); h.state.handle = responseWith(results.need_more_info);
+  try {
+    h.send("회의 등록"); await h.settle(); h.state.handle = () => problemResponse("STALE_QUESTION", 409, false);
+    h.send("오후 3시"); await h.settle(); assert.equal(postedBodies(h).length, 2);
+    h.state.handle = responseWith(results.outcome); h.send("새 일정 조회"); await h.settle();
+    assert.equal(Object.hasOwn(postedBodies(h).at(-1), "conversationId"), false); assert.equal(Object.hasOwn(postedBodies(h).at(-1).input, "questionId"), false);
+  } finally { h.close(); }
+});
+
+test("STALE_QUESTION 뒤 실제 새 질문 결과를 확인하면 그 questionId로만 명시적 후속 입력 가능", async () => {
+  const h = harness(); h.state.handle = responseWith(results.need_more_info);
+  try {
+    h.send("회의 등록"); await h.settle(); h.state.handle = () => problemResponse("STALE_QUESTION"); h.send("오후 3시"); await h.settle();
+    const latest = recovered("need_more_info", id(605)); latest.response.data.result = { ...results.need_more_info, questionId: id(305) };
+    h.publishSnapshot(snapshotOf([latest])); assert.equal(postedBodies(h).length, 2);
+    h.state.handle = responseWith(results.outcome); h.find("MessageInput").onSend(); await h.settle();
+    assert.equal(postedBodies(h).at(-1).input.questionId, id(305)); assert.equal(postedBodies(h).at(-1).conversationId, id(100));
+  } finally { h.close(); }
+});
+
+test("후속 접수 거절의 늦은 실패가 이후 작성·삭제한 새 초안을 덮어쓰지 않음", async () => {
+  const h = harness(), gate = deferred(); h.state.handle = responseWith(results.need_more_info);
+  try {
+    h.send("회의 등록"); await h.settle(); h.state.handle = () => gate.promise; h.send("오후 3시"); await h.settle();
+    h.edit("새 초안"); h.edit(""); gate.resolve(problemResponse("ASSISTANT_UNAVAILABLE", 503)); await h.settle();
+    assert.equal(h.find("MessageInput").value, ""); assert.equal(h.find("MessageInput").disabled, false);
+    h.state.handle = responseWith(results.outcome); h.send("오후 4시"); await h.settle(); assert.equal(postedBodies(h).at(-1).input.questionId, id(300));
+  } finally { h.close(); }
+});
+
+for (const failMetadata of [false, true]) test(`후속 접수 확인 후 GET 실패${failMetadata ? "·metadata 갱신 실패" : ""}: 이전 질문 재활성화·자동 POST 없음`, async () => {
+  const h = harness(); h.state.handle = responseWith(results.need_more_info);
+  try {
+    h.send("회의 등록"); await h.settle(); const first = postedBodies(h)[0].requestId;
+    h.state.handle = (url, init) => { if (init.method !== "POST") return problemResponse("ASSISTANT_UNAVAILABLE", 503);
+      if (failMetadata) h.state.failStorage = true; return json(status(JSON.parse(init.body).requestId), 202); };
+    h.send("오후 3시"); await h.settle(); assert.equal(postedBodies(h).length, 2); assert.equal(h.messages().at(-1).apiExecution.lastResponse.data.status, "accepted");
+    h.publishSnapshot(snapshotOf([recovered("need_more_info", first)])); h.state.failStorage = false;
+    h.state.handle = responseWith(results.outcome); h.send("명시적 새 작업"); await h.settle();
+    assert.equal(Object.hasOwn(postedBodies(h).at(-1).input, "questionId"), false); assert.equal(Object.hasOwn(postedBodies(h).at(-1), "conversationId"), false);
+    assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
+
+test("복구 질문 답변은 원래 서버 conversation/question 사용·반복 snapshot 후에도 중복 표시 없음", async () => {
+  const execution = recovered("need_more_info"), h = harness({ initialSnapshot: snapshotOf([execution]) });
+  try {
+    h.publishSnapshot(snapshotOf([execution])); h.publishSnapshot(snapshotOf([execution])); assert.equal(h.messages().length, 1);
+    h.send("오후 3시"); await h.settle(); const body = postedBodies(h)[0];
+    assert.equal(body.conversationId, execution.response.data.conversationId); assert.equal(body.input.questionId, execution.response.data.result.questionId);
+    assert.equal(h.messages().filter(message => message.role === "user").length, 1); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
+
+test("여러 과거 복구 질문의 활성 순서를 추측하지 않고 POST 없이 입력 보존", async () => {
+  const h = harness({ initialSnapshot: snapshotOf([recovered("need_more_info", id(600)), recovered("need_more_info", id(601))]) });
+  try { h.send("오후 3시"); await h.settle(); assert.equal(h.state.starts.length, 0); assert.equal(h.state.calls.length, 0);
+    assert.equal(h.find("MessageInput").value, "오후 3시"); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
+
+test("후속 최신 복구 질문이 늦은 정상 완료 callback보다 우선·교체된 과거 질문 부활 없음", async () => {
+  const h = harness(), gate = deferred(); h.state.handle = responseWith(results.need_more_info);
+  try {
+    h.send("회의 등록"); await h.settle(); const old = postedBodies(h)[0].requestId;
+    h.delegate.startRequest = (body, options) => { h.state.starts.push([body, options]); return { initial: gate.promise, completion: gate.promise, cancel() {} }; };
+    h.send("오후 3시"); const requestId = h.state.starts.at(-1)[0].requestId;
+    const latest = recovered("need_more_info", requestId); latest.response.data.result = { ...results.need_more_info, questionId: id(301) };
+    h.publishSnapshot(snapshotOf([recovered("need_more_info", old), latest]));
+    gate.resolve(recovered("outcome", requestId)); await h.settle(); h.publishSnapshot(snapshotOf([recovered("need_more_info", old), latest]));
+    h.send("회의실 A"); const body = h.state.starts.at(-1)[0]; assert.equal(body.input.questionId, id(301)); assert.equal(body.conversationId, id(100));
+    assert.equal(h.messages().filter(message => message.apiExecution?.reference.requestId === requestId).length, 1);
+  } finally { h.close(); }
+});
+
+test("UUID 생성 중 최신 질문 수신: 생성 직후 최신 구조화 ID로 본문 구성", async () => {
+  const h = harness({ initialSnapshot: snapshotOf([recovered("need_more_info")]) });
+  try {
+    h.state.beforeUuid = () => { const latest = recovered("need_more_info"); latest.response.data.result = { ...results.need_more_info, questionId: id(301) }; h.publishSnapshot(snapshotOf([latest])); };
+    h.send("오후 3시"); await h.settle(); assert.equal(postedBodies(h)[0].input.questionId, id(301));
+  } finally { h.close(); }
+});
+
+for (const change of ["server", "mode"]) test(`${change} 전환 뒤 과거 정보 보충 질문을 새 요청에 혼합하지 않음`, async () => {
+  const h = harness(); h.state.handle = responseWith(results.need_more_info);
+  try {
+    h.send("회의 등록"); await h.settle();
+    if (change === "mode") { h.switchMode("mock"); h.switchMode("server"); }
+    else { h.state.config = h.source("src/services/api/config.ts").parseDevelopmentServerConfig("https://other.example.invalid");
+      h.publishSnapshot(snapshotOf([], { serverId: "development:https://other.example.invalid" })); }
+    h.state.handle = responseWith(results.outcome); h.send("새 일정 조회"); await h.settle();
+    const body = postedBodies(h).at(-1); assert.equal(Object.hasOwn(body, "conversationId"), false); assert.equal(Object.hasOwn(body.input, "questionId"), false); assert.equal(h.state.mockRuns, 0);
+  } finally { h.close(); }
+});
+
+test("정보 보충 전송 중 서버 변경·해제 뒤 늦은 응답은 질문 상태나 UI를 갱신하지 않음", async () => {
+  const h = harness(), gate = deferred(); h.state.handle = responseWith(results.need_more_info);
+  try {
+    h.send("회의 등록"); await h.settle(); h.state.handle = () => gate.promise; h.send("오후 3시"); await h.settle();
+    h.close(); const count = h.state.calls.length; gate.resolve(json(status(postedBodies(h).at(-1).requestId), 202)); await h.settle();
+    assert.equal(h.state.lateUpdates, 0); assert.equal(h.state.calls.length, count); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
