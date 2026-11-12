@@ -1,5 +1,6 @@
 import { Pressable, StyleSheet, Text, View } from "react-native";
-import type { ComponentRef, Ref } from "react";
+import { useState, type ComponentRef, type Ref } from "react";
+import { SymbolView } from "expo-symbols";
 
 import { AssistantScheduleCard, formatAssistantCardDateTime } from "@/components/assistant/assistant-schedule-card";
 import { ThemedText } from "@/components/ui/themed-text";
@@ -78,8 +79,9 @@ export function AssistantMessage({
 }: AssistantMessageProps) {
   const theme = useTheme();
   const confirmationDisabled = interactionsDisabled || interaction?.resolved || !onDeleteConfirmation;
+  const hasConfirmation = apiResult?.kind === "confirmation" || interaction?.type === "delete-confirmation";
   return (
-    <ThemedView type="primary" style={styles.bubble}>
+    <ThemedView type="primary" style={[styles.bubble, hasConfirmation && styles.confirmationBubble]}>
       <Text
         key={resultTextKey}
         ref={resultTextRef}
@@ -122,6 +124,7 @@ function ScheduleSyncStatus({ entry, retrying, onRetry, showCompleted }: {
 }) {
   const theme = useTheme();
   const canRetry = entry.phase === "refresh-error" || entry.phase === "interrupted";
+  if (!canRetry && !retrying && entry.detail?.phase !== "ready" && entry.detail?.phase !== "error") return null;
   return <View testID="assistant-schedule-sync-status" style={styles.candidates} accessibilityLiveRegion="polite">
     {entry.detail?.phase === "ready" && entry.detail.schedule && <AssistantScheduleCard schedule={entry.detail.schedule} showCompleted={showCompleted} />}
     {entry.detail?.phase === "error" && <>
@@ -235,9 +238,9 @@ function ApiResultDetails({ result, onCandidateSelection, selectedCandidateId, o
           <Pressable key={candidate.candidateId} accessibilityRole="button"
             accessibilityState={{ disabled, selected: candidate.candidateId === selectedCandidateId }} disabled={disabled}
             onPress={disabled ? undefined : () => onCandidateSelection?.(candidate.candidateId)}
-            style={[styles.buttonBase, styles.candidate, { backgroundColor: theme.primaryForeground }, disabled && styles.disabled]}>
-            <AssistantScheduleCard schedule={candidate} />
-            {candidate.candidateId === selectedCandidateId && <ThemedText type="small" themeColor="primary">선택됨</ThemedText>}
+            style={[styles.buttonBase, styles.candidate, styles.apiCandidate, { backgroundColor: theme.primaryForeground }, disabled && styles.disabled]}>
+            <AssistantScheduleCard schedule={candidate} compact />
+            {candidate.candidateId === selectedCandidateId && <CandidateCheck />}
           </Pressable>
         ))}
       </View>
@@ -250,7 +253,7 @@ function ApiResultDetails({ result, onCandidateSelection, selectedCandidateId, o
         </ThemedText>
         <AssistantScheduleCard schedule={result.target} showCompleted />
         {result.operation === "update" && (
-          <View style={styles.candidates}>
+          <View style={styles.confirmationChanges}>
             {result.changes.title !== undefined && (
               <ThemedText themeColor="primaryForeground">{`제목: ${result.target.title} → ${result.changes.title}`}</ThemedText>
             )}
@@ -302,12 +305,12 @@ function ConfirmationActions({ disabled, onConfirm, selectedApproved }: {
 }) {
   const theme = useTheme();
   return (
-    <View style={styles.actions}>
+    <View style={styles.confirmationActions}>
       {([false, true] as const).map(confirmed => (
         <Pressable key={String(confirmed)} accessibilityRole="button"
           accessibilityState={{ disabled, ...(selectedApproved !== undefined ? { selected: selectedApproved === confirmed } : {}) }} disabled={disabled}
           onPress={disabled ? undefined : () => onConfirm?.(confirmed)}
-          style={[styles.buttonBase, styles.action, { backgroundColor: confirmed ? theme.primaryForeground : "#FC8957" }, disabled && styles.disabled]}>
+          style={[styles.buttonBase, styles.action, styles.confirmationButton, { backgroundColor: confirmed ? theme.primaryForeground : "#FC8957" }, disabled && styles.disabled]}>
           <ThemedText themeColor={confirmed ? "primary" : "primaryForeground"}>{confirmed ? "예" : "아니요"}</ThemedText>
         </Pressable>
       ))}
@@ -325,6 +328,7 @@ function CandidateSelectionInteraction({
   processing: boolean;
 }) {
   const theme = useTheme();
+  const [selectedScheduleId, setSelectedScheduleId] = useState<string | null>(null);
   const disabled = processing || interaction.resolved || !onSelect;
   return (
     <View style={styles.candidates}>
@@ -332,12 +336,13 @@ function CandidateSelectionInteraction({
         <Pressable
           key={candidate.scheduleId}
           accessibilityRole="button"
-          accessibilityState={{ disabled }}
+          accessibilityState={{ disabled, selected: candidate.scheduleId === selectedScheduleId }}
           disabled={disabled}
-          onPress={() => onSelect?.(candidate.scheduleId)}
+          onPress={() => { setSelectedScheduleId(candidate.scheduleId); onSelect?.(candidate.scheduleId); }}
           style={[
             styles.buttonBase,
             styles.candidate,
+            styles.mockCandidate,
             { backgroundColor: theme.primaryForeground },
             disabled && styles.disabled,
           ]}
@@ -345,10 +350,20 @@ function CandidateSelectionInteraction({
           <ThemedText themeColor="primary">
             {candidate.label}
           </ThemedText>
+          {candidate.scheduleId === selectedScheduleId && <CandidateCheck />}
         </Pressable>
       ))}
     </View>
   );
+}
+
+function CandidateCheck() {
+  const theme = useTheme();
+  return <View testID="assistant-candidate-check" pointerEvents="none" accessible={false}
+    accessibilityElementsHidden importantForAccessibility="no-hide-descendants" style={styles.candidateCheck}>
+    <SymbolView name={{ ios: "checkmark", android: "check" }} size={20} tintColor={theme.primary}
+      fallback={<Text style={{ color: theme.primary }}>✓</Text>} />
+  </View>;
 }
 
 const styles = StyleSheet.create({
@@ -359,6 +374,8 @@ const styles = StyleSheet.create({
     padding: 0,
     borderWidth: 0,
     backgroundColor: "transparent",
+    includeFontPadding: false,
+    textAlignVertical: "center",
   },
   candidates: {
     alignSelf: "stretch",
@@ -366,7 +383,14 @@ const styles = StyleSheet.create({
   },
   candidate: {
     paddingVertical: Spacing.two,
+    position: "relative",
   },
+  apiCandidate: { paddingHorizontal: 0, paddingVertical: 0 },
+  mockCandidate: { paddingHorizontal: 12, paddingRight: 36 },
+  candidateCheck: { position: "absolute", top: 10, right: 12, width: 20, height: 20 },
+  confirmationChanges: { alignSelf: "stretch", gap: 12 },
+  confirmationActions: { alignSelf: "stretch", flexDirection: "row", gap: 12 },
+  confirmationButton: { height: 44, minHeight: 44, flexBasis: 0 },
   actions: {
     alignSelf: "stretch",
     flexDirection: "row",
@@ -391,7 +415,10 @@ const styles = StyleSheet.create({
     maxWidth: "85%",
     borderRadius: 20,
     borderBottomLeftRadius: 4,
-    padding: Spacing.three,
+    paddingHorizontal: Spacing.three,
+    paddingVertical: Spacing.three,
+    justifyContent: "center",
     gap: Spacing.two,
   },
+  confirmationBubble: { width: "90%", maxWidth: "90%", gap: 12 },
 });

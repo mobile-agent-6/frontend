@@ -78,6 +78,7 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
     const code = ts.transpileModule(fs.readFileSync(file, "utf8"), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX }, fileName: file }).outputText;
     function resolve(name) {
       if (name === "expo-router") return { useFocusEffect: callback => { displayFocusCleanups.add(callback()); } };
+      if (name === "expo-symbols") return { SymbolView: "SymbolView" };
       // Schedule GET 통합은 전용 동기화·화면 회귀에서 검증하고 기존 Assistant 시험은 독립시킨다.
       if (name === "@/services/api/assistant-schedule-sync" && !actualScheduleSync) return { assistantScheduleSync: syncDouble };
       if (name === "react") return react;
@@ -695,6 +696,89 @@ test("정보 보충: 최초 ID 생략·후속마다 새 UUID·원래 conversatio
   } finally { h.close(); }
 });
 
+for (const [scenario, reply] of [["V6", "오후 2시로 잡아줘"], ["V7", "제목이 상차 화물 무게 배분 확인인 걸 찾고 있어"]]) for (const acceptedStatus of [200, 202]) {
+  test(`Reload ${scenario} 후속 처리 ${acceptedStatus}: 정상 진행 요청에 이전 복구 기록 경고 없음`, async () => {
+    const old = recoveryRef(id(980)), gate = deferred(), h = harness({ data: cleanupData(old), actualLifecycle: true });
+    let sent;
+    h.state.handle = async (url, options) => {
+      if (options.method === "POST") { sent = JSON.parse(options.body); return json(status(sent.requestId), acceptedStatus); }
+      if (url.endsWith(`/assistant/requests/${old.requestId}`)) return json({ ...done(old.requestId), result: results.need_more_info });
+      return gate.promise;
+    };
+    const detach = h.attachLifecycle();
+    try {
+      await readyCleanup(h); assert.equal(postedBodies(h).length, 0);
+      assert.equal(h.messages()[0].apiExecution.response.data.result.kind, "need_more_info");
+      h.send(reply); await readyCleanup(h);
+      assert.equal(sent.conversationId, id(100)); assert.deepEqual(sent.input, { type: "text", text: reply, questionId: id(300) });
+      assert.notEqual(sent.requestId, old.requestId); assert.equal(await h.storage.read(old), null);
+      const active = recoveryRef(sent.requestId); assert.ok(await h.storage.read(active));
+      assert.equal(h.find("ConversationList").isProcessing, true);
+      assert.ok(!textOf(h.renderConversation().footer).includes("이전 요청의 로컬 복구 기록이 남아 있어요"));
+      assert.ok(!textOf(h.renderConversation().footer).includes("로컬 복구 기록 수동 정리"));
+      gate.resolve(json({ ...done(sent.requestId), result: scenario === "V6" ? writeOutcome8b() : results.outcome }));
+      await readyCleanup(h); assert.equal(h.messages().at(-1).apiExecution.response.data.result.kind, "outcome");
+      assert.equal(postedBodies(h).length, 1); assert.equal(h.state.mockRuns, 0);
+    } finally { gate.resolve(json(done(sent?.requestId ?? old.requestId))); await h.settle(); detach(); h.close(); }
+  });
+}
+
+for (const failure of ["404", "network", "timeout"]) test(`Reload 복구 ${failure}: 미확정 요청은 GET-only·기록과 수동 정리 안내 보존`, async () => {
+  const reference = recoveryRef(id(981)), h = harness({ data: cleanupData(reference), actualLifecycle: true });
+  h.state.handle = () => {
+    if (failure === "404") return error7a("ASSISTANT_REQUEST_NOT_FOUND", 404);
+    if (failure === "network") throw new Error("대체 네트워크 오류");
+    return new Promise(() => {});
+  };
+  const detach = h.attachLifecycle();
+  try {
+    await readyCleanup(h); if (failure === "timeout") await h.advance(5000);
+    await readyCleanup(h);
+    assert.equal(postedBodies(h).length, 0); assert.equal(h.state.calls.length, 1);
+    assert.ok(h.state.calls[0].url.endsWith(`/assistant/requests/${reference.requestId}`));
+    assert.ok(await h.storage.read(reference)); assert.equal(h.state.cleanup, 0);
+    assert.equal(h.messages().at(-1).apiExecution.kind, "needs-attention");
+    assert.ok(textOf(h.renderConversation().rows).includes("로컬 복구 기록 수동 정리"));
+  } finally { detach(); h.close(); }
+});
+
+test("Reload 후속 접수 뒤 GET 실패: 이전 질문만 정리·새 미확정 요청 안내 유지", async () => {
+  const old = recoveryRef(id(982)), gate = deferred(), h = harness({ data: cleanupData(old), actualLifecycle: true });
+  let sent;
+  h.state.handle = (url, options) => {
+    if (options.method === "POST") { sent = JSON.parse(options.body); return json(status(sent.requestId), 202); }
+    if (url.endsWith(`/assistant/requests/${old.requestId}`)) return json({ ...done(old.requestId), result: results.need_more_info });
+    return gate.promise;
+  };
+  const detach = h.attachLifecycle();
+  try {
+    await readyCleanup(h); h.send("오후 2시로 잡아줘"); await readyCleanup(h);
+    assert.equal(await h.storage.read(old), null);
+    gate.resolve(error7a("ASSISTANT_REQUEST_NOT_FOUND", 404)); await readyCleanup(h);
+    assert.equal(h.find("ConversationList").isProcessing, false);
+    assert.equal(h.messages().at(-1).apiExecution.kind, "needs-attention");
+    assert.ok(await h.storage.read(recoveryRef(sent.requestId)));
+    assert.ok(textOf(h.renderConversation().rows).includes("로컬 복구 기록 수동 정리"));
+    assert.equal(postedBodies(h).length, 1); assert.equal(h.state.mockRuns, 0);
+  } finally { gate.resolve(error7a("ASSISTANT_REQUEST_NOT_FOUND", 404)); await h.settle(); detach(); h.close(); }
+});
+
+test("처리 중 복구 경고 제외는 현재 사용자 요청의 서버·ID에만 적용", async () => {
+  const current = recoveryRef(id(983)), other = recoveryRef(id(984)), foreign = recoveryRef(id(983), "development:https://other.invalid"),
+    h = harness({ data: cleanupData(current, other, foreign) });
+  try {
+    await readyCleanup(h);
+    const props = h.find("ConversationList"); props.isProcessing = true;
+    assert.equal(props.recoveryControls.length, 3);
+    const view = h.renderConversation([{ id: current.requestId, role: "user", text: "후속 답변", serverId }]);
+    const warnings = view.components.filter(node => node.name === "AssistantMessage" && node.props.recoveryIssue);
+    assert.deepEqual(warnings.map(node => node.props.recoveryControl.reference), [other, foreign]);
+    props.isProcessing = false;
+    assert.equal(h.renderConversation([{ id: current.requestId, role: "user", text: "후속 답변", serverId }]).components
+      .filter(node => node.name === "AssistantMessage" && node.props.recoveryIssue).length, 3);
+  } finally { h.close(); }
+});
+
 test("연속 정보 보충은 최신 questionId·서버 conversationId만 사용하고 자연어로 새 작업을 판별하지 않음", async () => {
   const h = harness(); let question = 300;
   h.state.handle = (url, init) => init.method === "POST" ? json(status(JSON.parse(init.body).requestId), 202)
@@ -932,7 +1016,9 @@ test("6-B 실제 카드 선택: 새 UUID·서버 conversation/question·opaque c
     const user = h.messages().find(item => item.id === selection.requestId); assert.equal(user.role, "user");
     assert.ok(user.text.includes("일정 후보 1")); assert.ok(user.text.includes("오전 12:05")); assert.ok(user.text.includes("재고"));
     assert.equal(candidateButtons(h, message.id)[1].props.accessibilityState.selected, true);
-    assert.ok(textOf(h.renderConversation().rows).includes("선택됨")); assert.equal(h.find("MessageInput").value, "보존할 초안");
+    assert.ok(!textOf(h.renderConversation().rows).includes("선택됨"));
+    assert.equal(nodes(h.renderConversation().rows, "View").filter(node => node.props.testID === "assistant-candidate-check").length, 1);
+    assert.equal(h.find("MessageInput").value, "보존할 초안");
     const confirmation = h.messages().at(-1); assert.equal(confirmation.apiExecution.response.data.result.kind, "confirmation");
     assert.ok(candidateButtons(h, confirmation.id).every(button => !button.props.disabled && typeof button.props.onPress === "function"));
     assert.strictEqual(h.mock.getState().schedules, before); assert.equal(h.state.mockRuns, 0); assert.equal(h.state.cleanup, 0);
@@ -2248,6 +2334,81 @@ for (const [operation, completed] of [["create", false], ["update", true], ["upd
     assert.deepEqual(labels, operation === "create" ? [] : [completed ? "완료" : "미완료"]);
     assert.ok(textOf(view.rows).includes("최신 일정 정보")); assert.ok(textOf(view.rows).includes(h.messages().at(-1).text));
     assert.equal(h.state.mockRuns, 0); assert.ok(h.state.calls.every(call => call.url.includes("/assistant/")));
+  } finally { h.close(); }
+});
+
+const uiStyle = value => Object.assign({}, ...[value].flat(Infinity).filter(item => item && typeof item === "object"));
+
+test("채팅 UI 서버 후보는 compact 카드·체크 오버레이로 선택 전후 크기 유지", async () => {
+  const h = harness(); try {
+    const message = await liveCandidates(h), before = candidateButtons(h, message.id)[1];
+    const initial = h.renderConversation(), candidateCard = cards(initial)[1];
+    assert.equal(candidateCard.props.compact, true);
+    const compact = h.source("src/components/assistant/assistant-schedule-card.tsx").AssistantScheduleCard(candidateCard.props);
+    const compactStyle = uiStyle(compact.props.style);
+    assert.equal(compactStyle.paddingVertical, 8); assert.equal(compactStyle.gap, 4); assert.equal(compactStyle.paddingRight, 36);
+    const originalStyle = uiStyle(before.props.style); assert.equal(originalStyle.paddingHorizontal, 0); assert.equal(originalStyle.paddingVertical, 0);
+    assert.equal(nodes(initial.rows, "View").filter(node => node.props.testID === "assistant-candidate-check").length, 0);
+    h.state.handle = responseWith(results.confirmation); before.props.onPress(); h.render(); await h.settle();
+    const after = candidateButtons(h, message.id)[1], row = h.renderConversation().rows[h.messages().findIndex(item => item.id === message.id)];
+    assert.deepEqual({ ...uiStyle(after.props.style), opacity: undefined }, { ...originalStyle, opacity: undefined });
+    const check = nodes(row, "View").find(node => node.props.testID === "assistant-candidate-check");
+    assert.deepEqual(uiStyle(check.props.style), { position: "absolute", top: 10, right: 12, width: 20, height: 20 });
+    assert.equal(check.props.pointerEvents, "none"); assert.ok(!textOf(row).includes("선택됨"));
+    assert.equal(postedBodies(h).length, 2); assert.equal(postedBodies(h)[1].input.candidateId, message.apiExecution.response.data.result.candidates[1].candidateId);
+  } finally { h.close(); }
+});
+
+test("채팅 UI Mock 후보도 선택 체크를 오버레이로 표시하고 기존 선택·확인 유지", async () => {
+  const h = harness({ initialMode: "mock" }); try {
+    h.send("재고 일정 삭제해 줘"); await h.advance(700); const message = h.messages().at(-1);
+    const before = candidateButtons(h, message.id)[0], geometry = uiStyle(before.props.style);
+    before.props.onPress(); h.render();
+    const row = h.renderConversation().rows[h.messages().findIndex(item => item.id === message.id)];
+    const after = interactionButtons(row)[0];
+    assert.deepEqual({ ...uiStyle(after.props.style), opacity: undefined }, { ...geometry, opacity: undefined });
+    assert.equal(after.props.accessibilityState.selected, true);
+    assert.equal(nodes(row, "View").filter(node => node.props.testID === "assistant-candidate-check").length, 1);
+    assert.deepEqual(interactionButtons(h.renderConversation().rows.at(-1)).map(textOf), ["아니요", "예"]);
+    assert.equal(h.state.calls.length, 0);
+  } finally { h.close(); }
+});
+
+for (const mode of ["server", "mock"]) test(`채팅 UI ${mode} 확인 카드는 90% 너비·동일한 44dp 버튼·12dp 간격`, async () => {
+  const h = harness({ initialMode: mode }); try {
+    if (mode === "server") { h.state.handle = responseWith(results.confirmation); h.send("확인 UI"); await h.settle(); }
+    else { h.send("작업장 안전 점검 삭제해 줘"); await h.advance(700); }
+    const row = h.renderConversation().rows.at(-1), bubble = uiStyle(row.props.style), buttons = interactionButtons(row);
+    assert.equal(bubble.width, "90%"); assert.equal(bubble.maxWidth, "90%"); assert.equal(bubble.gap, 12);
+    assert.equal(bubble.paddingHorizontal, 16); assert.equal(bubble.paddingVertical, 16);
+    assert.deepEqual(buttons.map(textOf), ["아니요", "예"]);
+    for (const button of buttons) { const style = uiStyle(button.props.style); assert.equal(style.height, 44); assert.equal(style.minHeight, 44); assert.equal(style.flex, 1); assert.equal(style.flexBasis, 0); }
+    const actions = nodes(row, "View").find(node => uiStyle(node.props.style).flexDirection === "row");
+    assert.equal(uiStyle(actions.props.style).gap, 12);
+  } finally { h.close(); }
+});
+
+for (const mode of ["server", "mock"]) for (const multiline of [false, true]) test(`채팅 UI ${mode} ${multiline ? "여러 줄" : "한 줄"} 결과는 대칭 padding·고정 높이·빈 상태 컨테이너 없음`, () => {
+  const h = harness({ initialMode: mode }); try {
+    const text = multiline ? "일정을 삭제했어요.\n다른 일정은 유지돼요." : "일정을 삭제했어요.";
+    const execution = writeExecution8b(); execution.response.data.result = { ...writeOutcome8b(), operation: "delete", text };
+    h.publishSync([syncEntry8b("synchronized", execution.reference.requestId)]);
+    const view = h.renderConversation([{ id: "ui-text", role: "assistant", text, ...(mode === "server" ? { apiExecution: execution } : {}) }]);
+    const row = view.rows[0], bubble = uiStyle(row.props.style), body = nodes(row, "Text")[0];
+    assert.equal(bubble.paddingVertical, bubble.paddingHorizontal); assert.equal(bubble.justifyContent, "center");
+    assert.equal(bubble.height, undefined); assert.equal(bubble.minHeight, undefined);
+    assert.equal(body.props.children, text); assert.equal(body.props.numberOfLines, undefined);
+    assert.equal(uiStyle(body.props.style).fontSize, 16); assert.equal(uiStyle(body.props.style).lineHeight, 24);
+    assert.equal(nodes(row, "View").filter(node => node.props.testID === "assistant-schedule-sync-status").length, 0);
+    assert.equal(h.state.calls.length, 0);
+  } finally { h.close(); }
+});
+
+test("채팅 UI compact 옵션은 일반 일정 요약 카드의 기존 디자인을 변경하지 않음", () => {
+  const h = harness(); try {
+    const card = h.source("src/components/assistant/assistant-schedule-card.tsx").AssistantScheduleCard({ schedule: { title: "기존 일정", date: "2026-11-13", time: "12:00", category: "재고" } });
+    const style = uiStyle(card.props.style); assert.equal(style.padding, 12); assert.equal(style.gap, 8); assert.equal(style.borderRadius, 16);
+    assert.equal(style.paddingRight, undefined);
   } finally { h.close(); }
 });
 

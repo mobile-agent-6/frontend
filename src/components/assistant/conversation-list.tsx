@@ -100,6 +100,7 @@ export function ConversationList({
 }: ConversationListProps) {
   const listRef = useRef<FlatList<ConversationMessage>>(null);
   const messageCount = messages.length;
+  const processingMessage = isProcessing ? [...messages].reverse().find(message => message.role === "user") : undefined;
   const previousMessageCountRef = useRef(messageCount);
   const scrollMetricsRef = useRef({ contentHeight: 0, viewportHeight: 0, offsetY: 0 });
   const isNearBottomRef = useRef(true);
@@ -300,7 +301,10 @@ export function ConversationList({
               </ThemedText>
             </View>
           )}
-          {recoveryControls?.filter(control => !messages.some(message => message.role === "assistant" && message.apiExecution &&
+          {/* 현재 전송을 처리 중인 기록은 고아 복구 항목이 아니다. 실패 결과와 이전 서버 기록은 별도로 유지한다. */}
+          {recoveryControls?.filter(control => !(processingMessage && processingMessage.serverId === control.reference.serverId &&
+            processingMessage.id.toLowerCase() === control.reference.requestId.toLowerCase()) &&
+            !messages.some(message => message.role === "assistant" && message.apiExecution &&
             assistantRecoveryKey(message.apiExecution.reference) === assistantRecoveryKey(control.reference))).map(control => (
             <AssistantMessage key={`recovery-${assistantRecoveryKey(control.reference)}`} text="이전 요청의 로컬 복구 기록이 남아 있어요."
               recoveryIssue

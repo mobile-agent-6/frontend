@@ -10,6 +10,7 @@ type AssistantScheduleCardProps = {
   // 후보 DTO에 없는 일정 ID·완료 여부를 표시 때문에 만들어 넣지 않는다.
   schedule: Pick<Schedule, "title" | "date" | "time" | "category"> & { completed?: boolean };
   showCompleted?: boolean;
+  compact?: boolean;
 };
 
 function formatCardDate(date: string) {
@@ -32,12 +33,12 @@ export function formatAssistantCardDateTime(date: string, time: string) {
   return `${formatCardDate(date)} ${formatCardTime(time)}`;
 }
 
-export function AssistantScheduleCard({ schedule, showCompleted = false }: AssistantScheduleCardProps) {
+export function AssistantScheduleCard({ schedule, showCompleted = false, compact = false }: AssistantScheduleCardProps) {
   const theme = useTheme();
 
   return (
-    <ThemedView style={styles.card}>
-      <View style={[styles.badge, { backgroundColor: theme.primaryMuted }]}>
+    <ThemedView style={[styles.card, compact && styles.compactCard]}>
+      <View style={[styles.badge, compact && styles.compactBadge, { backgroundColor: theme.primaryMuted }]}>
         <ThemedText type="smallBold" themeColor="primary">
           {schedule.category}
         </ThemedText>
@@ -67,6 +68,16 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     paddingHorizontal: Spacing.two,
     paddingVertical: Spacing.one,
+  },
+  compactCard: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    paddingRight: 36,
+    gap: 4,
+    borderRadius: 12,
+  },
+  compactBadge: {
+    paddingVertical: 2,
   },
   title: {
     fontWeight: "700",
