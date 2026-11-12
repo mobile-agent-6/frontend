@@ -9,8 +9,10 @@ const root = path.resolve(__dirname, "..");
 
 // 실제 화면·Hook·서비스를 실행하되 native 컴포넌트와 React 실행기만 메모리 대역으로 둔다.
 // native 렌더링·레이아웃·아이폰 통신을 검증하는 테스트는 아니다.
-function harness(initialMode, { readOnly = false } = {}) {
+function harness(initialMode, { readOnly = false, assistantSyncUi = false } = {}) {
   const modules = new Map(), screens = [], calls = [], navigations = [];
+  const assistantListeners = new Set();
+  let assistantSnapshot;
   let current;
   const router = { push: (route) => navigations.push(route), back: () => navigations.push("back") };
   const navigationRef = { isReady: () => true, addListener: () => () => {} };
@@ -54,10 +56,13 @@ function harness(initialMode, { readOnly = false } = {}) {
     }, fileName: filename }).outputText;
     const resolve = (name) => {
       // Assistant의 서버 통신 검증은 전용 화면 테스트에서 실행한다.
-      if (name === "@/services/api/assistant") return { assistantHttpClient: { getServerId: () => null } };
+      if (name === "@/services/api/assistant") return { assistantHttpClient: { getServerId: () => assistantSyncUi && config?.status === "ready" ? config.config.serverId : null } };
       if (name === "@/services/api/assistant-orchestrator") return { assistantOrchestrator: { startRequest: () => { throw new Error("Schedule 화면 검증에서 Assistant 전송 금지"); } } };
       // Schedule 화면 검증은 앱 복구와 분리하고 실제 root 연결은 lifecycle 테스트에서 검증한다.
-      if (name === "@/services/api/assistant-lifecycle") return { assistantLifecycle: { attach: () => () => {}, getSnapshot: () => ({ phase: "idle", initialCheck: "pending", serverId: null, results: [] }), subscribe: () => () => {} } };
+      if (name === "@/services/api/assistant-lifecycle") return { assistantLifecycle: { attach: () => () => {},
+        getSnapshot: () => assistantSnapshot ?? { phase: assistantSyncUi ? "settled" : "idle", initialCheck: assistantSyncUi ? "checked" : "pending",
+          serverId: assistantSyncUi && config?.status === "ready" ? config.config.serverId : null, results: [] },
+        subscribe: listener => { assistantListeners.add(listener); return () => assistantListeners.delete(listener); } } };
       if (name === "@/services/storage/assistant-recovery") return { assistantRecoveryStorage: { readAll: async () => [] } };
       if (name === "react") return react;
       if (name === "react/jsx-runtime") return { jsx: (type, props, key) => ({ type, props, key }), jsxs: (type, props, key) => ({ type, props, key }) };
@@ -166,6 +171,9 @@ function harness(initialMode, { readOnly = false } = {}) {
         s.children.forEach((child) => child.slots.forEach((slot) => slot?.cleanup?.())); } };
   }
   return { mount, calls, mock, server, flush, source, navigations,
+    publishAssistant(executions) { assistantSnapshot = { phase: "settled", initialCheck: "checked", serverId: config.config.serverId,
+      results: executions.map(execution => ({ reference: execution.reference, latestResult: execution, lastResponse: execution.response })) };
+      for (const listener of [...assistantListeners]) listener(); flush(); },
     back() { router.back(); }, // native 뒤로 가기 동작은 메모리 navigation으로만 모사한다.
     mode(value) { mode.getState().setMode(value); flush(); },
     config(value) { config = configModule.parseDevelopmentServerConfig(value); screens.forEach((s) => { s.dirty = true; }); flush(); },
@@ -185,6 +193,59 @@ const states = (screen) => screen.all("ScheduleListState").map((s) => s.state);
 const syncRequestId = "80000001-abcd-4abc-8abc-abcdef123456", syncScheduleId = "80000002-abcd-4abc-8abc-abcdef123456";
 const syncOutcome = (operation = "update") => ({ requestId: syncRequestId, conversationId: "80000003-abcd-4abc-8abc-abcdef123456", status: "completed",
   result: { kind: "outcome", text: "Assistant 서버 변경 성공", outcome: "success", operation, schedulesChanged: true, affectedScheduleIds: [syncScheduleId] } });
+
+async function failedSyncUi8b() {
+  const h = harness("server", { assistantSyncUi: true }), list = h.mount("index"), calendar = h.mount("calendar"), assistant = h.mount("assistant");
+  await h.settle(); const original = dto(syncScheduleId, "OTHER");
+  for (let n = 0; n < h.calls.length; n++) h.respond(n, [original]); await h.settle();
+  list.one("CategoryFilter").onSelectCategory("기타"); h.flush();
+  const reference = { serverId: "development:https://example.invalid", requestId: syncRequestId }, data = syncOutcome();
+  const sync = h.source("src/services/api/assistant-schedule-sync.ts").assistantScheduleSync, start = h.calls.length;
+  const pending = sync.observe(reference, data);
+  h.publishAssistant([{ kind: "completed", reference, response: { ok: true, data, status: 200, serverId: reference.serverId, httpRequestId: "추적 ID", metadata: { status: "updated" } } }]);
+  await h.settle(); assert.equal(assistant.one("ConversationList").scheduleSyncEntries[0].phase, "refreshing");
+  const failure = { type: "https://example.invalid/problem", title: "조회 실패", status: 404, detail: "내부 오류", instance: "/api/v1/schedules", code: "ROUTE_NOT_FOUND", requestId: "조회 추적" };
+  h.detail(start, failure, 404, "application/problem+json");
+  for (let n = start + 1; n < h.calls.length; n++) h.respond(n, [original]); await pending; await h.settle();
+  assert.equal(assistant.one("ConversationList").scheduleSyncEntries[0].phase, "refresh-error");
+  return { h, list, calendar, assistant, sync, reference, original, failedIndex: start };
+}
+
+for (const source of ["assistant", "schedule"]) test(`8-B ${source} GET-only retry 성공은 실제 Assistant 상태·목록·캘린더를 함께 갱신`, async () => {
+  const { h, list, calendar, assistant, reference, failedIndex } = await failedSyncUi8b();
+  try {
+    assert.equal(list.one("FlatList").data[0].id, syncScheduleId); assert.ok(states(list).includes("error"));
+    const month = calendar.one("MonthCalendar").visibleMonth, selected = calendar.one("MonthCalendar").selectedDate, before = h.calls.length;
+    if (source === "assistant") {
+      const retry = assistant.one("ConversationList").onScheduleSyncRetry; retry(reference); retry(reference);
+    } else list.all("ScheduleListState").find(entry => entry.state === "error").onRetry();
+    await h.settle(); assert.equal(h.calls.length, before + 1); assert.equal(h.calls[before].url, h.calls[failedIndex].url);
+    const updated = { ...dto(syncScheduleId, "OTHER"), title: "정식 GET 제목", scheduledAt: "2026-11-08T03:00:00Z" };
+    h.respond(before, [updated]); await h.settle();
+    assert.equal(assistant.one("ConversationList").scheduleSyncEntries[0].phase, "synchronized");
+    assert.equal(assistant.one("ConversationList").messages[0].apiExecution.response.data.result.outcome, "success");
+    assert.equal(list.one("FlatList").data[0].title, updated.title); assert.equal(list.one("FlatList").data[0].date, "2026-11-08");
+    assert.equal(list.one("CategoryFilter").selectedCategory, "기타"); assert.equal(calendar.one("MonthCalendar").visibleMonth, month);
+    assert.equal(calendar.one("MonthCalendar").selectedDate, selected); assert.ok(calendar.one("MonthCalendar").scheduleDates.includes("2026-11-08"));
+    assert.equal(calendar.all("ScheduleCard").length, 0); assert.ok(h.calls.every(call => call.method === "GET"));
+  } finally { h.close(); }
+});
+
+test("8-B Assistant retry 대기 중 수동 완료 PATCH는 독립 실행·성공 rollback/취소/재전송 없음", async () => {
+  const { h, list, calendar, assistant, reference } = await failedSyncUi8b();
+  try {
+    const before = h.calls.length; listCard(list).onToggleCompleted(); await h.settle();
+    assert.equal(h.calls[before].method, "PATCH"); const signal = h.calls[before].signal;
+    assistant.one("ConversationList").onScheduleSyncRetry(reference); await h.settle(); assert.equal(h.calls.length, before + 1); assert.equal(signal.aborted, false);
+    const updated = dto(syncScheduleId, "OTHER", true); h.detail(before, updated); await h.settle();
+    const manualEnd = h.calls.length;
+    for (let n = before + 1; n < manualEnd; n++) h.respond(n, [updated]); await h.settle();
+    for (let n = manualEnd; n < h.calls.length; n++) { assert.equal(h.calls[n].method, "GET"); h.respond(n, [updated]); } await h.settle();
+    assert.equal(signal.aborted, false); assert.equal(h.calls.filter(call => call.method === "PATCH").length, 1);
+    assert.equal(list.one("FlatList").data[0].completed, true); assert.equal(calendar.all("ScheduleCard")[0].schedule.completed, true);
+    assert.equal(assistant.one("ConversationList").scheduleSyncEntries[0].phase, "synchronized");
+  } finally { h.close(); }
+});
 
 for (const operation of ["create", "update", "delete", "completed"]) test(`8-A 실제 목록·캘린더 ${operation}: 정식 GET의 카드·날짜·dot와 기존 필터 유지`, async () => {
   const h = harness("server"); try {

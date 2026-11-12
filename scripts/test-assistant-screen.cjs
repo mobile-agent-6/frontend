@@ -17,19 +17,21 @@ const results = {
   failure: { kind: "failure", text: "서버에서 처리를 완료하지 못했어요.", code: "MODEL_TIMEOUT", nextAction: "retry_later" },
   uncertain: { kind: "uncertain", text: "실행 결과를 확인해야 해요.", code: "EXECUTION_RESULT_UNKNOWN", nextAction: "check_status" },
 };
-const json = (body, status = 200) => ({ status, headers: new Headers({ "Content-Type": "application/json", "X-Request-ID": id(900) }), text: async () => JSON.stringify(body) });
+const json = (body, status = 200) => ({ status, ok: status >= 200 && status < 300, headers: new Headers({ "Content-Type": "application/json", "X-Request-ID": id(900) }), text: async () => JSON.stringify(body) });
 const status = (requestId, value = "accepted") => ({ requestId, conversationId: id(100), status: value });
 const done = (requestId, kind = "outcome") => ({ ...status(requestId, "completed"), result: results[kind] });
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
 
 // 실제 화면 Hook·HTTP·복구·polling을 실행하고 native·시계·storage·fetch만 프로세스 대역으로 둔다.
 // 실제 단말 렌더링·키보드·네트워크 시험은 아니다.
-function harness({ initialMode = "server", readOnly = false, data = new Map(), initialSnapshot, actualLifecycle = false, snapshotAtSubscribe, notifyOnSubscribe = false } = {}) {
+function harness({ initialMode = "server", readOnly = false, data = new Map(), initialSnapshot, actualLifecycle = false, snapshotAtSubscribe, notifyOnSubscribe = false,
+  actualScheduleSync = false, initialSyncSnapshot = [], syncSnapshotAtSubscribe } = {}) {
   const cache = new Map(), slots = [], effects = [], timers = new Map(), listeners = new Set();
   let cursor = 0, dirty = false, tree, wall = 1000, mono = 0, timerId = 0, closed = false, displaying = false;
   const state = { app: "active", calls: [], starts: [], uuidCalls: 0, failUuid: false, failStorage: false, throwMessage: false,
     cleanup: 0, storageCleanupCalls: [], manualCleanupCalls: [], lateUpdates: 0, mockRuns: 0, beforeUuid: null, config: null, failRead: false, beforeRead: null,
     recoveryListeners: new Set(), lastRecoveryListener: null, beforeSubscribe: null, initializations: 0, unsubscribed: 0,
+    syncSnapshot: initialSyncSnapshot, syncListeners: new Set(), syncRetries: [], lastSyncListener: null, syncUnsubscribed: 0,
     snapshot: initialSnapshot ?? { phase: "settled", initialCheck: "checked", serverId, results: [] },
     handle: async (url, init) => init.method === "POST" ? json(status(JSON.parse(init.body).requestId), 202) : json(done(url.split("/").pop())) };
   const same = (a, b) => a && b && a.length === b.length && a.every((v, i) => Object.is(v, b[i]));
@@ -50,6 +52,11 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
   const clearTimer = token => timers.delete(token);
   const send = (url, init) => { state.calls.push({ url, init }); return state.handle(url, init); };
   const adapter = { async getItem(key) { if (state.beforeRead) await state.beforeRead(); if (state.failRead) throw Error("조회 실패"); return data.get(key) ?? null; }, async setItem(key, value) { if (state.failStorage) throw Error("저장 실패"); data.set(key, value); } };
+  const syncDouble = { observe: async () => null, getSnapshot: () => state.syncSnapshot,
+    retry: async reference => { state.syncRetries.push(reference); return state.syncSnapshot.find(entry => entry.reference.requestId === reference.requestId) ?? null; },
+    subscribe(listener) { state.syncListeners.add(listener); state.lastSyncListener = listener;
+      if (syncSnapshotAtSubscribe) state.syncSnapshot = syncSnapshotAtSubscribe;
+      return () => { state.syncListeners.delete(listener); state.syncUnsubscribed++; }; } };
   const native = { AppState: { get currentState() { return state.app; }, addEventListener(event, listener) { assert.equal(event, "change"); listeners.add(listener); return { remove: () => listeners.delete(listener) }; } },
     KeyboardAvoidingView: "KeyboardAvoidingView", FlatList: "FlatList", Keyboard: { isVisible: () => false }, Platform: { OS: "ios" }, StyleSheet: { create: s => s }, Text: "Text", View: "View", Pressable: "Pressable" };
   function load(file) {
@@ -58,7 +65,7 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
     const code = ts.transpileModule(fs.readFileSync(file, "utf8"), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX }, fileName: file }).outputText;
     function resolve(name) {
       // Schedule GET 통합은 전용 동기화·화면 회귀에서 검증하고 기존 Assistant 시험은 독립시킨다.
-      if (name === "@/services/api/assistant-schedule-sync") return { assistantScheduleSync: { observe: async () => null } };
+      if (name === "@/services/api/assistant-schedule-sync" && !actualScheduleSync) return { assistantScheduleSync: syncDouble };
       if (name === "react") return react;
       if (name === "react/jsx-runtime") return { Fragment: "Fragment", jsx: (type, props, key) => ({ type, props, key }), jsxs: (type, props, key) => ({ type, props, key }) };
       if (name === "react-native") return native;
@@ -71,7 +78,7 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
       if (name === "@/constants/theme") return { Spacing: { one: 4, two: 8, three: 16 } };
       if (name === "@/hooks/use-color-scheme") return { useColorScheme: () => "light" };
       if (name === "@/hooks/use-theme") return { useTheme: () => ({ background: "white", primaryForeground: "white" }) };
-      assert.ok(name.startsWith("@/"), name); assert.notEqual(name, "@/services/api/http");
+      assert.ok(name.startsWith("@/"), name); if (!actualScheduleSync) assert.notEqual(name, "@/services/api/http");
       return load(path.join(root, "src", `${name.slice(2)}.ts`));
     }
     new Function("require", "module", "exports", "fetch", "setTimeout", "clearTimeout", "performance", "process", "Date", code)(resolve, module, module.exports,
@@ -81,11 +88,17 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
   }
   const source = file => load(path.join(root, file));
   const config = source("src/services/api/config.ts"); state.config = config.parseDevelopmentServerConfig(origin);
+  config.getDevelopmentServerConfig = () => state.config;
+  if (actualScheduleSync) {
+    const scheduleHttp = source("src/services/api/http.ts");
+    scheduleHttp.scheduleHttpClient = scheduleHttp.createScheduleHttpClient({ readConfig: () => state.config, fetchImpl: send });
+  }
   const storage = source("src/services/storage/assistant-recovery.ts").assistantRecoveryStorage;
   const httpModule = source("src/services/api/assistant.ts");
   const http = httpModule.createAssistantHttpClient({ recovery: storage, fetchImpl: send, readConfig: () => state.config, now: () => wall }); httpModule.assistantHttpClient = http;
   const recovery = source("src/services/api/assistant-request-recovery.ts").createAssistantRequestRecovery({ http, recovery: storage, now: () => wall });
   const api = source("src/services/api/assistant-orchestrator.ts");
+  const sync = actualScheduleSync ? source("src/services/api/assistant-schedule-sync.ts").assistantScheduleSync : syncDouble;
   const orchestrator = api.createAssistantOrchestrator({ http, requests: recovery, storage: { ...storage, cleanup: async (...args) => { state.cleanup++; return storage.cleanup(...args); } }, clock: { now: () => wall, monotonicNow: () => mono } });
   const originalCleanup = storage.cleanup, originalManualCleanup = storage.removeManually;
   storage.cleanup = (...args) => { state.storageCleanupCalls.push(args); return originalCleanup(...args); };
@@ -127,13 +140,14 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
     return { list, components, rows: messages.map(item => expand(list.props.renderItem({ item }))), footer: expand(list.props.ListFooterComponent) };
   }
   render();
-  return { state, source, storage, data, mock, mode, delegate, lifecycle, render, renderConversation, find, settle, advance, timers, listeners,
+  return { state, source, storage, data, mock, mode, delegate, lifecycle, sync, render, renderConversation, find, settle, advance, timers, listeners,
     get wall() { return wall; }, set wall(value) { wall = value; },
     messages: () => find("ConversationList").messages,
     edit(text) { find("MessageInput").onChangeText(text); render(); },
     send(text) { this.edit(text); find("MessageInput").onSend(); render(); },
     switchMode(value) { mode.scheduleDataModeStore.getState().setMode(value); render(); },
     publishSnapshot(snapshot) { state.snapshot = snapshot; for (const listener of [...state.recoveryListeners]) listener(); render(); },
+    publishSync(snapshot) { state.syncSnapshot = snapshot; for (const listener of [...state.syncListeners]) listener(); render(); },
     attachLifecycle: () => realLifecycle.attach(),
     app(value) { state.app = value; for (const listener of [...listeners]) listener(value); },
     close() { if (closed) return; closed = true; slots.forEach(slot => slot?.cleanup?.()); },
@@ -2137,5 +2151,183 @@ test("7-C 서버 왕복은 이전 수동 정리 확인 의사를 복원하지 �
     h.state.config = config.parseDevelopmentServerConfig(origin); h.render(); await readyCleanup(h);
     oldConfirm(); await readyCleanup(h); assert.ok(await h.storage.read(ref)); assert.equal(h.state.manualCleanupCalls.length, 0);
     assert.equal(cleanupButton(h, ref.requestId, "confirm-manual"), undefined);
+  } finally { h.close(); }
+});
+
+// 동기화 UI는 원래 Assistant 결과와 분리한다. 실제 GET 통합 시험 외에는 snapshot·retry만 대체한다.
+const writeOutcome8b = (operation = "update") => ({ kind: "outcome", text: "서버의 원문 변경 성공", outcome: "success", operation,
+  schedulesChanged: true, affectedScheduleIds: [id(200)] });
+const writeExecution8b = (requestId = id(600), server = serverId) => { const value = recovered("outcome", requestId, server); value.response.data.result = writeOutcome8b(); return value; };
+const syncEntry8b = (phase, requestId = id(600), server = serverId) => ({ reference: recoveryRef(requestId, server), phase, failedQueries: [], errors: [] });
+const syncStatus8b = (h, requestId) => {
+  const index = h.messages().findIndex(message => message.apiExecution?.reference.requestId.toLowerCase() === requestId.toLowerCase());
+  return nodes(h.renderConversation().rows[index], "View").find(node => node.props.testID === "assistant-schedule-sync-status");
+};
+const syncRetry8b = (h, requestId) => nodes(syncStatus8b(h, requestId), "Pressable").find(node => node.props.testID === "assistant-schedule-sync-retry");
+const syncCalls8b = h => h.state.calls.filter(call => new URL(call.url).pathname === "/api/v1/schedules");
+const scheduleDto8b = (extra = {}) => ({ ...summary, createdAt: "2026-11-01T00:00:00Z", ...extra });
+function routeSync8b(h, read, result = writeOutcome8b()) {
+  h.state.handle = (url, init) => new URL(url).pathname === "/api/v1/schedules" ? read(url, init)
+    : init.method === "POST" ? json(status(JSON.parse(init.body).requestId), 202) : json({ ...done(url.split("/").pop()), result });
+}
+async function liveSync8b(h, read) {
+  routeSync8b(h, read); h.send("일정 변경 요청"); await h.settle(); return postMessage(h).apiExecution;
+}
+
+for (const [phase, text] of [["refreshing", "최신화하고 있어요"], ["synchronized", "동기화가 완료"], ["refresh-error", "목록 갱신에 실패"], ["interrupted", "목록 확인이 중단"]]) test(`8-B 초기 ${phase} snapshot: 기존 bubble·성공 원문/ID 유지·상태만 별도 표시`, async () => {
+  const execution = writeExecution8b(), h = harness({ initialSnapshot: snapshotOf([execution]), initialSyncSnapshot: [syncEntry8b(phase)] });
+  try {
+    assert.ok(textOf(syncStatus8b(h, id(600))).includes(text)); assert.equal(h.messages()[0].text, execution.response.data.result.text);
+    assert.deepEqual(h.messages()[0].apiExecution, execution); assert.deepEqual(h.messages()[0].apiExecution.response.data.result.affectedScheduleIds, [id(200)]);
+    assert.equal(Boolean(syncRetry8b(h, id(600))), ["refresh-error", "interrupted"].includes(phase));
+    assert.equal(h.state.calls.length, 0); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); }
+});
+
+test("8-B 구독 경계 변경을 최신 snapshot 재조회로 소비·중복 메시지/자동 retry 없음", async () => {
+  const h = harness({ initialSnapshot: snapshotOf([writeExecution8b()]), initialSyncSnapshot: [syncEntry8b("refresh-error")],
+    syncSnapshotAtSubscribe: [syncEntry8b("synchronized")] });
+  try {
+    assert.ok(textOf(syncStatus8b(h, id(600))).includes("동기화가 완료")); const message = h.messages()[0];
+    for (let n = 0; n < 3; n++) h.publishSync([syncEntry8b("synchronized")]);
+    assert.strictEqual(h.messages()[0], message); assert.equal(h.messages().length, 1); assert.equal(h.state.syncRetries.length, 0); assert.equal(h.state.calls.length, 0);
+    assert.equal(h.state.syncListeners.size, 1);
+  } finally { h.close(); }
+});
+
+test("8-B 여러 성공 요청은 서버/requestId별 상태를 각각 표시하고 잘못된 ID retry 차단", async () => {
+  const h = harness({ initialSnapshot: snapshotOf([writeExecution8b(id(600)), writeExecution8b(id(601))]),
+    initialSyncSnapshot: [syncEntry8b("refresh-error", id(600)), syncEntry8b("synchronized", id(601))] });
+  try {
+    assert.ok(textOf(syncStatus8b(h, id(600))).includes("실패")); assert.ok(textOf(syncStatus8b(h, id(601))).includes("완료"));
+    h.find("ConversationList").onScheduleSyncRetry(recoveryRef(id(601))); h.find("ConversationList").onScheduleSyncRetry(recoveryRef(id(799))); await h.settle();
+    assert.equal(h.state.syncRetries.length, 0); syncRetry8b(h, id(600)).props.onPress(); await h.settle();
+    assert.deepEqual(h.state.syncRetries, [recoveryRef(id(600))]);
+  } finally { h.close(); }
+});
+
+for (const kind of ["need_more_info", "candidate_selection", "confirmation", "outcome", "failure", "uncertain"]) test(`8-B 변경 success가 아닌 ${kind}에 동기화 안내·retry 혼합 없음`, async () => {
+  const h = harness({ initialSnapshot: snapshotOf([recovered(kind)]), initialSyncSnapshot: [syncEntry8b("refresh-error")] });
+  try {
+    assert.equal(syncStatus8b(h, id(600)), undefined); h.find("ConversationList").onScheduleSyncRetry(recoveryRef()); await h.settle(); assert.equal(h.state.syncRetries.length, 0);
+    assert.equal(h.state.calls.length, 0); assert.equal(h.state.mockRuns, 0);
+  } finally { h.close(); }
+});
+
+test("8-B retry 연타는 실제 Schedule GET 1회·POST/write 0회·성공 후 실패 안내와 버튼 해제", async () => {
+  const h = harness({ actualScheduleSync: true }), first = deferred(), retried = deferred();
+  try {
+    const cache = h.source("src/stores/serverScheduleStore.ts").serverScheduleStore;
+    h.state.handle = async () => json({ items: [scheduleDto8b()] });
+    const owner = cache.acquire({ from: "2026-11-01T00:00:00Z", to: "2026-12-01T00:00:00Z" }); await owner.promise;
+    const execution = await liveSync8b(h, () => first.promise), requestId = execution.reference.requestId, original = h.messages().at(-1);
+    assert.ok(textOf(syncStatus8b(h, requestId)).includes("최신화")); first.resolve(error7a("ROUTE_NOT_FOUND", 404)); await h.settle();
+    assert.ok(textOf(syncStatus8b(h, requestId)).includes("목록 갱신에 실패")); assert.ok(cache.store.getState().servers[serverId].entities[id(200)]);
+    routeSync8b(h, () => retried.promise); const beforePosts = postedBodies(h).length, beforeGets = syncCalls8b(h).length;
+    const press = syncRetry8b(h, requestId).props.onPress; press(); press(); h.render(); await h.settle();
+    assert.equal(syncCalls8b(h).length, beforeGets + 1); assert.equal(syncRetry8b(h, requestId)?.props.disabled ?? true, true);
+    assert.equal(h.find("MessageInput").disabled, false); h.edit("작성 중인 새 초안");
+    retried.resolve(json({ items: [scheduleDto8b({ title: "GET의 최종 제목", category: "RETURN" })] })); await h.settle();
+    assert.ok(textOf(syncStatus8b(h, requestId)).includes("동기화가 완료")); assert.equal(syncRetry8b(h, requestId), undefined);
+    assert.equal(h.find("MessageInput").value, "작성 중인 새 초안"); assert.strictEqual(h.messages().find(message => message.apiExecution?.reference.requestId === requestId), original);
+    assert.equal(original.apiExecution.response.data.result.outcome, "success"); assert.equal(postedBodies(h).length, beforePosts);
+    assert.ok(syncCalls8b(h).every(call => call.init.method === "GET")); assert.equal(cache.store.getState().servers[serverId].entities[id(200)].category, "반품"); owner.release();
+  } finally { first.resolve(error7a("ROUTE_NOT_FOUND", 404)); retried.resolve(json({ items: [] })); h.close(); }
+});
+
+test("8-B GET 재실패는 success·실패 안내·retry 유지, 반복 snapshot으로 GET 재실행 없음", async () => {
+  const h = harness({ actualScheduleSync: true }); try {
+    const execution = await liveSync8b(h, async () => error7a("ROUTE_NOT_FOUND", 404)), requestId = execution.reference.requestId;
+    assert.equal(execution.response.data.result.outcome, "success"); const before = syncCalls8b(h).length;
+    syncRetry8b(h, requestId).props.onPress(); await h.settle(); assert.equal(syncCalls8b(h).length, before + 1);
+    assert.ok(syncRetry8b(h, requestId));
+    assert.ok(textOf(syncStatus8b(h, requestId)).includes("실패")); const count = h.state.calls.length;
+    h.publishSnapshot(snapshotOf([execution])); h.publishSnapshot(snapshotOf([execution])); await h.settle();
+    assert.equal(h.state.calls.length, count); assert.equal(h.messages().at(-1).apiExecution.response.data.result.kind, "outcome");
+  } finally { h.close(); }
+});
+
+for (const change of ["server", "mock"]) test(`8-B ${change} 변경 후 오래된 retry callback·상태 혼합 차단`, async () => {
+  const h = harness({ initialSnapshot: snapshotOf([writeExecution8b()]), initialSyncSnapshot: [syncEntry8b("refresh-error")] });
+  try {
+    const press = syncRetry8b(h, id(600)).props.onPress;
+    if (change === "server") { h.state.config = h.source("src/services/api/config.ts").parseDevelopmentServerConfig("https://other.example.invalid"); h.render(); }
+    else h.switchMode("mock");
+    press(); h.publishSync([syncEntry8b("synchronized")]); await h.settle();
+    assert.equal(h.state.syncRetries.length, 0); assert.equal(nodes(h.renderConversation().rows, "View").some(node => node.props.testID === "assistant-schedule-sync-status"), false);
+    assert.equal(h.state.calls.length, 0);
+  } finally { h.close(); }
+});
+
+test("8-B 화면 해제는 구독 해제·늦은 callback 무시, retry 완료도 UI 갱신 없음", async () => {
+  const h = harness({ initialSnapshot: snapshotOf([writeExecution8b()]), initialSyncSnapshot: [syncEntry8b("refresh-error")] }), gate = deferred();
+  h.sync.retry = () => gate.promise;
+  try {
+    syncRetry8b(h, id(600)).props.onPress(); h.render(); const late = h.state.lastSyncListener; h.close();
+    assert.equal(h.state.syncListeners.size, 0); assert.equal(h.state.syncUnsubscribed, 1);
+    h.state.syncSnapshot = [syncEntry8b("synchronized")]; late(); gate.resolve(syncEntry8b("synchronized")); await h.settle();
+    assert.equal(h.state.lateUpdates, 0); assert.equal(h.state.calls.length, 0);
+  } finally { gate.resolve(null); h.close(); }
+});
+
+test("8-B retry의 늦은 반환 오류는 최신 성공 snapshot을 덮지 않음", async () => {
+  const h = harness({ initialSnapshot: snapshotOf([writeExecution8b()]), initialSyncSnapshot: [syncEntry8b("refresh-error")] }), gate = deferred();
+  h.sync.retry = () => gate.promise;
+  try {
+    syncRetry8b(h, id(600)).props.onPress(); h.render(); h.publishSync([syncEntry8b("synchronized")]); gate.resolve(syncEntry8b("refresh-error")); await h.settle();
+    assert.ok(textOf(syncStatus8b(h, id(600))).includes("동기화가 완료")); assert.equal(syncRetry8b(h, id(600)), undefined);
+  } finally { gate.resolve(null); h.close(); }
+});
+
+test("8-B retry 예외는 잠금 해제·기존 실패 안내 유지·자동 새 요청 없음", async () => {
+  const h = harness({ initialSnapshot: snapshotOf([writeExecution8b()]), initialSyncSnapshot: [syncEntry8b("refresh-error")] });
+  h.sync.retry = async () => { throw Error("대체 서비스 예외"); };
+  try { syncRetry8b(h, id(600)).props.onPress(); await h.settle(); assert.equal(syncRetry8b(h, id(600)).props.disabled, false);
+    assert.ok(textOf(syncStatus8b(h, id(600))).includes("실패")); assert.equal(h.state.calls.length, 0); assert.equal(h.state.uuidCalls, 0);
+  } finally { h.close(); }
+});
+
+test("8-B 실제 uncertain → GET success는 같은 메시지에서 동기화·이전 위험 상태와 분리", async () => {
+  const h = harness({ actualScheduleSync: true }), gate = deferred(); try {
+    const requestId = await liveUncertain(h); assert.equal(syncStatus8b(h, requestId), undefined); const messageId = h.messages().at(-1).id;
+    routeSync8b(h, () => gate.promise); checkRisk(h, requestId); await h.settle();
+    assert.equal(h.messages().at(-1).id, messageId); assert.equal(h.messages().at(-1).apiExecution.response.data.result.outcome, "success");
+    assert.ok(textOf(syncStatus8b(h, requestId)).includes("최신화")); gate.resolve(json({ items: [] })); await h.settle();
+    assert.ok(textOf(syncStatus8b(h, requestId)).includes("동기화가 완료")); assert.equal(postedBodies(h).length, 1); assert.equal(syncCalls8b(h).length, 1);
+  } finally { gate.resolve(json({ items: [] })); h.close(); }
+});
+
+test("8-B 실제 앱 시작·foreground 복구 성공 표시도 GET-only·중복 동기화 없음", async () => {
+  const h = harness({ actualScheduleSync: true, actualLifecycle: true });
+  await h.storage.saveBeforePost(recoveryRef(), 1000); routeSync8b(h, async () => json({ items: [] })); const detach = h.attachLifecycle();
+  try {
+    await h.settle(); await h.settle(); assert.ok(textOf(syncStatus8b(h, id(600))).includes("동기화가 완료"));
+    h.app("background"); await h.settle(); h.app("active"); await h.settle();
+    assert.equal(h.messages().filter(message => message.apiExecution?.reference.requestId === id(600)).length, 1);
+    assert.equal(syncCalls8b(h).length, 1); assert.ok(h.state.calls.every(call => call.init.method === "GET")); assert.equal(h.state.cleanup, 0);
+  } finally { h.close(); detach(); await h.settle(); }
+});
+
+for (const change of ["server", "mock"]) test(`8-B 실제 GET retry 도중 ${change}: 늦은 응답·과거 동기화 성공 표시 차단`, async () => {
+  const h = harness({ actualScheduleSync: true }), gate = deferred(); try {
+    const execution = await liveSync8b(h, async () => error7a("ROUTE_NOT_FOUND", 404)), requestId = execution.reference.requestId;
+    routeSync8b(h, () => gate.promise); syncRetry8b(h, requestId).props.onPress(); h.render(); await h.settle(); const calls = h.state.calls.length;
+    if (change === "server") { h.state.config = h.source("src/services/api/config.ts").parseDevelopmentServerConfig("https://other.example.invalid"); h.render(); }
+    else h.switchMode("mock");
+    gate.resolve(json({ items: [scheduleDto8b()] })); await h.settle();
+    assert.equal(nodes(h.renderConversation().rows, "View").some(node => node.props.testID === "assistant-schedule-sync-status"), false);
+    assert.equal(h.state.calls.length, calls); assert.equal(h.state.lateUpdates, 0); assert.equal(h.sync.getSnapshot()[0].phase, "interrupted");
+    assert.equal(h.state.mockRuns, 0); assert.equal(postedBodies(h).length, 1);
+  } finally { gate.resolve(json({ items: [] })); h.close(); }
+});
+
+test("8-B 결과 표시 확인 metadata 정리와 Schedule GET-only retry는 독립", async () => {
+  const h = harness({ actualScheduleSync: true }); try {
+    const execution = await liveSync8b(h, async () => error7a("ROUTE_NOT_FOUND", 404)), requestId = execution.reference.requestId;
+    await readyCleanup(h); clickCleanup(h, requestId, "result"); await readyCleanup(h);
+    assert.equal(await h.storage.read(execution.reference), null); assert.ok(syncRetry8b(h, requestId));
+    routeSync8b(h, async () => json({ items: [] })); syncRetry8b(h, requestId).props.onPress(); await h.settle();
+    assert.ok(textOf(syncStatus8b(h, requestId)).includes("동기화가 완료")); assert.equal(await h.storage.read(execution.reference), null);
+    assert.equal(postedBodies(h).length, 1); assert.equal(h.state.cleanup, 1); assert.equal(h.messages().at(-1).apiExecution.response.data.result.outcome, "success");
   } finally { h.close(); }
 });

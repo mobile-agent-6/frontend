@@ -15,6 +15,7 @@ import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useTheme } from "@/hooks/use-theme";
 import { assistantHttpClient } from "@/services/api/assistant";
 import { assistantLifecycle, type AssistantLifecycleSnapshot } from "@/services/api/assistant-lifecycle";
+import { assistantScheduleSync } from "@/services/api/assistant-schedule-sync";
 import { assistantOrchestrator, type AssistantExecutionResult, type AssistantRequestTask } from "@/services/api/assistant-orchestrator";
 import {
   resolveMockDeleteConfirmation,
@@ -57,6 +58,9 @@ export default function AssistantScreen() {
     selections: Readonly<Record<string, string>>; confirmations: Readonly<Record<string, boolean>>;
     expiredConfirmations: readonly string[] } | null>(null);
   const [recoverySnapshot, setRecoverySnapshot] = useState(assistantLifecycle.getSnapshot);
+  const [scheduleSyncSnapshot, setScheduleSyncSnapshot] = useState(assistantScheduleSync.getSnapshot);
+  const [retryingScheduleSync, setRetryingScheduleSync] = useState<readonly string[]>([]);
+  const scheduleSyncRetryLocksRef = useRef(new Set<string>());
   const [uncertainUi, setUncertainUi] = useState<{ serverId: string; generation: number; held: boolean;
     views: AssistantUncertainView[] } | null>(null);
   const [recoveryRecords, setRecoveryRecords] = useState<AssistantRecoveryMetadata[]>([]);
@@ -236,6 +240,16 @@ export default function AssistantScreen() {
       if (processingTimerRef.current !== null) clearTimeout(processingTimerRef.current);
       processingTimerRef.current = null;
     };
+  }, []);
+
+  useEffect(() => {
+    let subscribed = true;
+    const consume = () => {
+      if (subscribed && mountedRef.current) setScheduleSyncSnapshot(assistantScheduleSync.getSnapshot());
+    };
+    const unsubscribe = assistantScheduleSync.subscribe(consume);
+    consume();
+    return () => { subscribed = false; unsubscribe(); };
   }, []);
 
   useEffect(() => {
@@ -651,6 +665,34 @@ export default function AssistantScreen() {
     finally { cleanupLocksRef.current.delete(key); }
   };
 
+  const retryScheduleSync = async (reference: AssistantRecoveryReference, viewServerId: string | null, generation: number) => {
+    const ref = { serverId: reference.serverId, requestId: reference.requestId }, key = assistantRecoveryKey(ref);
+    const current = () => mountedRef.current && !isMockScheduleMode() && ref.serverId === viewServerId &&
+      assistantHttpClient.getServerId() === viewServerId && scheduleDataModeStore.getState().generation === generation;
+    if (!current() || scheduleSyncRetryLocksRef.current.has(key)) return;
+    const entry = assistantScheduleSync.getSnapshot().find(value => assistantRecoveryKey(value.reference) === key);
+    if (!entry || !["refresh-error", "interrupted"].includes(entry.phase)) return;
+    const message = committedMessagesRef.current.find(value => value.role === "assistant" && value.apiExecution &&
+      assistantRecoveryKey(value.apiExecution.reference) === key);
+    const execution = message?.role === "assistant" ? message.apiExecution : undefined;
+    const data = execution?.kind === "completed" ? parseAssistantRequestStatusResponse(execution.response.data) : null;
+    if (!data || data.status !== "completed" || data.requestId.toLowerCase() !== ref.requestId.toLowerCase() ||
+      data.result.kind !== "outcome" || data.result.outcome !== "success" || data.result.operation === "list" || !data.result.schedulesChanged) return;
+    scheduleSyncRetryLocksRef.current.add(key);
+    setRetryingScheduleSync([...scheduleSyncRetryLocksRef.current]);
+    try {
+      // 반환된 과거 상태를 메시지에 덮지 않는다. 최신 상태는 구독을 통해서만 읽는다.
+      await assistantScheduleSync.retry(ref);
+    } catch {
+      // 기존 실패 안내를 유지한다. 표시 예외가 Assistant POST나 Schedule write의 근거가 되지 않는다.
+      if (current()) setScheduleSyncSnapshot(assistantScheduleSync.getSnapshot());
+    } finally {
+      scheduleSyncRetryLocksRef.current.delete(key);
+      // 이 호출의 로컬 잠금만 해제하며 다른 요청의 메시지·입력·처리 상태는 변경하지 않는다.
+      if (mountedRef.current) setRetryingScheduleSync([...scheduleSyncRetryLocksRef.current]);
+    }
+  };
+
   const handleSend = () => {
     if (!isMockScheduleMode()) { void sendServerInput(); return; }
     const text = inputTextRef.current.trim();
@@ -829,6 +871,9 @@ export default function AssistantScreen() {
           expiredApiConfirmations={questionView?.expiredConfirmations}
           onApiConfirmation={(messageId, approved) => { if (!isMockScheduleMode()) void sendServerInput({ type: "confirmation", messageId, approved }); }}
           uncertainViews={uncertainView?.views}
+          scheduleSyncEntries={mockMode ? [] : scheduleSyncSnapshot.filter(entry => entry.reference.serverId === currentServerId)}
+          retryingScheduleSync={retryingScheduleSync}
+          onScheduleSyncRetry={reference => { void retryScheduleSync(reference, currentServerId, cleanupGeneration); }}
           recoveryControls={recoveryControls}
           recoveryStorageError={!mockMode && recoveryReadError}
           onRecoveryAction={(control, action) => { void handleRecoveryAction(control, action, currentServerId, cleanupGeneration); }}

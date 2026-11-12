@@ -14,6 +14,7 @@ import type { AssistantResultDisplay } from "@/utils/assistant-mapper";
 import { assistantFailureAdvice } from "@/utils/assistant-errors";
 import type { AssistantUncertainView } from "@/utils/assistant-uncertain";
 import type { AssistantRecoveryControl, AssistantRecoveryControlAction } from "@/utils/assistant-recovery-cleanup";
+import type { AssistantScheduleSyncEntry } from "@/services/api/assistant-schedule-sync";
 
 type AssistantMessageProps = {
   text: string;
@@ -36,6 +37,9 @@ type AssistantMessageProps = {
   onUncertainAcknowledge?: () => void;
   recoveryControl?: AssistantRecoveryControl;
   onRecoveryAction?: (action: AssistantRecoveryControlAction) => void;
+  scheduleSyncEntry?: AssistantScheduleSyncEntry;
+  scheduleSyncRetrying?: boolean;
+  onScheduleSyncRetry?: () => void;
 };
 
 export function AssistantMessage({
@@ -59,6 +63,9 @@ export function AssistantMessage({
   onUncertainAcknowledge,
   recoveryControl,
   onRecoveryAction,
+  scheduleSyncEntry,
+  scheduleSyncRetrying = false,
+  onScheduleSyncRetry,
 }: AssistantMessageProps) {
   const theme = useTheme();
   const confirmationDisabled = interactionsDisabled || interaction?.resolved || !onDeleteConfirmation;
@@ -73,6 +80,7 @@ export function AssistantMessage({
       {apiRecoveryText && <ThemedText type="small" themeColor="primaryForeground">{apiRecoveryText}</ThemedText>}
       {apiResult && <ApiResultDetails result={apiResult} onCandidateSelection={onApiCandidateSelection} selectedCandidateId={selectedApiCandidateId}
         onConfirmation={onApiConfirmation} selectedApproval={selectedApiApproval} confirmationExpired={apiConfirmationExpired} />}
+      {scheduleSyncEntry && <ScheduleSyncStatus entry={scheduleSyncEntry} retrying={scheduleSyncRetrying} onRetry={onScheduleSyncRetry} />}
       {uncertainView && <UncertainActions value={uncertainView} errorText={uncertainErrorText} disabled={uncertainActionsDisabled}
         onCheck={onUncertainCheck} onAcknowledge={onUncertainAcknowledge} />}
       {!apiResult && schedules?.map((schedule) => (
@@ -91,6 +99,23 @@ export function AssistantMessage({
       {recoveryControl && <RecoveryActions value={recoveryControl} onAction={onRecoveryAction} />}
     </ThemedView>
   );
+}
+
+function ScheduleSyncStatus({ entry, retrying, onRetry }: { entry: AssistantScheduleSyncEntry; retrying: boolean; onRetry?: () => void }) {
+  const theme = useTheme();
+  const canRetry = entry.phase === "refresh-error" || entry.phase === "interrupted";
+  return <View testID="assistant-schedule-sync-status" style={styles.candidates} accessibilityLiveRegion="polite">
+    <ThemedText type="small" themeColor="primaryForeground">{retrying || entry.phase === "refreshing"
+      ? "일정 변경은 완료됐어요. 목록을 최신화하고 있어요."
+      : entry.phase === "synchronized" ? "이 요청의 목록 동기화가 완료됐어요."
+      : entry.phase === "interrupted" ? "일정 변경은 완료됐지만 목록 확인이 중단됐어요. 현재 서버에서 GET으로 다시 확인해 주세요."
+      : "일정 변경은 완료됐지만 목록 갱신에 실패했어요. 이전 정보가 표시될 수 있어요. GET 조회만 다시 시도해 주세요."}</ThemedText>
+    {canRetry && <Pressable testID="assistant-schedule-sync-retry" accessibilityRole="button" disabled={retrying || !onRetry}
+      accessibilityState={{ disabled: retrying || !onRetry }} onPress={retrying ? undefined : onRetry}
+      style={[styles.buttonBase, { backgroundColor: theme.primaryForeground }, (retrying || !onRetry) && styles.disabled]}>
+      <ThemedText themeColor="primary">목록 다시 불러오기</ThemedText>
+    </Pressable>}
+  </View>;
 }
 
 function RecoveryActions({ value, onAction }: { value: AssistantRecoveryControl;

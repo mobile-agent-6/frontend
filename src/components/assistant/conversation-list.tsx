@@ -14,6 +14,8 @@ import { assistantResultToDisplay } from "@/utils/assistant-mapper";
 import type { AssistantCandidateQuestion, AssistantConfirmationQuestion } from "@/utils/assistant-text-question";
 import { assistantErrorRecoveryNotice, assistantHttpErrorNotice, getAssistantExecutionError, type AssistantErrorRecoveryNotice } from "@/utils/assistant-errors";
 import type { AssistantUncertainView } from "@/utils/assistant-uncertain";
+import type { AssistantScheduleSyncEntry } from "@/services/api/assistant-schedule-sync";
+import type { AssistantRecoveryReference } from "@/types/assistant-recovery";
 import { assistantRecoveryKey, type AssistantRecoveryControl, type AssistantRecoveryControlAction } from "@/utils/assistant-recovery-cleanup";
 
 // 화면 메시지와 공개 API 결과를 구분하며 API 원형은 현재 실행 세션에만 보관한다.
@@ -63,6 +65,9 @@ type ConversationListProps = {
   recoveryControls?: readonly AssistantRecoveryControl[];
   recoveryStorageError?: boolean;
   onRecoveryAction?: (control: AssistantRecoveryControl, action: AssistantRecoveryControlAction) => void;
+  scheduleSyncEntries?: readonly AssistantScheduleSyncEntry[];
+  retryingScheduleSync?: readonly string[];
+  onScheduleSyncRetry?: (reference: AssistantRecoveryReference) => void;
 };
 
 export function ConversationList({
@@ -85,6 +90,9 @@ export function ConversationList({
   recoveryControls,
   recoveryStorageError,
   onRecoveryAction,
+  scheduleSyncEntries,
+  retryingScheduleSync,
+  onScheduleSyncRetry,
 }: ConversationListProps) {
   const listRef = useRef<FlatList<ConversationMessage>>(null);
   const messageCount = messages.length;
@@ -247,6 +255,9 @@ export function ConversationList({
         ) : (
           <AssistantMessage
             text={item.text}
+            scheduleSyncEntry={scheduleSyncForMessage(item, scheduleSyncEntries)}
+            scheduleSyncRetrying={Boolean(item.apiExecution && retryingScheduleSync?.includes(assistantRecoveryKey(item.apiExecution.reference)))}
+            onScheduleSyncRetry={item.apiExecution && onScheduleSyncRetry ? () => onScheduleSyncRetry(item.apiExecution!.reference) : undefined}
             recoveryControl={item.apiExecution ? recoveryControls?.find(control =>
               assistantRecoveryKey(control.reference) === assistantRecoveryKey(item.apiExecution!.reference)) : undefined}
             onRecoveryAction={item.apiExecution && onRecoveryAction ? action => {
@@ -299,6 +310,14 @@ export function ConversationList({
       }
     />
   );
+}
+
+function scheduleSyncForMessage(message: ConversationMessage, entries?: readonly AssistantScheduleSyncEntry[]) {
+  const execution = message.role === "assistant" ? message.apiExecution : undefined;
+  if (execution?.kind !== "completed") return;
+  const result = execution.response.data.result;
+  if (result.kind !== "outcome" || result.outcome !== "success" || result.operation === "list" || !result.schedulesChanged) return;
+  return entries?.find(entry => assistantRecoveryKey(entry.reference) === assistantRecoveryKey(execution.reference));
 }
 
 function UserMessage({ text }: { text: string }) {

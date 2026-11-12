@@ -219,3 +219,11 @@ test("8-A 후속 UI snapshot·반환 오류 상태는 불변이며 구독자 예
   assert.ok(Object.isFrozen(failed.errors[0].error.problem)); assert.equal(failed.phase, "refresh-error");
   assert.notStrictEqual(failed.errors[0].error, h.entry(failed.failedQueries[0]).error); off();
 });
+
+test("8-B 기존 Schedule GET 재시도가 성공하면 이전 동기화 실패 상태도 해제", async () => {
+  const h = harness(), owner = h.cache.acquire(query); await tick(); h.reply(0, [dto()]); await owner.promise;
+  const pending = h.sync.observe(ref(), success()); await tick(); h.calls[1].resolve(problem()); await pending;
+  assert.equal(h.sync.getSnapshot()[0].phase, "refresh-error");
+  const retry = owner.retry(); await tick(); h.reply(2, [dto(200, { title: "기존 GET 경로의 최신 결과" })]); await retry; await tick();
+  assert.equal(h.sync.getSnapshot()[0].phase, "synchronized"); assert.equal(h.calls.length, 3); owner.release();
+});

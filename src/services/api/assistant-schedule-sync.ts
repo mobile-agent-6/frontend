@@ -30,10 +30,27 @@ export function createAssistantScheduleSync({ cache = serverScheduleStore, readS
   const subscribers = new Set<() => void>();
   let snapshot: readonly AssistantScheduleSyncEntry[] = Object.freeze([]);
   let tail: Promise<unknown> = Promise.resolve();
+  let unsubscribeFailedQueries: (() => void) | undefined;
+  function reconcileFailedQueries() {
+    const state = cache.store.getState();
+    for (const [key, entry] of [...entries]) {
+      if (entry.phase !== "refresh-error" || !entry.failedQueries.length || flights.has(key) ||
+        mode.getState().mode !== "server" || readServerId() !== entry.reference.serverId || state.serverId !== entry.reference.serverId) continue;
+      const queries = state.servers[entry.reference.serverId]?.queries;
+      if (entry.failedQueries.every(query => {
+        const current = queries?.[scheduleQueryKey(entry.reference.serverId, query)];
+        return current?.status === "success" && !current.stale;
+      })) publish({ ...entry, phase: "synchronized", failedQueries: [], errors: [] });
+    }
+  }
   function publish(entry: AssistantScheduleSyncEntry) {
     const saved = immutable(entry);
     entries.set(keyOf(entry.reference), saved);
     snapshot = Object.freeze([...entries.values()]);
+    // 기존 목록 화면의 GET-only 재시도·stale 재조회 성공도 같은 실패 안내를 해제한다. 새 GET은 시작하지 않는다.
+    const needsWatch = [...entries.values()].some(value => value.phase === "refresh-error" && value.failedQueries.length);
+    if (needsWatch && !unsubscribeFailedQueries) unsubscribeFailedQueries = cache.store.subscribe(reconcileFailedQueries);
+    else if (!needsWatch && unsubscribeFailedQueries) { unsubscribeFailedQueries(); unsubscribeFailedQueries = undefined; }
     for (const listener of [...subscribers]) { try { listener(); } catch {} }
     return saved;
   }
@@ -64,7 +81,10 @@ export function createAssistantScheduleSync({ cache = serverScheduleStore, readS
           failedQueries: previous?.failedQueries ?? [], errors: previous?.errors ?? [] };
         return publish(entry);
       }
-    }).finally(() => { if (flights.get(key) === promise) flights.delete(key); });
+    }).finally(() => {
+      if (flights.get(key) === promise) flights.delete(key);
+      reconcileFailedQueries();
+    });
     tail = promise.catch(() => undefined);
     flights.set(key, promise);
     return promise;
