@@ -10,12 +10,16 @@ import {
 import { useEffect, useRef } from "react";
 import { Platform, useColorScheme } from "react-native";
 
+import { assistantLifecycle } from "@/services/api/assistant-lifecycle";
+
 export default function RootLayout() {
   const colorScheme = useColorScheme();
   const navigationRef = useNavigationContainerRef();
   const pathname = usePathname();
   const router = useRouter();
   const hasHandledInitialRoute = useRef(false);
+
+  useEffect(() => assistantLifecycle.attach(), []);
 
   useEffect(() => {
     const handleInitialRoute = () => {

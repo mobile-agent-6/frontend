@@ -2,7 +2,8 @@ import { SymbolView } from "expo-symbols";
 import { useRouter } from "expo-router";
 import { useMemo, useState } from "react";
 import { useStore } from "zustand";
-import { FlatList, Pressable, ScrollView, StyleSheet, View } from "react-native";
+import { FlatList, Pressable, StyleSheet, View } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import {
   CategoryFilter,
@@ -26,6 +27,7 @@ export default function ScheduleListScreen() {
   const theme = useTheme();
   const colorScheme = useColorScheme();
   const router = useRouter();
+  const insets = useSafeAreaInsets();
   const openSchedule = useScheduleEditNavigation();
   const [selectedCategory, setSelectedCategory] =
     useState<ScheduleCategoryFilter>("전체");
@@ -44,13 +46,17 @@ export default function ScheduleListScreen() {
     !server.error && !server.refreshPending && !completionError;
   const loading = serverMode && server.initialLoading;
   const canShowEmpty = serverMode ? server.success : !readError || hasSuccessfulRead;
+  const hasFeedback = Boolean(readError || needsRefresh || completionError);
+  const initialReadError = readError && !hasSuccessfulRead && schedules.length === 0;
   const feedback = <>
     {readError && !(serverMode && server.completionRefreshFailed) && <ScheduleListState state="error" onRetry={retryRead}
+      variant={initialReadError ? "centered" : "card"}
+      compactRetryButton={initialReadError}
       errorTitle={hasSuccessfulRead ? "최신 정보를 불러오지 못했어요. 이전 정보를 표시하고 있어요." : undefined} />}
-    {needsRefresh && <ScheduleListState state="notice" errorTitle="일정 정보를 다시 확인해 주세요." onRetry={retryRead} retryLabel="GET 다시 조회" />}
+    {needsRefresh && <ScheduleListState state="notice" errorTitle="일정 정보를 다시 확인해 주세요." onRetry={retryRead} retryLabel="일정 다시 불러오기" />}
     {completionError && <ScheduleListState state={serverMode ? completion.completionNoticeState : "error"}
       errorTitle={serverMode ? completion.completionError ?? undefined : "완료 상태를 변경하지 못했어요."}
-      onRetry={retryCompletion} retryLabel={serverMode ? "GET 상태 확인" : undefined} />}
+      onRetry={retryCompletion} retryLabel={serverMode ? "완료 상태 확인하기" : undefined} />}
   </>;
 
   const visibleSchedules = useMemo(
@@ -67,6 +73,12 @@ export default function ScheduleListScreen() {
       );
     },
     [schedules, selectedCategory, serverMode],
+  );
+  const centeredContent = visibleSchedules.length === 0 && (!hasFeedback || !hasSuccessfulRead);
+  // 탭은 별도 레이아웃이다. 오류 카드 끝까지 FAB 위로 올려 볼 수 있는 스크롤 공간을 둔다.
+  const feedbackBottomPadding = Math.max(
+    centeredContent ? BottomTabInset + 120 : 96,
+    Spacing.four + 58 + Spacing.three + insets.bottom,
   );
 
   return (
@@ -92,7 +104,8 @@ export default function ScheduleListScreen() {
         keyExtractor={(schedule) => schedule.id}
         contentContainerStyle={[
           styles.listContent,
-          visibleSchedules.length === 0 && styles.emptyListContent,
+          centeredContent && styles.emptyListContent,
+          hasFeedback && { paddingBottom: feedbackBottomPadding },
         ]}
         ItemSeparatorComponent={ScheduleSeparator}
         ListEmptyComponent={
@@ -104,13 +117,15 @@ export default function ScheduleListScreen() {
           )
         }
         ListHeaderComponent={
-          (!serverMode || !hasSuccessfulRead) && (readError || completionError || loading) ? (
-            <View style={!serverMode && visibleSchedules.length > 0 ? styles.errorHeader : undefined}>
+          (hasFeedback || loading) ? (
+            <View testID={hasFeedback ? "schedule-list-feedback" : undefined}
+              style={[hasFeedback && styles.noticeStack, visibleSchedules.length > 0 && styles.errorHeader]}>
               {loading && <ScheduleListState state="loading" />}
               {feedback}
             </View>
           ) : undefined
         }
+        ListHeaderComponentStyle={hasFeedback ? styles.noticeHeader : undefined}
         renderItem={({ item }) => (
           <ScheduleCard
             schedule={item}
@@ -120,12 +135,6 @@ export default function ScheduleListScreen() {
           />
         )}
       />
-
-      {serverMode && hasSuccessfulRead && (readError || needsRefresh || completionError) && (
-        <ScrollView testID="schedule-feedback" style={styles.feedback} contentContainerStyle={styles.feedbackContent}>
-          {feedback}
-        </ScrollView>
-      )}
 
       <Pressable
         accessibilityLabel="새 일정 추가"
@@ -173,9 +182,9 @@ const styles = StyleSheet.create({
   separator: {
     height: 12,
   },
-  feedback: { flexGrow: 0, maxHeight: "40%" },
-  feedbackContent: { gap: Spacing.two, padding: Spacing.three, paddingRight: 84 },
-  errorHeader: { marginBottom: 24 },
+  noticeStack: { gap: Spacing.two },
+  errorHeader: { marginBottom: Spacing.four },
+  noticeHeader: { alignSelf: "stretch" },
   addButton: {
     position: "absolute",
     right: Spacing.four,

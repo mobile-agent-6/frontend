@@ -312,6 +312,44 @@ export function createServerScheduleStore({
     });
     return { ok: failedQueries.length === 0, failedQueries };
   }
+
+  /** Assistant의 확정 변경 뒤 GET만 수행한다. 수동 mutation·상태 확인 중에는 조회 장벽을 기다린다. */
+  async function refreshAfterExternalChange(expectedServerId: string, affectedIds: readonly string[],
+    options: { isCurrent: () => boolean; retryQueries?: ScheduleListQuery[] }) {
+    const generation = scheduleDataModeStore.getState().generation;
+    const current = () => options.isCurrent() && readServerId() === expectedServerId &&
+      scheduleDataModeStore.getState().mode === "server" && scheduleDataModeStore.getState().generation === generation;
+    const idle = () => mutationControllers.size === 0 && checking.size === 0;
+    if (!current()) return { ok: false, failedQueries: options.retryQueries ?? [], interrupted: true };
+    while (current() && !idle()) await new Promise<void>(resolve => {
+      let finished = false, scheduled = false;
+      const check = () => {
+        if (finished || (current() && !idle())) return;
+        finished = true; unsubscribeStore(); unsubscribeMode(); resolve();
+      };
+      // mutation의 마지막 store 알림 뒤 finally에서 잠금이 풀리는 시점까지 기다린다.
+      const schedule = () => { if (!scheduled) { scheduled = true; void Promise.resolve().then(() => { scheduled = false; check(); }); } };
+      const unsubscribeStore = store.subscribe(schedule), unsubscribeMode = scheduleDataModeStore.subscribe(schedule);
+      schedule();
+    });
+    if (!current() || syncServer() !== expectedServerId) return { ok: false, failedQueries: options.retryQueries ?? [], interrupted: true };
+    let invalidated = false;
+    const unsubscribe = scheduleDataModeStore.subscribe(() => {
+      if (!current() && !invalidated && store.getState().serverId === expectedServerId) {
+        invalidated = true; invalidate();
+      }
+    });
+    try {
+      if (!options.retryQueries) {
+        // ID는 단건 캐시 무효화에만 사용한다. 객체·목록·삭제 tombstone은 GET 없이 만들지 않는다.
+        for (const [key, flight] of flights) if (flight.detailId && affectedIds.includes(flight.detailId)) cancel(key, true);
+        update(expectedServerId, cache => ({ ...cache, details: Object.fromEntries(Object.entries(cache.details).map(([id, entry]) =>
+          [id, affectedIds.includes(id) ? { ...entry, stale: true } : entry])) }));
+      }
+      const result = await refreshLists(expectedServerId, options.retryQueries);
+      return { ...result, interrupted: !current() };
+    } finally { unsubscribe(); }
+  }
   /** 확인된 write 응답만 반영한다. 이전 GET은 취소하고 새 객체 버전 경계를 만든다. */
   function applyScheduleResult(expectedServerId: string, schedule: Schedule) {
     if (syncServer() !== expectedServerId) return false;
@@ -523,7 +561,7 @@ export function createServerScheduleStore({
           message: "목록을 갱신하지 못했어요. GET 조회만 다시 시도해 주세요." });
     } finally { checking.delete(key); }
   }
-  return { store, syncServer, acquire, acquireDetail, invalidate, refreshLists, applyScheduleResult,
+  return { store, syncServer, acquire, acquireDetail, invalidate, refreshLists, refreshAfterExternalChange, applyScheduleResult,
     beginMutation, completionAllowed, toggleCompleted, checkCompletion,
     deletionAllowed, deleteSchedule, checkDeletion,
     retryDetail: (scheduleId: string) => fetchDetail(scheduleId, true),

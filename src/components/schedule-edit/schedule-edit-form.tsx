@@ -14,6 +14,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { ScheduleCategorySelector } from "@/components/schedule-create/schedule-category-selector";
 import { ScheduleDateField } from "@/components/schedule-create/schedule-date-field";
 import { ScheduleTimeField } from "@/components/schedule-create/schedule-time-field";
+import { ScheduleErrorNotice } from "@/components/schedule-list/schedule-error-notice";
 import { Button } from "@/components/ui/button";
 import { ThemedText } from "@/components/ui/themed-text";
 import { ThemedView } from "@/components/ui/themed-view";
@@ -33,7 +34,11 @@ type ScheduleEditFormProps = {
   onSave: (updates: Partial<Schedule>, original: Schedule) => void;
   actionLocked: boolean;
   actionError: string | null;
+  errorTitle?: string;
+  readError?: string | null;
   onRetryRead?: () => void;
+  onRetryDetailRead?: () => void;
+  retryReadLabel?: string;
   retryReadDisabled?: boolean;
 };
 
@@ -42,7 +47,11 @@ export function ScheduleEditForm({
   onSave,
   actionLocked,
   actionError,
+  errorTitle = "일정 정보를 확인해 주세요.",
+  readError,
   onRetryRead,
+  onRetryDetailRead,
+  retryReadLabel = "일정 정보 다시 불러오기",
   retryReadDisabled,
 }: ScheduleEditFormProps) {
   const theme = useTheme();
@@ -213,25 +222,29 @@ export function ScheduleEditForm({
               ) : null}
             </View>
 
-            <ScheduleCategorySelector
-              category={category}
-              onSelectCategory={(value) => {
-                setCategory(value);
-                setFormError(null);
-              }}
-            />
+            <View style={styles.categorySection}>
+              <ScheduleCategorySelector
+                category={category}
+                onSelectCategory={(value) => {
+                  setCategory(value);
+                  setFormError(null);
+                }}
+              />
 
-            {formError || actionError ? (
-              <View accessibilityRole="alert" style={styles.formError}>
-                <ThemedText
-                  type="small"
-                  style={[styles.formErrorText, { color: theme.primary }]}
-                >
-                  {formError ?? actionError}
-                </ThemedText>
-                {onRetryRead && <Button label="서버 상태 다시 불러오기" onPress={onRetryRead} disabled={retryReadDisabled} />}
-              </View>
-            ) : null}
+              {formError || actionError || readError ? (
+                <ScheduleErrorNotice
+                  testID="schedule-edit-feedback"
+                  title={errorTitle}
+                  description={[formError, actionError]}
+                  secondaryDescription={readError}
+                  disabled={retryReadDisabled}
+                  actions={[
+                    ...(onRetryRead ? [{ key: "read", label: retryReadLabel, onPress: onRetryRead }] : []),
+                    ...(onRetryDetailRead ? [{ key: "detail", label: "일정 정보 다시 불러오기", onPress: onRetryDetailRead }] : []),
+                  ]}
+                />
+              ) : null}
+            </View>
           </ScrollView>
 
           <View
@@ -290,14 +303,8 @@ const styles = StyleSheet.create({
   picker: {
     minHeight: 180,
   },
-  formError: {
-    borderRadius: 12,
-    paddingHorizontal: Spacing.three,
-    paddingVertical: Spacing.two,
-  },
-  formErrorText: {
-    fontWeight: "600",
-    textAlign: "center",
+  categorySection: {
+    gap: Spacing.four,
   },
   footer: {
     flexShrink: 0,

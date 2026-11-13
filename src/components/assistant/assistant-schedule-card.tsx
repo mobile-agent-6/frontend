@@ -7,7 +7,10 @@ import { useTheme } from "@/hooks/use-theme";
 import type { Schedule } from "@/types/schedule";
 
 type AssistantScheduleCardProps = {
-  schedule: Schedule;
+  // 후보 DTO에 없는 일정 ID·완료 여부를 표시 때문에 만들어 넣지 않는다.
+  schedule: Pick<Schedule, "title" | "date" | "time" | "category"> & { completed?: boolean };
+  showCompleted?: boolean;
+  compact?: boolean;
 };
 
 function formatCardDate(date: string) {
@@ -26,20 +29,29 @@ function formatCardTime(time: string) {
   return `${period} ${hour % 12 || 12}:${String(minute).padStart(2, "0")}`;
 }
 
-export function AssistantScheduleCard({ schedule }: AssistantScheduleCardProps) {
+export function formatAssistantCardDateTime(date: string, time: string) {
+  return `${formatCardDate(date)} ${formatCardTime(time)}`;
+}
+
+export function AssistantScheduleCard({ schedule, showCompleted = false, compact = false }: AssistantScheduleCardProps) {
   const theme = useTheme();
 
   return (
-    <ThemedView style={styles.card}>
-      <View style={[styles.badge, { backgroundColor: theme.primaryMuted }]}>
+    <ThemedView style={[styles.card, compact && styles.compactCard]}>
+      <View style={[styles.badge, compact && styles.compactBadge, { backgroundColor: theme.primaryMuted }]}>
         <ThemedText type="smallBold" themeColor="primary">
           {schedule.category}
         </ThemedText>
       </View>
       <ThemedText style={styles.title}>{schedule.title}</ThemedText>
       <ThemedText type="small" themeColor="textSecondary">
-        {`${formatCardDate(schedule.date)} ${formatCardTime(schedule.time)}`}
+        {formatAssistantCardDateTime(schedule.date, schedule.time)}
       </ThemedText>
+      {showCompleted && schedule.completed !== undefined && (
+        <ThemedText type="small" themeColor="textSecondary">
+          {schedule.completed ? "완료" : "미완료"}
+        </ThemedText>
+      )}
     </ThemedView>
   );
 }
@@ -56,6 +68,16 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     paddingHorizontal: Spacing.two,
     paddingVertical: Spacing.one,
+  },
+  compactCard: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    paddingRight: 36,
+    gap: 4,
+    borderRadius: 12,
+  },
+  compactBadge: {
+    paddingVertical: 2,
   },
   title: {
     fontWeight: "700",

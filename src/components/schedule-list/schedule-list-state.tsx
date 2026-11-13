@@ -1,5 +1,6 @@
-import { ActivityIndicator, Pressable, StyleSheet, View } from "react-native";
+import { ActivityIndicator, StyleSheet, View } from "react-native";
 
+import { ScheduleErrorNotice } from "@/components/schedule-list/schedule-error-notice";
 import { ThemedText } from "@/components/ui/themed-text";
 import { Spacing } from "@/constants/theme";
 import { useTheme } from "@/hooks/use-theme";
@@ -12,6 +13,10 @@ type ScheduleListStateProps = {
   emptyText?: string;
   errorTitle?: string;
   retryLabel?: string;
+  retryDisabled?: boolean;
+  retryLoading?: boolean;
+  variant?: "card" | "centered";
+  compactRetryButton?: boolean;
 };
 
 export function ScheduleListState({
@@ -20,6 +25,10 @@ export function ScheduleListState({
   emptyText = "등록된 일정이 없어요.",
   errorTitle = "일정을 불러오지 못했어요.",
   retryLabel = "다시 시도",
+  retryDisabled,
+  retryLoading,
+  variant = "card",
+  compactRetryButton = false,
 }: ScheduleListStateProps) {
   const theme = useTheme();
 
@@ -49,23 +58,14 @@ export function ScheduleListState({
   }
 
   return (
-    <View
-      accessibilityRole={state === "error" ? "alert" : undefined}
-      accessibilityLiveRegion="polite"
-      style={[styles.container, styles.errorContainer]}
-    >
-      <ThemedText style={styles.errorTitle}>
-        {errorTitle}
-      </ThemedText>
-      <ThemedText type="small" themeColor="textSecondary">
-        {state === "notice" ? "GET으로 최신 상태를 확인할 수 있어요." : "잠시 후 다시 시도해 주세요."}
-      </ThemedText>
-      {onRetry && (
-        <Pressable accessibilityRole="button" onPress={onRetry} hitSlop={Spacing.two} style={styles.retryButton}>
-          <ThemedText themeColor="primary">{retryLabel}</ThemedText>
-        </Pressable>
-      )}
-    </View>
+    <ScheduleErrorNotice
+      title={errorTitle}
+      description={state === "notice" ? "최신 정보를 다시 불러와 상태를 확인할 수 있어요." : "잠시 후 다시 시도해 주세요."}
+      tone={state}
+      variant={variant}
+      compactActions={compactRetryButton}
+      actions={onRetry ? [{ key: "retry", label: retryLabel, onPress: onRetry, disabled: retryDisabled, loading: retryLoading }] : []}
+    />
   );
 }
 
@@ -74,16 +74,6 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     gap: Spacing.two,
-  },
-  errorContainer: {
-    gap: Spacing.one,
-  },
-  errorTitle: {
-    fontSize: 16,
-    fontWeight: "600",
-  },
-  retryButton: {
-    marginTop: 8,
   },
   emptyText: {
     fontSize: 15,

@@ -9,8 +9,11 @@ const root = path.resolve(__dirname, "..");
 
 // 실제 화면·Hook·서비스를 실행하되 native 컴포넌트와 React 실행기만 메모리 대역으로 둔다.
 // native 렌더링·레이아웃·아이폰 통신을 검증하는 테스트는 아니다.
-function harness(initialMode, { readOnly = false } = {}) {
+function harness(initialMode, { readOnly = false, assistantSyncUi = false, assistantDetails = false, compileEditScreen = false, platform = "ios", renderListState = false, colorScheme = "light", bottomInset = 0 } = {}) {
   const modules = new Map(), screens = [], calls = [], navigations = [];
+  const assistantListeners = new Set();
+  const theme = { background: colorScheme === "dark" ? "#000000" : "white", backgroundElement: colorScheme === "dark" ? "#212225" : "#F0F0F3", primary: "#FB6C2D", destructive: "red" };
+  let assistantSnapshot;
   let current;
   const router = { push: (route) => navigations.push(route), back: () => navigations.push("back") };
   const navigationRef = { isReady: () => true, addListener: () => () => {} };
@@ -39,6 +42,11 @@ function harness(initialMode, { readOnly = false } = {}) {
       });
     },
   };
+  const toolbar = Object.assign(function MockStackToolbar(props) {
+    // Expo composition에 전달되는 props 참조만 보존하며 native 렌더링은 재현하지 않는다.
+    (current.root ?? current).toolbarProps = props;
+    return { type: "Stack.Toolbar", props };
+  }, { View: "Stack.Toolbar.View" });
   const useStore = (store, select = (s) => s) => {
     const owner = current;
     react.useEffect(() => store.subscribe(() => mark(owner)), [store]);
@@ -49,18 +57,38 @@ function harness(initialMode, { readOnly = false } = {}) {
     const filename = path.join(root, file);
     if (modules.has(filename)) return modules.get(filename).exports;
     const module = { exports: {} }; modules.set(filename, module);
-    const code = ts.transpileModule(fs.readFileSync(filename, "utf8"), { compilerOptions: {
+    let input = fs.readFileSync(filename, "utf8");
+    if (compileEditScreen && file === "src/app/schedule/[id].tsx") {
+      input = require("@babel/core").transformSync(input, {
+        filename, configFile: false, babelrc: false,
+        parserOpts: { plugins: ["typescript", "jsx"] },
+        plugins: [["babel-plugin-react-compiler", { target: "19" }]],
+      }).code;
+    }
+    const code = ts.transpileModule(input, { compilerOptions: {
       module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX,
     }, fileName: filename }).outputText;
     const resolve = (name) => {
+      // Assistant의 서버 통신 검증은 전용 화면 테스트에서 실행한다.
+      if (name === "@/services/api/assistant") return { assistantHttpClient: { getServerId: () => assistantSyncUi && config?.status === "ready" ? config.config.serverId : null } };
+      if (name === "@/services/api/assistant-orchestrator") return { assistantOrchestrator: { startRequest: () => { throw new Error("Schedule 화면 검증에서 Assistant 전송 금지"); } } };
+      // Schedule 화면 검증은 앱 복구와 분리하고 실제 root 연결은 lifecycle 테스트에서 검증한다.
+      if (name === "@/services/api/assistant-lifecycle") return { assistantLifecycle: { attach: () => () => {},
+        getSnapshot: () => assistantSnapshot ?? { phase: assistantSyncUi ? "settled" : "idle", initialCheck: assistantSyncUi ? "checked" : "pending",
+          serverId: assistantSyncUi && config?.status === "ready" ? config.config.serverId : null, results: [] },
+        subscribe: listener => { assistantListeners.add(listener); return () => assistantListeners.delete(listener); } } };
+      if (name === "@/services/storage/assistant-recovery") return { assistantRecoveryStorage: { readAll: async () => [] } };
       if (name === "react") return react;
+      if (name === "react/compiler-runtime") return { c(size) {
+        return current.slots[current.cursor++] ??= Array(size).fill(Symbol.for("react.memo_cache_sentinel"));
+      } };
       if (name === "react/jsx-runtime") return { jsx: (type, props, key) => ({ type, props, key }), jsxs: (type, props, key) => ({ type, props, key }) };
       if (name === "zustand/vanilla") return require(name);
       if (name === "zustand") return { useStore, create: (initializer) => {
         const store = require("zustand/vanilla").createStore(initializer);
         return Object.assign((select) => useStore(store, select), store);
       } };
-      if (name === "expo-router") return { Stack: { Screen: "Stack.Screen" }, ThemeProvider: "ThemeProvider", DarkTheme: {}, DefaultTheme: {},
+      if (name === "expo-router") return { Stack: { Screen: "Stack.Screen", Toolbar: toolbar }, ThemeProvider: "ThemeProvider", DarkTheme: {}, DefaultTheme: {},
         useNavigationContainerRef: () => navigationRef, usePathname: () => "/assistant",
         useFocusEffect(effect) {
           const owner = current.root ?? current;
@@ -78,23 +106,29 @@ function harness(initialMode, { readOnly = false } = {}) {
         calls.push({ url, ...options, resolve, reject, transport: "expo" })) };
       if (name === "@/constants/theme") return { Spacing: { half: 2, one: 4, two: 8, three: 16, four: 24, five: 32, six: 64 }, BottomTabInset: 0 };
       if (name === "react-native") return { ...Object.fromEntries(["FlatList", "Pressable", "View", "ScrollView", "TextInput", "KeyboardAvoidingView", "ActivityIndicator"].map((s) => [s, s])),
-        Platform: { OS: "ios" }, useColorScheme: () => "light", Keyboard: { dismiss() {} }, StyleSheet: { create: (s) => s, hairlineWidth: 0.5 } };
+        Platform: { OS: platform }, useColorScheme: () => "light", Keyboard: { dismiss() {} }, StyleSheet: { create: (s) => s, hairlineWidth: 0.5 } };
       if (name === "@expo/ui/community/datetime-picker") return { DateTimePicker: "DateTimePicker" };
-      if (name === "react-native-safe-area-context") return { SafeAreaView: "SafeAreaView" };
+      if (name === "react-native-safe-area-context") return { SafeAreaView: "SafeAreaView", useSafeAreaInsets: () => ({ top: 0, bottom: bottomInset, left: 0, right: 0 }) };
       if (name === "@/components/schedule-edit/schedule-edit-form") return source("src/components/schedule-edit/schedule-edit-form.tsx");
       if (name === "@/components/schedule-create/schedule-create-form") return source("src/components/schedule-create/schedule-create-form.tsx");
+      if (name === "@/components/schedule-list/schedule-error-notice") return source("src/components/schedule-list/schedule-error-notice.tsx");
+      if (renderListState && name === "@/components/schedule-list/schedule-list-state") return source("src/components/schedule-list/schedule-list-state.tsx");
       if (name.startsWith("@/components/")) {
         const component = name.split("/").at(-1).split("-").map((s) => s[0].toUpperCase() + s.slice(1)).join("");
         return { [component]: component };
       }
-      if (name === "@/hooks/use-theme") return { useTheme: () => ({ background: "white", primary: "#FB6C2D", destructive: "red" }) };
-      if (name === "@/hooks/use-color-scheme") return { useColorScheme: () => "light" };
+      if (name === "@/hooks/use-theme") return { useTheme: () => theme };
+      if (name === "@/hooks/use-color-scheme") return { useColorScheme: () => colorScheme };
       assert.ok(name.startsWith("@/")); return source(`src/${name.slice(2)}.ts`);
     };
     new Function("require", "module", "exports", "fetch", "Date", "process", code)(resolve, module, module.exports,
       (url, options) => new Promise((resolve, reject) => calls.push({ url, ...options, resolve, reject, transport: "global" })), FixedDate,
       { env: { EXPO_PUBLIC_SCHEDULE_DATA_MODE: initialMode,
         EXPO_PUBLIC_SCHEDULE_READ_ONLY: String(readOnly) } });
+    // 기존 목록·필터 회귀는 단건 카드 조회와 분리하며 카드 통합 사례에서만 함께 실행한다.
+    if (file === "src/services/api/assistant-schedule-sync.ts" && !assistantDetails) {
+      module.exports.assistantScheduleSync = module.exports.createAssistantScheduleSync();
+    }
     return module.exports;
   }
   const configModule = source("src/services/api/config.ts");
@@ -119,7 +153,12 @@ function harness(initialMode, { readOnly = false } = {}) {
       const result = node.type(node.props); while (child.effects.length) child.effects.shift()();
       return expand(result, rootScreen, key, seen);
     }
-    return { ...node, props: { ...node.props, children: expand(node.props?.children, rootScreen, `${trail}/children`, seen) } };
+    return { ...node, props: { ...node.props, children: expand(node.props?.children, rootScreen, `${trail}/children`, seen),
+      ...(renderListState && node.type === "FlatList" ? {
+        ListHeaderComponent: expand(node.props?.ListHeaderComponent, rootScreen, `${trail}/header`, seen),
+        ListEmptyComponent: expand(node.props?.ListEmptyComponent, rootScreen, `${trail}/empty`, seen),
+      } : {}),
+    } };
   }
   function flush() {
     let limit = 40;
@@ -143,9 +182,11 @@ function harness(initialMode, { readOnly = false } = {}) {
   }
   function mount(kind, routeId) {
     const s = { slots: [], effects: [], children: new Map(), dirty: true, routeId, focused: true, focusEffects: new Set(),
-      Screen: source(kind === "detail" ? "src/app/schedule/[id].tsx" : kind === "create" ? "src/app/schedule/create.tsx" : kind === "layout" ? "src/app/_layout.tsx" : `src/app/(tabs)/${kind}.tsx`).default };
+      Screen: kind === "notice" ? () => ({ type: source("src/components/schedule-list/schedule-error-notice.tsx").ScheduleErrorNotice, props: routeId })
+        : source(kind === "detail" ? "src/app/schedule/[id].tsx" : kind === "create" ? "src/app/schedule/create.tsx" : kind === "layout" ? "src/app/_layout.tsx" : `src/app/(tabs)/${kind}.tsx`).default };
     screens.push(s); flush();
     return { all: (type) => nodes(s.tree, type), one: (type) => nodes(s.tree, type)[0],
+      headerToolbarProps: () => s.toolbarProps,
       instance: (name) => [...s.children].find(([key]) => key.includes(`/${name}/`))?.[1],
       focus(value) {
         if (s.focused === value) return;
@@ -160,6 +201,9 @@ function harness(initialMode, { readOnly = false } = {}) {
         s.children.forEach((child) => child.slots.forEach((slot) => slot?.cleanup?.())); } };
   }
   return { mount, calls, mock, server, flush, source, navigations,
+    publishAssistant(executions) { assistantSnapshot = { phase: "settled", initialCheck: "checked", serverId: config.config.serverId,
+      results: executions.map(execution => ({ reference: execution.reference, latestResult: execution, lastResponse: execution.response })) };
+      for (const listener of [...assistantListeners]) listener(); flush(); },
     back() { router.back(); }, // native 뒤로 가기 동작은 메모리 navigation으로만 모사한다.
     mode(value) { mode.getState().setMode(value); flush(); },
     config(value) { config = configModule.parseDevelopmentServerConfig(value); screens.forEach((s) => { s.dirty = true; }); flush(); },
@@ -176,6 +220,344 @@ const dto = (id, category = "INVENTORY", completed = false) => ({ id, title: id,
   scheduledAt: "2026-11-07T03:00:00Z", createdAt: "2026-11-01T00:00:00Z", updatedAt: "2026-11-01T00:00:00Z" });
 const states = (screen) => screen.all("ScheduleListState").map((s) => s.state);
 
+const noticeCards = (screen) => screen.all("View").filter((p) => p.accessibilityLiveRegion === "polite" && flatStyle(p.style).width === "100%");
+
+for (const colorScheme of ["light", "dark"]) test(`오류 공통 카드: ${colorScheme} 테마·접근성·두 복구 동작·중복 문구 제거`, () => {
+  const h = harness("mock", { colorScheme }); try {
+    const calls = [], first = () => calls.push("list"), second = () => calls.push("detail");
+    const screen = h.mount("notice", { title: "일정은 수정됐어요", description: ["목록을 갱신하지 못했어요.", "목록을 갱신하지 못했어요."],
+      secondaryDescription: "상세 정보를 확인해 주세요.", actions: [
+        { key: "list", label: "일정 목록 다시 불러오기", onPress: first },
+        { key: "detail", label: "일정 정보 다시 불러오기", onPress: second, disabled: true },
+      ] });
+    const card = noticeCards(screen)[0];
+    assert.equal(noticeCards(screen).length, 1); assert.equal(card.accessibilityRole, "alert");
+    assert.deepEqual(card.accessibilityState, { busy: false });
+    assert.equal(flatStyle(card.style).backgroundColor, colorScheme === "dark" ? "#212225" : "white");
+    assert.equal(flatStyle(card.style).borderRadius, 12); assert.equal(flatStyle(card.style).padding, 16);
+    assert.equal(flatStyle(card.style).gap, 12);
+    const texts = screen.all("ThemedText");
+    assert.deepEqual(texts.map((p) => p.children), ["일정은 수정됐어요", "목록을 갱신하지 못했어요.", "상세 정보를 확인해 주세요."]);
+    assert.equal(flatStyle(texts[0].style).fontSize, 16); assert.equal(flatStyle(texts[0].style).fontWeight, "600");
+    assert.ok(texts.every((p) => flatStyle(p.style).textAlign === "left"));
+    assert.ok(texts.slice(1).every((p) => flatStyle(p.style).fontSize === 14 && flatStyle(p.style).fontWeight === "500"));
+    const buttons = screen.all("Button");
+    assert.deepEqual(buttons.map((p) => p.variant), ["secondary", "secondary"]);
+    assert.deepEqual(buttons.map((p) => p.disabled), [false, true]);
+    assert.strictEqual(buttons[0].onPress, first); assert.strictEqual(buttons[1].onPress, second);
+    buttons[0].onPress(); assert.deepEqual(calls, ["list"]);
+    assert.ok(screen.all("View").some((p) => p.accessibilityElementsHidden && p.importantForAccessibility === "no-hide-descendants"));
+    assert.equal(h.calls.length, 0);
+  } finally { h.close(); }
+});
+
+test("오류 공통 카드: 로딩과 비활성화는 전달받은 버튼에 적용하고 안내 문구는 사용자 표현으로 변환", () => {
+  const h = harness("mock"); try {
+    const screen = h.mount("notice", { title: "완료 변경 결과를 확인하지 못했어요.",
+      description: ["PATCH를 다시 보내지 않고 GET으로 상태를 확인해 주세요.", "서버의 현재 상태를 조회했어요. 이전 PATCH의 성공 여부를 뜻하지 않아요."],
+      actions: [{ key: "check", label: "결과 확인하기", onPress() {}, loading: true }], tone: "notice" });
+    assert.equal(noticeCards(screen)[0].accessibilityRole, undefined);
+    assert.equal(noticeCards(screen)[0].accessibilityState.busy, true);
+    assert.equal(screen.one("Button").disabled, true); assert.ok(screen.one("ActivityIndicator"));
+    assert.doesNotMatch(formText(screen), /\b(?:PATCH|GET|POST|DELETE)\b/);
+    assert.match(formText(screen), /성공했다는 뜻은 아니에요/);
+    assert.match(formText(screen), /변경을 다시 요청하지 않고/);
+    assert.equal(h.calls.length, 0);
+  } finally { h.close(); }
+});
+
+for (const kind of ["index", "calendar"]) test(`오류 카드 ${kind}: Server 최초 실패·기존 위치·재조회 callback`, async () => {
+  const h = harness("server", { renderListState: true }); try {
+    const screen = h.mount(kind); await h.settle(); h.respond(0, [], 500); await h.settle();
+    assert.equal(noticeCards(screen).length, 1); assert.match(formText(screen), /일정을 불러오지 못했어요/);
+    assert.equal(feedbackPanel(screen), undefined);
+    if (kind === "index") {
+      assert.ok(screen.one("FlatList").ListHeaderComponent);
+      assert.equal(flatStyle(screen.one("FlatList").contentContainerStyle).justifyContent, "center");
+      assert.equal(flatStyle(screen.one("FlatList").ListHeaderComponentStyle).alignSelf, "stretch");
+      assert.equal(flatStyle(noticeCards(screen)[0].style).backgroundColor, undefined);
+      assert.equal(flatStyle(noticeCards(screen)[0].style).alignItems, "center");
+      assert.equal(flatStyle(screen.one("Button").style).alignSelf, "center");
+      assert.equal(flatStyle(screen.one("Button").style).width, 120);
+      assert.equal(flatStyle(screen.one("Button").style).minHeight, 44);
+      assert.equal(flatStyle(screen.one("Button").style).borderRadius, 12);
+      assert.equal(flatStyle(screen.one("Button").textStyle).fontWeight, "600");
+    } else {
+      assert.equal(screen.one("MonthCalendar").selectedDate, "2026-11-07");
+      assert.equal(flatStyle(noticeCards(screen)[0].style).backgroundColor, "white");
+      assert.equal(flatStyle(screen.one("Button").style).alignSelf, undefined);
+      assert.equal(screen.one("Button").textStyle, undefined);
+    }
+    assert.equal(screen.one("Button").variant, "secondary"); screen.one("Button").onPress(); await h.settle();
+    assert.equal(h.calls.length, 2); assert.equal(h.calls[1].method, "GET");
+    h.respond(1, []); await h.settle(); assert.equal(noticeCards(screen).length, 0);
+    assert.match(formText(screen), kind === "index" ? /등록된 일정이 없어요/ : /일정 없음/);
+  } finally { h.close(); }
+});
+
+for (const kind of ["index", "calendar"]) test(`오류 카드 ${kind}: Mock 조회·완료 실패의 개별 재시도와 입력·날짜 유지`, async () => {
+  const h = harness("mock", { renderListState: true }); try {
+    const ops = h.source("src/services/mock/schedule-operations.ts");
+    const read = ops.readMockSchedules, complete = ops.setMockScheduleCompleted;
+    ops.readMockSchedules = () => { throw new Error("memory read"); };
+    const screen = h.mount(kind); h.flush();
+    if (kind === "calendar") { screen.one("MonthCalendar").onSelectDate({ dateString: "2026-09-30" }); h.flush(); }
+    assert.equal(noticeCards(screen).length, 1); assert.equal(screen.all("ScheduleCard").length, 0);
+    assert.equal(flatStyle(noticeCards(screen)[0].style).backgroundColor, kind === "index" ? undefined : "white");
+    ops.readMockSchedules = read; screen.one("Button").onPress(); h.flush();
+    const currentCard = () => kind === "index" ? listCard(screen) : screen.one("ScheduleCard");
+    assert.equal(noticeCards(screen).length, 0); assert.ok(currentCard());
+    const card = currentCard(), before = card.schedule.completed;
+    const selectedDate = screen.one("MonthCalendar")?.selectedDate;
+    ops.setMockScheduleCompleted = () => { throw new Error("memory completion"); };
+    card.onToggleCompleted(); h.flush(); assert.equal(noticeCards(screen).length, 1);
+    assert.equal(flatStyle(noticeCards(screen)[0].style).backgroundColor, "white");
+    assert.equal(screen.one("Button").textStyle, undefined);
+    if (kind === "index") { assert.ok(listFeedback(screen)); assert.equal(feedbackPanel(screen), undefined); }
+    assert.equal(currentCard().schedule.completed, before);
+    // 조회 실패와 완료 실패가 동시에 있어도 각 복구 동작을 따로 유지한다.
+    ops.readMockSchedules = () => { throw new Error("memory read"); };
+    h.mock.setState({ schedules: [...h.mock.getState().schedules] }); h.flush();
+    assert.equal(noticeCards(screen).length, 2); assert.ok(currentCard());
+    if (kind === "index") assert.strictEqual(screen.one("FlatList").ListHeaderComponent.props, listFeedback(screen));
+    ops.readMockSchedules = read; screen.all("Button")[0].onPress(); h.flush();
+    assert.equal(noticeCards(screen).length, 1);
+    ops.setMockScheduleCompleted = complete; screen.one("Button").onPress(); h.flush();
+    assert.equal(noticeCards(screen).length, 0);
+    assert.equal(currentCard().schedule.completed, !before);
+    assert.equal(screen.one("MonthCalendar")?.selectedDate, selectedDate); assert.equal(h.calls.length, 0);
+  } finally { h.close(); }
+});
+
+test("오류 카드 목록·캘린더: Server 완료 성공·재조회 실패의 단일 안내와 조회만 재시도", async () => {
+  const h = harness("server", { renderListState: true }); try {
+    const { list, calendar } = await completionScreens(h);
+    listCard(list).onToggleCompleted(); await h.settle(); h.detail(2, dto("target", "INVENTORY", true)); await h.settle();
+    h.respond(3, [], 500); h.respond(4, [dto("target", "INVENTORY", true)]); await h.settle();
+    for (const screen of [list, calendar]) {
+      assert.equal(noticeCards(screen).length, 1);
+      if (screen === list) { assert.ok(listFeedback(screen)); assert.equal(feedbackPanel(screen), undefined); }
+      else assert.ok(feedbackPanel(screen));
+      assert.equal((screen === list ? listCard(screen) : screen.one("ScheduleCard")).schedule.completed, true);
+      assert.doesNotMatch(formText(screen), /\b(?:GET|PATCH)\b/);
+      assert.equal(screen.one("Button").label, "완료 상태 확인하기");
+    }
+    calendar.one("Button").onPress(); await h.settle();
+    assert.equal(h.calls[5].method, "GET"); assert.equal(h.calls[5].url, h.calls[3].url);
+    h.respond(5, [dto("target", "INVENTORY", true)]); await h.settle();
+    assert.equal(patches(h).length, 1); assert.equal(noticeCards(list).length, 0); assert.equal(noticeCards(calendar).length, 0);
+  } finally { h.close(); }
+});
+
+test("목록 부분 오류는 단일 스크롤 헤더·안전 하단 여백을 사용하고 필터·FAB·재조회 동작 유지", async () => {
+  for (const bottomInset of [0, 34, 70]) {
+    const h = harness("server", { bottomInset }); try {
+      const list = h.mount("index"); await h.settle(); h.respond(0, [dto("target")]); await h.settle();
+      list.one("CategoryFilter").onSelectCategory("재고"); h.flush();
+      const fab = () => list.all("Pressable").find((props) => props.accessibilityLabel === "새 일정 추가");
+      const originalFab = flatStyle(fab().style({ pressed: false }));
+      assert.equal(flatStyle(list.one("FlatList").contentContainerStyle).paddingBottom, 96);
+      assert.equal(list.one("FlatList").ListHeaderComponent, undefined);
+      const query = h.source("src/utils/schedule-query.ts").getMainScheduleRange(new Date("2026-11-07T03:00:00Z"));
+      const read = h.server.retry(query); await h.settle(); h.respond(1, [], 500); await read; await h.settle();
+      const flatList = list.one("FlatList"), feedback = listFeedback(list), content = flatStyle(flatList.contentContainerStyle);
+      assert.strictEqual(flatList.ListHeaderComponent.props, feedback);
+      assert.equal(list.all("View").filter((props) => props.testID === "schedule-list-feedback").length, 1);
+      assert.equal(feedbackPanel(list), undefined); assert.equal(list.all("ScheduleListState").length, 1);
+      assert.equal(flatStyle(flatList.ListHeaderComponentStyle).alignSelf, "stretch");
+      assert.equal(flatStyle(feedback.style).marginBottom, 24);
+      assert.equal(content.paddingHorizontal, 16); assert.equal(content.paddingRight, undefined);
+      assert.ok(content.paddingBottom >= originalFab.bottom + originalFab.height + 16 + bottomInset);
+      assert.equal(content.justifyContent, undefined);
+      assert.equal(flatList.data[0].id, "target"); assert.equal(list.one("CategoryFilter").selectedCategory, "재고");
+      assert.deepEqual(flatStyle(fab().style({ pressed: false })), originalFab);
+      list.one("ScheduleListState").onRetry(); await h.settle(); assert.equal(h.calls[2].method, "GET");
+      h.respond(2, [dto("target")]); await h.settle();
+      assert.equal(listFeedback(list), undefined); assert.equal(flatStyle(list.one("FlatList").contentContainerStyle).paddingBottom, 96);
+      fab().onPress(); h.flush(); assert.deepEqual(h.navigations, ["/schedule/create"]);
+      assert.ok(h.calls.every((call) => call.method === "GET"));
+    } finally { h.close(); }
+  }
+});
+
+test("목록 필터 결과가 비어 있는 재조회 실패는 최초 실패로 취급하지 않고 헤더에 한 번 표시", async () => {
+  const h = harness("server"); try {
+    const list = h.mount("index"); await h.settle(); h.respond(0, [dto("target")]); await h.settle();
+    list.one("CategoryFilter").onSelectCategory("출고"); h.flush();
+    const query = h.source("src/utils/schedule-query.ts").getMainScheduleRange(new Date("2026-11-07T03:00:00Z"));
+    const read = h.server.retry(query); await h.settle(); h.respond(1, [], 500); await read; await h.settle();
+    assert.equal(list.one("FlatList").data.length, 0); assert.ok(listFeedback(list));
+    assert.equal(flatStyle(list.one("FlatList").contentContainerStyle).justifyContent, undefined);
+    assert.equal(list.all("ScheduleListState").length, 1); assert.equal(feedbackPanel(list), undefined);
+    assert.equal(list.one("CategoryFilter").selectedCategory, "출고");
+    assert.match(list.one("ScheduleListState").errorTitle, /이전 정보/);
+    assert.equal(list.one("ScheduleListState").variant, "card");
+  } finally { h.close(); }
+});
+
+test("목록 정상 0건은 기존 빈 상태를 유지하고 이후 재조회 실패도 중앙 안내형으로 바꾸지 않음", async () => {
+  const h = harness("server"); try {
+    const list = h.mount("index"); await h.settle(); h.respond(0, []); await h.settle();
+    const empty = list.one("FlatList").ListEmptyComponent;
+    assert.equal(empty.props.state, "empty"); assert.equal(list.one("FlatList").ListHeaderComponent, undefined);
+    assert.equal(flatStyle(list.one("FlatList").contentContainerStyle).justifyContent, "center");
+    const query = h.source("src/utils/schedule-query.ts").getMainScheduleRange(new Date("2026-11-07T03:00:00Z"));
+    const read = h.server.retry(query); await h.settle(); h.respond(1, [], 500); await read; await h.settle();
+    assert.equal(list.one("ScheduleListState").variant, "card");
+    assert.equal(flatStyle(list.one("FlatList").contentContainerStyle).justifyContent, undefined);
+    list.one("ScheduleListState").onRetry(); await h.settle(); h.respond(2, []); await h.settle();
+    assert.equal(list.one("FlatList").ListHeaderComponent, undefined);
+    assert.deepEqual(list.one("FlatList").ListEmptyComponent, empty);
+    assert.ok(h.calls.every((call) => call.method === "GET"));
+  } finally { h.close(); }
+});
+
+test("목록의 오류 없는 stale 상태 확인 안내도 전체 너비의 스크롤 헤더에서 GET만 재시도", async () => {
+  const h = harness("server"); try {
+    const list = h.mount("index"); await h.settle(); h.respond(0, [dto("target")]); await h.settle();
+    h.server.invalidate(); h.flush();
+    assert.ok(listFeedback(list)); assert.equal(list.one("ScheduleListState").state, "notice");
+    assert.equal(flatStyle(list.one("FlatList").ListHeaderComponentStyle).alignSelf, "stretch");
+    assert.equal(feedbackPanel(list), undefined); assert.equal(list.all("ScheduleListState").length, 1);
+    list.one("ScheduleListState").onRetry(); await h.settle(); h.respond(1, [dto("target")]); await h.settle();
+    assert.equal(listFeedback(list), undefined); assert.ok(h.calls.every((call) => call.method === "GET"));
+  } finally { h.close(); }
+});
+
+test("오류 카드 추가·수정: 같은 카테고리 하단 간격과 스타일, Mock 저장 실패 후 입력 보존·재시도", async () => {
+  const h = harness("mock"); try {
+    const add = h.mock.getState().addSchedule;
+    h.mock.setState({ addSchedule() { throw new Error("memory create"); } });
+    const create = h.mount("create"); fillCreation(h, create); await createButton(create).onPress(); h.flush();
+    const edit = h.mount("detail", mockId); edit.one("TextInput").onChangeText(""); h.flush(); saveButton(edit).onPress(); h.flush();
+    for (const screen of [create, edit]) {
+      const card = noticeCards(screen)[0]; assert.ok(card);
+      const category = screen.all("View").find((p) => p.children?.[0]?.type === "ScheduleCategorySelector");
+      assert.equal(flatStyle(category.style).gap, 24); assert.strictEqual(category.children[1].props, card);
+    }
+    assert.deepEqual(flatStyle(noticeCards(create)[0].style), flatStyle(noticeCards(edit)[0].style));
+    assert.equal(create.one("TextInput").value, "새 일정"); assert.equal(createButton(create).disabled, false);
+    h.mock.setState({ addSchedule: add }); h.flush(); await createButton(create).onPress(); h.flush();
+    assert.equal(h.mock.getState().schedules.length, 11); assert.equal(h.calls.length, 0); assert.deepEqual(h.navigations, ["back"]);
+  } finally { h.close(); }
+});
+
+const syncRequestId = "80000001-abcd-4abc-8abc-abcdef123456", syncScheduleId = "80000002-abcd-4abc-8abc-abcdef123456";
+const syncOutcome = (operation = "update") => ({ requestId: syncRequestId, conversationId: "80000003-abcd-4abc-8abc-abcdef123456", status: "completed",
+  result: { kind: "outcome", text: "Assistant 서버 변경 성공", outcome: "success", operation, schedulesChanged: true, affectedScheduleIds: [syncScheduleId] } });
+
+async function failedSyncUi8b() {
+  const h = harness("server", { assistantSyncUi: true }), list = h.mount("index"), calendar = h.mount("calendar"), assistant = h.mount("assistant");
+  await h.settle(); const original = dto(syncScheduleId, "OTHER");
+  for (let n = 0; n < h.calls.length; n++) h.respond(n, [original]); await h.settle();
+  list.one("CategoryFilter").onSelectCategory("기타"); h.flush();
+  const reference = { serverId: "development:https://example.invalid", requestId: syncRequestId }, data = syncOutcome();
+  const sync = h.source("src/services/api/assistant-schedule-sync.ts").assistantScheduleSync, start = h.calls.length;
+  const pending = sync.observe(reference, data);
+  h.publishAssistant([{ kind: "completed", reference, response: { ok: true, data, status: 200, serverId: reference.serverId, httpRequestId: "추적 ID", metadata: { status: "updated" } } }]);
+  await h.settle(); assert.equal(assistant.one("ConversationList").scheduleSyncEntries[0].phase, "refreshing");
+  const failure = { type: "https://example.invalid/problem", title: "조회 실패", status: 404, detail: "내부 오류", instance: "/api/v1/schedules", code: "ROUTE_NOT_FOUND", requestId: "조회 추적" };
+  h.detail(start, failure, 404, "application/problem+json");
+  for (let n = start + 1; n < h.calls.length; n++) h.respond(n, [original]); await pending; await h.settle();
+  assert.equal(assistant.one("ConversationList").scheduleSyncEntries[0].phase, "refresh-error");
+  return { h, list, calendar, assistant, sync, reference, original, failedIndex: start };
+}
+
+for (const source of ["assistant", "schedule"]) test(`8-B ${source} GET-only retry 성공은 실제 Assistant 상태·목록·캘린더를 함께 갱신`, async () => {
+  const { h, list, calendar, assistant, reference, failedIndex } = await failedSyncUi8b();
+  try {
+    assert.equal(list.one("FlatList").data[0].id, syncScheduleId); assert.ok(states(list).includes("error"));
+    const month = calendar.one("MonthCalendar").visibleMonth, selected = calendar.one("MonthCalendar").selectedDate, before = h.calls.length;
+    if (source === "assistant") {
+      const retry = assistant.one("ConversationList").onScheduleSyncRetry; retry(reference); retry(reference);
+    } else list.all("ScheduleListState").find(entry => entry.state === "error").onRetry();
+    await h.settle(); assert.equal(h.calls.length, before + 1); assert.equal(h.calls[before].url, h.calls[failedIndex].url);
+    const updated = { ...dto(syncScheduleId, "OTHER"), title: "정식 GET 제목", scheduledAt: "2026-11-08T03:00:00Z" };
+    h.respond(before, [updated]); await h.settle();
+    assert.equal(assistant.one("ConversationList").scheduleSyncEntries[0].phase, "synchronized");
+    assert.equal(assistant.one("ConversationList").messages[0].apiExecution.response.data.result.outcome, "success");
+    assert.equal(list.one("FlatList").data[0].title, updated.title); assert.equal(list.one("FlatList").data[0].date, "2026-11-08");
+    assert.equal(list.one("CategoryFilter").selectedCategory, "기타"); assert.equal(calendar.one("MonthCalendar").visibleMonth, month);
+    assert.equal(calendar.one("MonthCalendar").selectedDate, selected); assert.ok(calendar.one("MonthCalendar").scheduleDates.includes("2026-11-08"));
+    assert.equal(calendar.all("ScheduleCard").length, 0); assert.ok(h.calls.every(call => call.method === "GET"));
+  } finally { h.close(); }
+});
+
+test("8-B Assistant retry 대기 중 수동 완료 PATCH는 독립 실행·성공 rollback/취소/재전송 없음", async () => {
+  const { h, list, calendar, assistant, reference } = await failedSyncUi8b();
+  try {
+    const before = h.calls.length; listCard(list).onToggleCompleted(); await h.settle();
+    assert.equal(h.calls[before].method, "PATCH"); const signal = h.calls[before].signal;
+    assistant.one("ConversationList").onScheduleSyncRetry(reference); await h.settle(); assert.equal(h.calls.length, before + 1); assert.equal(signal.aborted, false);
+    const updated = dto(syncScheduleId, "OTHER", true); h.detail(before, updated); await h.settle();
+    const manualEnd = h.calls.length;
+    for (let n = before + 1; n < manualEnd; n++) h.respond(n, [updated]); await h.settle();
+    for (let n = manualEnd; n < h.calls.length; n++) { assert.equal(h.calls[n].method, "GET"); h.respond(n, [updated]); } await h.settle();
+    assert.equal(signal.aborted, false); assert.equal(h.calls.filter(call => call.method === "PATCH").length, 1);
+    assert.equal(list.one("FlatList").data[0].completed, true); assert.equal(calendar.all("ScheduleCard")[0].schedule.completed, true);
+    assert.equal(assistant.one("ConversationList").scheduleSyncEntries[0].phase, "synchronized");
+  } finally { h.close(); }
+});
+
+for (const operation of ["create", "update", "delete", "completed"]) test(`8-A 실제 목록·캘린더 ${operation}: 정식 GET의 카드·날짜·dot와 기존 필터 유지`, async () => {
+  const h = harness("server"); try {
+    const list = h.mount("index"), calendar = h.mount("calendar"); await h.settle();
+    const original = dto(syncScheduleId, "OTHER");
+    for (let n = 0; n < h.calls.length; n++) h.respond(n, operation === "create" ? [] : [original]); await h.settle();
+    list.one("CategoryFilter").onSelectCategory("기타"); h.flush();
+    const month = calendar.one("MonthCalendar").visibleMonth, selected = calendar.one("MonthCalendar").selectedDate;
+    const start = h.calls.length, sync = h.source("src/services/api/assistant-schedule-sync.ts").assistantScheduleSync;
+    const result = syncOutcome(operation === "completed" ? "update" : operation);
+    const pending = sync.observe({ serverId: "development:https://example.invalid", requestId: syncRequestId }, result); await h.settle();
+    const updated = { ...original, title: "Schedule GET으로 확인한 제목", completed: operation === "completed",
+      ...(operation === "update" ? { scheduledAt: "2026-11-08T03:00:00Z" } : {}) };
+    for (let n = start; n < h.calls.length; n++) { assert.equal(h.calls[n].method, "GET"); h.respond(n, operation === "delete" ? [] : [updated]); }
+    assert.equal((await pending).phase, "synchronized"); await h.settle();
+    assert.equal(list.one("CategoryFilter").selectedCategory, "기타");
+    assert.equal(calendar.one("MonthCalendar").visibleMonth, month); assert.equal(calendar.one("MonthCalendar").selectedDate, selected);
+    const items = list.one("FlatList").data;
+    if (operation === "delete") { assert.deepEqual(items, []); assert.deepEqual(calendar.one("MonthCalendar").scheduleDates, []); assert.equal(calendar.all("ScheduleCard").length, 0); }
+    else {
+      assert.equal(items[0].title, updated.title); assert.equal(items[0].completed, updated.completed);
+      assert.ok(calendar.one("MonthCalendar").scheduleDates.includes(operation === "update" ? "2026-11-08" : "2026-11-07"));
+      if (operation === "update") { assert.equal(calendar.all("ScheduleCard").length, 0); assert.equal(items[0].date, "2026-11-08"); }
+      else assert.strictEqual(calendar.all("ScheduleCard")[0].schedule, items[0]);
+    }
+    const count = h.calls.length; for (let n = 0; n < 3; n++) { await sync.observe({ serverId: "development:https://example.invalid", requestId: syncRequestId }, result); list.focus(false); list.focus(true); calendar.focus(false); calendar.focus(true); }
+    await h.settle(); assert.equal(h.calls.length, count); assert.ok(h.calls.every(call => call.method === "GET"));
+  } finally { h.close(); }
+});
+
+test("8-A 사용자가 고른 다른 캘린더 월·날짜는 동기화 뒤에도 유지", async () => {
+  const h = harness("server"); try {
+    const list = h.mount("index"), calendar = h.mount("calendar"); await h.settle();
+    for (let n = 0; n < h.calls.length; n++) h.respond(n, []); await h.settle();
+    calendar.one("MonthCalendar").onMonthChange({ dateString: "2026-12-01" }); calendar.one("MonthCalendar").onSelectDate({ dateString: "2026-12-05" }); h.flush(); await h.settle();
+    for (let n = 2; n < h.calls.length; n++) h.respond(n, []); await h.settle();
+    const start = h.calls.length, sync = h.source("src/services/api/assistant-schedule-sync.ts").assistantScheduleSync;
+    const pending = sync.observe({ serverId: "development:https://example.invalid", requestId: syncRequestId }, syncOutcome("create")); await h.settle();
+    const item = { ...dto(syncScheduleId), scheduledAt: "2026-12-05T03:00:00Z" };
+    for (let n = start; n < h.calls.length; n++) h.respond(n, [item]); await pending; await h.settle();
+    assert.equal(calendar.one("MonthCalendar").visibleMonth, "2026-12-01"); assert.equal(calendar.one("MonthCalendar").selectedDate, "2026-12-05");
+    assert.ok(calendar.one("MonthCalendar").scheduleDates.includes("2026-12-05")); assert.equal(calendar.all("ScheduleCard")[0].schedule.id, syncScheduleId);
+    assert.equal(list.one("FlatList").data[0].id, syncScheduleId);
+  } finally { h.close(); }
+});
+
+test("8-A 화면 해제 중 성공은 기존 조건을 무효화하고 재진입 GET으로 갱신·무한 조회 없음", async () => {
+  const h = harness("server"); try {
+    let list = h.mount("index"), calendar = h.mount("calendar"); await h.settle();
+    for (let n = 0; n < h.calls.length; n++) h.respond(n, [dto(syncScheduleId)]); await h.settle(); list.close(); calendar.close();
+    const start = h.calls.length, sync = h.source("src/services/api/assistant-schedule-sync.ts").assistantScheduleSync;
+    const pending = sync.observe({ serverId: "development:https://example.invalid", requestId: syncRequestId }, syncOutcome("delete")); await h.settle();
+    for (let n = start; n < h.calls.length; n++) h.respond(n, []); await pending;
+    list = h.mount("index"); calendar = h.mount("calendar"); await h.settle();
+    for (let n = start + 1; n < h.calls.length; n++) h.respond(n, []); await h.settle();
+    assert.deepEqual(list.one("FlatList").data, []); assert.deepEqual(calendar.one("MonthCalendar").scheduleDates, []);
+    const count = h.calls.length; list.focus(false); list.focus(true); calendar.focus(false); calendar.focus(true); await h.settle(); assert.equal(h.calls.length, count);
+  } finally { h.close(); }
+});
+
 test("기본 Mock 두 화면·CRUD·완료 변경과 서버 요청 0회", async () => {
   const h = harness("mock"); try {
     const list = h.mount("index"), cal = h.mount("calendar"); await h.settle();
@@ -188,6 +570,38 @@ test("기본 Mock 두 화면·CRUD·완료 변경과 서버 요청 0회", async 
     h.mock.getState().updateSchedule("local", { title: "수정" }); h.flush(); assert.equal(list.one("FlatList").data.length, 11);
     h.mock.getState().deleteSchedule("local"); h.flush(); assert.equal(cal.all("ScheduleCard").length, 10);
     assert.equal(h.calls.length, 0);
+  } finally { h.close(); }
+});
+
+test("Assistant Mock 등록·수정·완료·삭제는 실제 목록/캘린더에 같은 store로 반영", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const h = harness("mock"); try {
+    const list = h.mount("index"), calendar = h.mount("calendar"), assistant = h.mount("assistant");
+    const send = text => {
+      assistant.one("MessageInput").onChangeText(text); h.flush();
+      assistant.one("MessageInput").onSend(); h.flush();
+      t.mock.timers.tick(700); h.flush();
+    };
+    const showDate = date => { calendar.one("MonthCalendar").onSelectDate({ dateString: date }); h.flush(); };
+    const listItem = id => list.one("FlatList").data.find(item => item.id === id);
+    const calendarItem = id => calendar.all("ScheduleCard").find(item => item.schedule.id === id)?.schedule;
+    const originalIds = new Set(h.mock.getState().schedules.map(item => item.id));
+    send("내일 오후 3시 팀 회의 추가해 줘");
+    const created = h.mock.getState().schedules.find(item => !originalIds.has(item.id)); assert.ok(created);
+    showDate(created.date); assert.strictEqual(listItem(created.id), created); assert.strictEqual(calendarItem(created.id), created);
+    assert.ok(calendar.one("MonthCalendar").scheduleDates.includes(created.date));
+    send("팀 주간 회의를 오후 4시로 바꿔 줘");
+    const changed = h.mock.getState().schedules.find(item => item.id === "10000000-0000-4000-8000-000000000002");
+    showDate(changed.date); assert.equal(changed.time, "16:00"); assert.strictEqual(listItem(changed.id), changed); assert.strictEqual(calendarItem(changed.id), changed);
+    send("A구역 재고 실사 완료 처리해 줘");
+    const completed = h.mock.getState().schedules.find(item => item.id === "10000000-0000-4000-8000-000000000001");
+    showDate(completed.date); assert.equal(completed.completed, true); assert.strictEqual(listItem(completed.id), completed); assert.strictEqual(calendarItem(completed.id), completed);
+    send("작업장 안전 점검 삭제해 줘");
+    const confirmation = assistant.one("ConversationList").messages.at(-1), targetId = confirmation.interaction.scheduleId;
+    showDate(h.mock.getState().schedules.find(item => item.id === targetId).date);
+    assistant.one("ConversationList").onDeleteConfirmation(confirmation.id, true); h.flush();
+    assert.equal(listItem(targetId), undefined); assert.equal(calendarItem(targetId), undefined);
+    assert.equal(assistant.one("MessageInput").disabled, false); assert.equal(h.calls.length, 0);
   } finally { h.close(); }
 });
 test("서버 메인 3개월·서버 순서·로컬 카테고리 필터·완료 차단", async () => {
@@ -312,6 +726,42 @@ const notFoundProblem = (code = "SCHEDULE_NOT_FOUND") => ({ type: "test", title:
 const validationProblem = () => ({ ...notFoundProblem("VALIDATION_ERROR"), status: 422,
   errors: [{ location: "body", pointer: "/completed", code: "INVALID_TYPE", detail: "test" }] });
 const saveButton = (screen) => screen.all("Button").find((p) => p.label === "수정 완료");
+const editFeedback = (screen) => screen.all("View").find((p) => p.testID === "schedule-edit-feedback");
+const editReadButton = (screen) => screen.all("Button").find((p) => /확인하기|일정 (정보|목록) (다시 불러오기|새로고침)/.test(p.label));
+
+function assertUnifiedEditFeedback(screen, label) {
+  const feedback = editFeedback(screen);
+  assert.ok(feedback); assert.equal(feedback.accessibilityRole, "alert");
+  assert.equal(screen.all("ScheduleListState").length, 0, "폼 하단에 별도 조회 안내가 없어야 한다");
+  const buttons = screen.all("Button").filter((p) => p.label !== "수정 완료");
+  assert.deepEqual(buttons.map((p) => p.label), Array.isArray(label) ? label : [label]);
+  const [messages, actions] = feedback.children;
+  assert.equal(messages.type, "View");
+  assert.deepEqual(actions.filter(Boolean).map((node) => node.props), buttons);
+  assert.equal(flatStyle(feedback.style).gap, 12);
+  const categorySection = screen.all("View").find((p) => Array.isArray(p.children) && p.children[0]?.type === "ScheduleCategorySelector");
+  assert.strictEqual(categorySection.children[1].props, feedback);
+  assert.equal(flatStyle(categorySection.style).gap, 24);
+  assert.ok(flatStyle(screen.one("ScrollView").contentContainerStyle).paddingBottom >= 24);
+  assert.doesNotMatch(`${formText(screen)} ${buttons.map((p) => p.label).join(" ")}`, /\b(?:PATCH|GET|mutation)\b|수정 잠금/);
+}
+
+function assertEditCopy(screen, title, description, labels) {
+  assertUnifiedEditFeedback(screen, labels);
+  assert.deepEqual(noticeTexts(editFeedback(screen)), [title, description]);
+}
+
+function noticeTexts(props) {
+  const texts = [];
+  function visit(node) {
+    if (Array.isArray(node)) return node.forEach(visit);
+    if (!node || typeof node !== "object") return;
+    if (node.type === "ThemedText") texts.push(node.props.children);
+    else visit(node.props?.children);
+  }
+  visit(props.children);
+  return texts;
+}
 
 test("상세 Mock 수정·삭제와 모달/navigation 유지, 서버 요청 0회", async () => {
   for (const kind of ["update", "delete"]) {
@@ -360,7 +810,8 @@ test("상세 재조회 실패와 늦은 성공에도 사용자 입력·dirty-che
     h.detail(0, dto("target")); await h.settle();
     screen.one("TextInput").onChangeText("사용자 입력"); h.flush();
     let retry = h.server.retryDetail("target"); await h.settle(); h.detail(1, {}, 500); await retry; await h.settle();
-    assert.equal(screen.one("TextInput").value, "사용자 입력"); assert.ok(states(screen).includes("error"));
+    assert.equal(screen.one("TextInput").value, "사용자 입력");
+    assertEditCopy(screen, "일정 정보를 불러오지 못했어요", "현재 이전 정보를 표시하고 있어요.", "일정 정보 다시 불러오기");
     retry = h.server.retryDetail("target"); await h.settle(); h.detail(2, { ...dto("target"), title: "다른 서버 제목" }); await retry; await h.settle();
     assert.equal(screen.one("TextInput").value, "사용자 입력");
     assert.equal(Object.values(h.server.store.getState().servers)[0].entities.target.title, "다른 서버 제목");
@@ -779,12 +1230,50 @@ test("PATCH 성공 후 GET 실패는 성공 유지·GET만 재시도", async () 
   const h = harness("server"); try {
     const screen = await editableDetail(h); editTitle(h, screen); saveButton(screen).onPress(); await h.settle();
     h.detail(1, { ...dto("target"), title: "수정 입력" }); await h.settle(); h.respond(2, [], 500); await h.settle();
-    assert.match(formText(screen), /수정되었지만/); assert.equal(saveButton(screen).disabled, true);
+    assert.equal(saveButton(screen).disabled, true);
+    assertEditCopy(screen, "일정은 수정됐어요", "다만 일정 목록에 변경 내용이 표시되지 않을 수 있어요.", "일정 목록 새로고침");
     saveButton(screen).onPress(); await h.settle(); assert.equal(h.calls.length, 3);
-    screen.all("Button").find((p) => p.label === "서버 상태 다시 불러오기").onPress(); await h.settle();
+    editReadButton(screen).onPress(); await h.settle();
     assert.equal(h.calls[3].method, "GET"); h.respond(3, [dto("target")]); await h.settle();
     assert.deepEqual(h.navigations, ["back"]); assert.equal(h.calls.filter((c) => c.method === "PATCH").length, 1);
   } finally { h.close(); }
+});
+
+test("UI 수정 목록 GET와 단건 GET 동시 실패는 각 callback을 같은 영역에 보존", async () => {
+  for (const listRetryFirst of [false, true]) for (const status of [500, 404]) {
+    const h = harness("server"); try {
+      const screen = await editableDetail(h); editTitle(h, screen); saveButton(screen).onPress(); await h.settle();
+      const updated = { ...dto("target"), title: "수정 입력" };
+      h.detail(1, updated); await h.settle(); h.respond(2, [], 500); await h.settle();
+      const read = h.server.retryDetail("target"); await h.settle();
+      h.detail(3, status === 404 ? notFoundProblem() : {}, status, "application/problem+json"); await read; await h.settle();
+      const labels = ["일정 목록 다시 불러오기", "일정 정보 다시 불러오기"];
+      assertEditCopy(screen, "일정은 수정됐어요", "일정 목록과 상세 정보를 최신 상태로 불러오지 못했어요.", labels);
+      assert.equal(saveButton(screen).disabled, true); assert.equal(screen.one("TextInput").value, "수정 입력");
+      const button = (label) => screen.all("Button").find((p) => p.label === label);
+      if (listRetryFirst) {
+        button(labels[0]).onPress(); await h.settle();
+        const call = h.calls.at(-1); assert.match(new URL(call.url).pathname, /\/schedules$/);
+        assert.ok(labels.every((label) => button(label).disabled));
+        h.respond(h.calls.length - 1, [], 500); await h.settle();
+        assertEditCopy(screen, "일정은 수정됐어요", "일정 목록과 상세 정보를 최신 상태로 불러오지 못했어요.", labels);
+        assert.deepEqual(h.navigations, []);
+      }
+      button(labels[1]).onPress(); await h.settle();
+      assert.match(new URL(h.calls.at(-1).url).pathname, /\/schedules\/target$/);
+      assert.equal(editReadButton(screen).disabled, true); assert.equal(saveButton(screen).disabled, true);
+      h.detail(h.calls.length - 1, updated); await h.settle();
+      if (listRetryFirst) assertEditCopy(screen, "일정 목록을 불러오지 못했어요", "수정은 완료됐지만 목록을 갱신하지 못했어요.", "일정 목록 다시 불러오기");
+      else assertEditCopy(screen, "일정은 수정됐어요", "다만 일정 목록에 변경 내용이 표시되지 않을 수 있어요.", "일정 목록 새로고침");
+      assert.equal(saveButton(screen).disabled, true); assert.deepEqual(h.navigations, []);
+      editReadButton(screen).onPress(); await h.settle();
+      assert.match(new URL(h.calls.at(-1).url).pathname, /\/schedules$/);
+      h.respond(h.calls.length - 1, [updated]); await h.settle();
+      assert.equal(editFeedback(screen), undefined); assert.deepEqual(h.navigations, ["back"]);
+      assert.equal(saveButton(screen).disabled, true); assert.equal(screen.one("TextInput").value, "수정 입력");
+      assert.equal(patches(h).length, 1); assert.ok(h.calls.slice(2).every((call) => call.method === "GET"));
+    } finally { h.close(); }
+  }
 });
 test("PATCH 확정 404·422 오류는 입력과 원래 공유 데이터를 보존", async () => {
   for (const [status, code, message] of [[404, "SCHEDULE_NOT_FOUND", /수정할 일정/], [422, "SCHEDULE_IN_THE_PAST", /과거 시각/],
@@ -804,17 +1293,61 @@ test("PATCH 불확실 결과는 재저장 차단·고정 body 제한 retry·단�
     h.calls[1].reject(new Error("메모리 네트워크 오류")); await h.settle(); h.calls[2].reject(new Error("메모리 네트워크 오류")); await h.settle();
     assert.equal(h.calls[1].body, h.calls[2].body); assert.equal(h.calls[1].url, h.calls[2].url);
     assert.match(formText(screen), /수정 결과/); assert.equal(screen.one("TextInput").value, "수정 입력");
+    assertEditCopy(screen, "수정 결과를 확인할 수 없어요", "변경 사항이 저장됐을 수도 있어요. 중복 수정을 막기 위해 먼저 최신 상태를 확인해 주세요.", "수정 결과 확인하기");
     saveButton(screen).onPress(); await h.settle(); assert.equal(h.calls.length, 3);
-    screen.all("Button").find((p) => p.label === "서버 상태 다시 불러오기").onPress(); await h.settle();
+    editReadButton(screen).onPress(); await h.settle();
     assert.equal(h.calls[3].method, "GET"); h.detail(3, dto("target")); await h.settle();
     assert.equal(screen.one("TextInput").value, "수정 입력"); assert.equal(h.calls.filter((c) => c.method === "PATCH").length, 2);
     assert.deepEqual(h.navigations, []);
   } finally { h.close(); }
 });
+
+test("UI 수정 결과 미확인과 독립적인 단건 오류도 간결한 안내 하나로 표시", async () => {
+  for (const status of [404, 500]) {
+    const h = harness("server"); try {
+      const screen = await editableDetail(h); editTitle(h, screen); saveButton(screen).onPress(); await h.settle();
+      h.calls[1].reject(new Error("memory")); await h.settle(); h.calls[2].reject(new Error("memory")); await h.settle();
+      const read = h.server.retryDetail("target"); await h.settle();
+      h.detail(3, status === 404 ? notFoundProblem() : {}, status, "application/problem+json"); await read; await h.settle();
+      if (status === 404) assertEditCopy(screen, "일정을 확인할 수 없어요", "현재 서버에서 일정을 찾지 못했어요. 수정 결과도 아직 확인되지 않았어요.", "수정 결과 확인하기");
+      else assertEditCopy(screen, "최신 정보를 불러오지 못했어요", "수정 여부가 확인되지 않았어요. 연결 상태를 확인하고 다시 조회해 주세요.", "수정 결과 다시 확인하기");
+      assert.doesNotMatch(formText(screen), /삭제됐|삭제되었|삭제되었습니다/);
+      assert.equal(saveButton(screen).disabled, true); assert.equal(screen.one("TextInput").value, "수정 입력");
+      saveButton(screen).onPress(); await h.settle(); assert.equal(h.calls.length, 4);
+      editReadButton(screen).onPress(); await h.settle(); assert.equal(h.calls[4].method, "GET");
+      h.detail(4, dto("target")); await h.settle();
+      assertEditCopy(screen, "최신 일정 정보를 불러왔어요", "변경 사항이 반영됐는지 확인해 주세요.", "다시 확인하기");
+      assert.equal(saveButton(screen).disabled, true); assert.equal(patches(h).length, 2); assert.deepEqual(h.navigations, []);
+    } finally { h.close(); }
+  }
+});
+
+test("UI 수정 결과 미확인과 GET 실패는 한 영역·복구 버튼 하나, 조회 중 잠금·입력 보존", async () => {
+  for (const status of [500, 404]) {
+    const h = harness("server"); try {
+      const screen = await editableDetail(h); editTitle(h, screen); saveButton(screen).onPress(); await h.settle();
+      h.calls[1].reject(new Error("memory")); await h.settle(); h.calls[2].reject(new Error("memory")); await h.settle();
+      assertEditCopy(screen, "수정 결과를 확인할 수 없어요", "변경 사항이 저장됐을 수도 있어요. 중복 수정을 막기 위해 먼저 최신 상태를 확인해 주세요.", "수정 결과 확인하기");
+      const form = screen.instance("ScheduleEditForm");
+      editReadButton(screen).onPress(); await h.settle();
+      assert.equal(editReadButton(screen).disabled, true); assert.equal(saveButton(screen).disabled, true);
+      h.detail(3, status === 404 ? notFoundProblem() : {}, status, "application/problem+json"); await h.settle();
+      assertEditCopy(screen, "최신 정보를 불러오지 못했어요", "수정 여부가 확인되지 않았어요. 연결 상태를 확인하고 다시 조회해 주세요.", "수정 결과 다시 확인하기");
+      assert.equal(editReadButton(screen).disabled, false); assert.equal(saveButton(screen).disabled, true);
+      saveButton(screen).onPress(); await h.settle(); assert.equal(h.calls.length, 4);
+      editReadButton(screen).onPress(); await h.settle(); assert.equal(h.calls[4].method, "GET");
+      h.detail(4, dto("target")); await h.settle();
+      assertEditCopy(screen, "최신 일정 정보를 불러왔어요", "변경 사항이 반영됐는지 확인해 주세요.", "다시 확인하기");
+      assert.strictEqual(screen.instance("ScheduleEditForm"), form); assert.equal(screen.one("TextInput").value, "수정 입력");
+      assert.equal(saveButton(screen).disabled, true); assert.equal(patches(h).length, 2); assert.deepEqual(h.navigations, []);
+    } finally { h.close(); }
+  }
+});
 test("PATCH 응답의 ID 불일치는 cache 반영·성공 navigation 금지", async () => {
   const h = harness("server"); try {
     const screen = await editableDetail(h); editTitle(h, screen); saveButton(screen).onPress(); await h.settle();
-    h.detail(1, dto("wrong")); await h.settle(); assert.match(formText(screen), /ID가 일치하지/);
+    h.detail(1, dto("wrong")); await h.settle();
+    assertEditCopy(screen, "수정 결과를 확인할 수 없어요", "변경 사항이 저장됐을 수도 있어요. 중복 수정을 막기 위해 먼저 최신 상태를 확인해 주세요.", "수정 결과 확인하기");
     assert.equal(Object.values(h.server.store.getState().servers)[0].entities.wrong, undefined); assert.deepEqual(h.navigations, []);
   } finally { h.close(); }
 });
@@ -857,9 +1390,10 @@ test("PATCH 결과 확인 GET이 404여도 입력을 보존하고 조회 성공�
   const h = harness("server"); try {
     const screen = await editableDetail(h); editTitle(h, screen); saveButton(screen).onPress(); await h.settle();
     h.calls[1].reject(new Error("메모리 네트워크 오류")); await h.settle(); h.calls[2].reject(new Error("메모리 네트워크 오류")); await h.settle();
-    screen.all("Button").find((p) => p.label === "서버 상태 다시 불러오기").onPress(); await h.settle();
+    editReadButton(screen).onPress(); await h.settle();
     h.detail(3, notFoundProblem(), 404, "application/problem+json"); await h.settle();
-    assert.equal(screen.one("TextInput").value, "수정 입력"); assert.match(formText(screen), /서버 상태를 확인하지 못했/);
+    assert.equal(screen.one("TextInput").value, "수정 입력");
+    assertEditCopy(screen, "최신 정보를 불러오지 못했어요", "수정 여부가 확인되지 않았어요. 연결 상태를 확인하고 다시 조회해 주세요.", "수정 결과 다시 확인하기");
     assert.equal(saveButton(screen).disabled, true); assert.deepEqual(h.navigations, []);
   } finally { h.close(); }
 });
@@ -1150,7 +1684,7 @@ test("H 서버·모드 왕복 전환 전의 토글 callback은 재사용 불가"
   }
 });
 
-const deleteButton = (screen) => screen.one("Stack.Screen").options.headerRight()?.props;
+const deleteButton = (screen) => screen.one("Stack.Toolbar.View")?.children?.props ?? screen.one("Stack.Screen").options.headerRight()?.props;
 const deleteCalls = (h) => h.calls.filter((c) => c.method === "DELETE");
 const retryDeletion = (screen) => screen.all("Button").find((p) => p.label === "서버 상태 다시 불러오기")?.onPress ?? screen.one("ScheduleListState")?.onRetry;
 function confirmDelete(h, screen) {
@@ -1632,9 +2166,13 @@ const flatStyle = (style) => Object.assign({}, ...[style].flat(Infinity).filter(
 const editHeader = (screen) => screen.one("Stack.Screen");
 const editContent = (screen) => screen.all("View").find((props) => props.testID === "schedule-edit-content");
 const feedbackPanel = (screen) => screen.all("ScrollView").find((props) => props.testID === "schedule-feedback");
+const listFeedback = (screen) => screen.all("View").find((props) => props.testID === "schedule-list-feedback");
 function assertStableCards(list, calendar) {
   assert.equal(states(list).includes("loading"), false); assert.equal(states(calendar).includes("loading"), false);
-  assert.equal(list.one("FlatList").ListHeaderComponent, undefined);
+  if (states(list).some((state) => state === "error" || state === "notice")) {
+    assert.strictEqual(list.one("FlatList").ListHeaderComponent.props, listFeedback(list));
+    assert.equal(feedbackPanel(list), undefined);
+  } else assert.equal(list.one("FlatList").ListHeaderComponent, undefined);
   assert.equal(flatStyle(calendar.all("View").find((props) => props.testID === "calendar-schedule-list").style).marginTop, 8);
 }
 
@@ -1704,13 +2242,80 @@ test("H 빠른 수정 진입: 실제 단건 네트워크 실패는 cache·입력
     h.respond(3, [dto(id, "INVENTORY", true)]); h.respond(4, [dto(id, "INVENTORY", true)]); await h.settle();
     h.calls[5].reject(new Error("memory network")); await h.settle(); h.calls[6].reject(new Error("memory network"));
     await read; await h.settle();
-    assert.equal(screen.one("ScheduleListState").state, "error"); assert.match(screen.one("ScheduleListState").errorTitle, /최신 정보를 불러오지 못했어요/);
+    assertEditCopy(screen, "일정 정보를 불러오지 못했어요", "현재 이전 정보를 표시하고 있어요.", "일정 정보 다시 불러오기");
     assert.equal(screen.one("TextInput").value, "통신 실패 중 입력"); assert.equal(saveButton(screen).disabled, true);
     assert.equal(listCard(list).schedule.completed, true); assert.equal(calendar.one("ScheduleCard").schedule.completed, true);
-    screen.one("ScheduleListState").onRetry(); await h.settle();
+    editReadButton(screen).onPress(); await h.settle();
     assert.equal(h.calls[7].method, "GET"); h.detail(7, dto(id, "INVENTORY", true)); await h.settle();
-    assert.deepEqual(screen.all("ScheduleListState"), []); assert.equal(screen.one("TextInput").value, "통신 실패 중 입력");
+    assert.equal(editFeedback(screen), undefined); assert.equal(screen.one("TextInput").value, "통신 실패 중 입력");
     assert.equal(saveButton(screen).disabled, false); assert.equal(patches(h).length, 1);
+  } finally { h.close(); }
+});
+
+for (const platform of ["ios", "android"]) for (const compileEditScreen of [false, true]) test(`UI 저장 성공·목록 갱신·복귀 시 동일한 삭제 Header 옵션 유지 (${platform}, Compiler ${compileEditScreen})`, async () => {
+  const h = harness("server", { compileEditScreen, platform }); try {
+    const screen = await editableDetail(h), form = screen.instance("ScheduleEditForm");
+    const headerPresentation = () => screen.headerToolbarProps() ?? editHeader(screen).options;
+    const enabledOptions = headerPresentation(), screenOptions = editHeader(screen).options;
+    assert.equal(deleteButton(screen).disabled, false);
+    h.back(); assert.strictEqual(headerPresentation(), enabledOptions);
+    assert.deepEqual(h.navigations, ["back"]); h.navigations.length = 0;
+    editTitle(h, screen); saveButton(screen).onPress(); await h.settle();
+    const pendingOptions = headerPresentation(), pendingOnPress = deleteButton(screen).onPress;
+    assert.equal(deleteButton(screen).disabled, true); assert.notStrictEqual(pendingOptions, enabledOptions);
+    const updated = { ...dto("target"), title: "수정 입력" };
+    h.detail(1, updated); await h.settle();
+    assert.strictEqual(headerPresentation(), pendingOptions, "같은 버튼 표시·비활성화 상태에서 일정 객체 교체는 헤더 재등록 사유가 아니다");
+    assert.strictEqual(deleteButton(screen).onPress, pendingOnPress);
+    if (platform === "ios") {
+      assert.strictEqual(editHeader(screen).options, screenOptions); assert.equal(screenOptions.headerRight(), null);
+      assert.equal(screen.one("Stack.Toolbar.View").hidesSharedBackground, true);
+    }
+    assert.equal(deleteButton(screen).disabled, true); assert.deepEqual(h.navigations, []);
+    h.respond(2, [updated]); await h.settle();
+    assert.strictEqual(headerPresentation(), pendingOptions, "busy 해제·공유 변경 정리 직후에도 기존 헤더 옵션을 유지한다");
+    assert.strictEqual(screen.instance("ScheduleEditForm"), form); assert.equal(deleteButton(screen).disabled, true);
+    assert.deepEqual(h.navigations, ["back"]); assert.equal(patches(h).length, 1);
+    pendingOnPress(); h.flush();
+    assert.equal(screen.one("ConfirmationModal").visible, false); assert.equal(deleteCalls(h).length, 0);
+  } finally { h.close(); }
+});
+
+for (const platform of ["ios", "android"]) for (const readOnly of [false, true]) test(`UI 삭제 버튼 ${platform} 분기·배경·접근성·확인 동작 유지 (읽기 전용 ${readOnly})`, async () => {
+  const h = harness("server", { platform, readOnly }); try {
+    const screen = await editableDetail(h), button = deleteButton(screen);
+    assert.equal(button.accessibilityLabel, "일정 삭제"); assert.equal(button.accessibilityRole, "button");
+    assert.equal(button.disabled, readOnly); assert.equal(button.accessibilityState.disabled, readOnly);
+    const style = flatStyle(button.style({ pressed: false }));
+    assert.equal(style.width, 44); assert.equal(style.height, 44);
+    assert.equal(style.alignItems, "center"); assert.equal(style.justifyContent, "center");
+    assert.equal(button.children.type, "SymbolView"); assert.equal(button.children.props.size, 24);
+    assert.equal(button.children.props.name[platform], platform === "ios" ? "trash" : "delete_outline");
+    assert.equal(button.children.props.tintColor, "red");
+    if (platform === "ios") {
+      assert.equal(editHeader(screen).options.headerRight(), null);
+      assert.equal(screen.all("Stack.Toolbar").length, 1); assert.equal(screen.one("Stack.Toolbar").placement, "right");
+      assert.equal(screen.one("Stack.Toolbar").asChild, undefined);
+      assert.equal(screen.all("Stack.Toolbar.View").length, 1); assert.equal(screen.one("Stack.Toolbar.View").hidesSharedBackground, true);
+      assert.equal(screen.all("Pressable").filter((p) => p.accessibilityLabel === "일정 삭제").length, 1);
+    } else {
+      assert.equal(screen.one("Stack.Toolbar"), undefined); assert.equal(screen.one("Stack.Toolbar.View"), undefined);
+      assert.ok(editHeader(screen).options.headerRight());
+    }
+    button.onPress(); h.flush();
+    assert.equal(screen.one("ConfirmationModal").visible, !readOnly); assert.equal(deleteCalls(h).length, 0);
+    if (readOnly) {
+      screen.one("ConfirmationModal").onConfirm(); await h.settle();
+      assert.equal(deleteCalls(h).length, 0); assert.deepEqual(h.navigations, []);
+    } else {
+      screen.one("ConfirmationModal").onCancel(); screen.one("ConfirmationModal").onDismiss(); h.flush();
+      assert.equal(screen.one("ConfirmationModal").visible, false); assert.equal(deleteCalls(h).length, 0);
+      deleteButton(screen).onPress(); screen.one("ConfirmationModal").onConfirm(); await h.settle();
+      assert.equal(deleteCalls(h).length, 1); assert.equal(deleteButton(screen).disabled, true);
+      noContent(h, 1); await h.settle(); h.respond(2, []); await h.settle();
+      screen.one("ConfirmationModal").onDismiss(); h.flush();
+      assert.deepEqual(h.navigations, ["back"]);
+    }
   } finally { h.close(); }
 });
 
@@ -1752,7 +2357,7 @@ test("UI 목록·캘린더 캐시 수정 진입과 GET 재조회는 스피너 �
       assert.strictEqual(screen.one("DateTimePicker").value, picker); assert.strictEqual(screen.one("ScrollView").contentContainerStyle, scrollStyle);
       const retry = h.server.retryDetail(id); await h.settle(); h.respond(2, [], 500); await retry; await h.settle();
       assert.equal(screen.one("TextInput").value, "보존할 입력"); assert.equal(screen.one("ActivityIndicator"), undefined);
-      assert.ok(states(screen).includes("error")); screen.one("ScheduleListState").onRetry(); await h.settle();
+      assertEditCopy(screen, "일정 정보를 불러오지 못했어요", "현재 이전 정보를 표시하고 있어요.", "일정 정보 다시 불러오기"); editReadButton(screen).onPress(); await h.settle();
       h.detail(3, dto(id)); await h.settle(); assert.strictEqual(screen.instance("ScheduleEditForm"), form);
       assert.equal(screen.one("TextInput").value, "보존할 입력"); assert.ok(h.calls.every((call) => call.method === "GET"));
     } finally { h.close(); }
@@ -1762,6 +2367,7 @@ test("UI 목록·캘린더 캐시 수정 진입과 GET 재조회는 스피너 �
 test("UI native Header 아래 폼은 기존 하단 Safe Area만 사용하고 별도 Header 높이·inset 보정 없음", () => {
   const h = harness("mock"); try {
     const screen = h.mount("detail", mockId), form = screen.instance("ScheduleEditForm");
+    assert.equal(editFeedback(screen), undefined); assert.equal(editReadButton(screen), undefined);
     assert.deepEqual(screen.all("SafeAreaView").map((props) => props.edges), [["bottom"]]);
     assert.equal(screen.all("SafeAreaView").some((props) => props.testID === "schedule-edit-header"), false);
     editTitle(h, screen, "키보드 입력");
@@ -1804,19 +2410,19 @@ test("UI mutation이 진행 중 GET을 취소해도 오류를 만들지 않고 �
   } finally { h.close(); }
 });
 
-test("UI PATCH 성공 뒤 GET 실패는 중복 오류 없이 하단에서 안내하고 실패한 GET만 재시도", async () => {
+test("UI PATCH 성공 뒤 GET 실패는 목록 헤더에서 한 번 안내하고 실패한 GET만 재시도", async () => {
   const h = harness("server"); try {
     const id = randomUUID(), { list, calendar } = await completionScreens(h, [dto(id)]);
     listCard(list).onToggleCompleted(); await h.settle(); h.detail(2, dto(id, "INVENTORY", true)); await h.settle();
     h.respond(3, [], 500); h.respond(4, [dto(id, "INVENTORY", true)]); await h.settle();
     assertStableCards(list, calendar); assert.equal(listCard(list).schedule.completed, true);
     assert.equal(list.all("ScheduleListState").length, 1); assert.equal(completionNotice(list).state, "error");
-    assert.match(completionNotice(list).errorTitle, /변경되었지만 목록/); assert.ok(feedbackPanel(list)); assert.ok(feedbackPanel(calendar));
-    assert.equal(completionNotice(list).retryLabel, "GET 상태 확인");
+    assert.match(completionNotice(list).errorTitle, /변경되었지만 목록/); assert.ok(listFeedback(list)); assert.ok(feedbackPanel(calendar));
+    assert.equal(completionNotice(list).retryLabel, "완료 상태 확인하기");
     completionNotice(list).onRetry(); completionNotice(calendar).onRetry(); await h.settle();
     assert.equal(h.calls.length, 6); assert.equal(h.calls[5].method, "GET"); assert.equal(h.calls[5].url, h.calls[3].url);
     assertStableCards(list, calendar); h.respond(5, [dto(id, "INVENTORY", true)]); await h.settle();
-    assert.equal(patches(h).length, 1); assert.equal(feedbackPanel(list), undefined);
+    assert.equal(patches(h).length, 1); assert.equal(listFeedback(list), undefined);
   } finally { h.close(); }
 });
 
@@ -1830,27 +2436,30 @@ test("UI PATCH 확정 거절은 rollback과 오류를 유지하며 불확실 GET
       else h.detail(2, { invalid: true });
       await h.settle(); assertStableCards(list, calendar); assert.equal(listCard(list).schedule.completed, false);
       assert.equal(Object.values(h.server.store.getState().servers)[0].mutations[id].phase, outcome === "rejected" ? "error" : "uncertain");
-      assert.equal(completionNotice(list).state, "error"); assert.ok(feedbackPanel(list)); assert.equal(list.all("ScheduleListState").length, 1);
+      assert.equal(completionNotice(list).state, "error"); assert.ok(listFeedback(list)); assert.equal(list.all("ScheduleListState").length, 1);
       completionNotice(list).onRetry(); await h.settle();
       if (outcome !== "rejected") { h.detail(3, dto(id, "INVENTORY", true)); await h.settle(); }
       await respondLists(h, outcome !== "rejected" ? 4 : 3, [dto(id, "INVENTORY", outcome !== "rejected")]);
       assert.equal(patches(h).length, 1);
       if (outcome !== "rejected") {
         assert.equal(completionNotice(list).state, "notice"); assert.match(completionNotice(list).errorTitle, /이전 PATCH의 성공 여부를 뜻하지/);
+        assert.ok(listFeedback(list)); assert.equal(feedbackPanel(list), undefined);
+        // data가 남아 있으면 실제 FlatList는 설정된 ListEmptyComponent를 렌더하지 않는다.
+        assert.equal(list.all("ScheduleListState").filter(({ state }) => state === "error" || state === "notice").length, 1);
       } else assert.equal(completionNotice(list), undefined);
     } finally { h.close(); }
   }
 });
 
-test("UI 독립적인 GET 오류는 카드 위 배치 없이 표시하고 GET Retry만 실행", async () => {
+test("UI 독립적인 GET 오류는 목록 헤더에 표시하고 GET Retry만 실행", async () => {
   const h = harness("server"); try {
     const { list, calendar } = await completionScreens(h);
     const query = h.source("src/utils/schedule-query.ts").getMainScheduleRange(new Date("2026-11-07T03:00:00Z"));
     const retry = h.server.retry(query); await h.settle(); assertStableCards(list, calendar);
     h.respond(2, [], 500); await retry; await h.settle();
-    assertStableCards(list, calendar); assert.ok(feedbackPanel(list)); assert.match(list.one("ScheduleListState").errorTitle, /최신/);
+    assertStableCards(list, calendar); assert.ok(listFeedback(list)); assert.match(list.one("ScheduleListState").errorTitle, /최신/);
     list.one("ScheduleListState").onRetry(); await h.settle(); h.respond(3, [dto("target")]); await h.settle();
-    assert.equal(feedbackPanel(list), undefined); assert.ok(h.calls.every((call) => call.method === "GET"));
+    assert.equal(listFeedback(list), undefined); assert.ok(h.calls.every((call) => call.method === "GET"));
   } finally { h.close(); }
 });
 
@@ -1860,9 +2469,9 @@ test("UI 수정 GET가 mutation으로 취소되면 가짜 오류 대신 GET 확�
     editTitle(h, screen, "진행 중 입력"); await h.settle();
     listCard(list).onToggleCompleted(); await h.settle(); assert.equal(h.calls[2].signal.aborted, true);
     h.detail(3, validationProblem(), 422, "application/problem+json"); await h.settle();
-    assert.equal(screen.one("ScheduleListState").state, "notice"); assert.ok(editHeader(screen));
+    assertEditCopy(screen, "일정 정보를 다시 확인해 주세요", "일정 정보를 다시 불러와 최신 상태를 확인해 주세요.", "일정 정보 다시 불러오기"); assert.ok(editHeader(screen));
     assert.equal(screen.one("ActivityIndicator"), undefined); assert.equal(screen.one("TextInput").value, "진행 중 입력");
-    screen.one("ScheduleListState").onRetry(); await h.settle(); h.detail(4, dto(id)); await h.settle();
+    editReadButton(screen).onPress(); await h.settle(); h.detail(4, dto(id)); await h.settle();
     assert.equal(screen.one("TextInput").value, "진행 중 입력"); assert.equal(saveButton(screen).disabled, false); assert.equal(patches(h).length, 1);
   } finally { h.close(); }
 });

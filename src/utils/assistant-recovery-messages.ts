@@ -1,0 +1,49 @@
+import type { ConversationMessage } from "@/components/assistant/conversation-list";
+import type { AssistantExecutionResult } from "@/services/api/assistant-orchestrator";
+import type { AssistantRecoveryReference } from "@/types/assistant-recovery";
+import { assistantHttpErrorNotice, getAssistantExecutionError } from "@/utils/assistant-errors";
+
+const sameRequest = (a: AssistantRecoveryReference, b: AssistantRecoveryReference) =>
+  a.serverId === b.serverId && a.requestId.toLowerCase() === b.requestId.toLowerCase();
+
+// 표시 중복 제거만 담당한다. 영속 복구 정보 정리·요청 실행과는 무관하다.
+export function upsertAssistantExecutionMessage(messages: ConversationMessage[], execution: AssistantExecutionResult,
+  source: "request" | "recovery", options: { uncertainRecheck?: boolean } = {}): ConversationMessage[] {
+  const index = messages.findIndex(message => message.role === "assistant" && message.apiExecution &&
+    sameRequest(message.apiExecution.reference, execution.reference));
+  const previous = index < 0 ? undefined : messages[index];
+  if (previous?.role === "assistant") {
+    const old = previous.apiExecution;
+    const oldError = old ? getAssistantExecutionError(old) : undefined;
+    if (previous.apiUncertain && oldError?.operation === "get" && oldError.status === 410 &&
+      oldError.problem?.code === "REQUEST_EXPIRED" && execution.kind === "completed") return messages;
+    // 단방향 처리 상태와 더 최근의 복구 GET 관측을 늦은 최초 요청 callback으로 되돌리지 않는다.
+    if (old?.kind === "completed" && ["outcome", "failure"].includes(old.response.data.result.kind) &&
+      execution.kind === "completed" && execution.response.data.result.kind === "uncertain") return messages;
+    if (previous.apiUncertain && old && old.kind !== "completed" && !options.uncertainRecheck &&
+      execution.kind === "completed" && execution.response.data.result.kind === "uncertain") return messages;
+    if (execution.kind === "observed" && (old?.kind === "completed" &&
+      !(options.uncertainRecheck && old.response.data.result.kind === "uncertain") ||
+      old?.kind === "observed" && old.response.data.status === "processing" && execution.response.data.status === "accepted")) return messages;
+    if (source === "request" && previous.apiSource === "recovery" && (old?.kind === "completed" ||
+      old?.kind === "needs-attention" && old.recoveryResult?.kind === "unconfirmed" && old.recoveryResult.getResult)) return messages;
+    if (execution.kind === "needs-attention" && source === "request" && old?.kind === "completed") return messages;
+  }
+  const history = execution.kind === "completed" && ["outcome", "failure"].includes(execution.response.data.result.kind) ? undefined
+    : execution.kind === "completed" && execution.response.data.result.kind === "uncertain" ? execution
+    : previous?.role === "assistant" ? previous.apiUncertain : undefined;
+  const error = getAssistantExecutionError(execution);
+  const text = execution.kind === "completed" ? execution.response.data.result.text
+    : execution.kind === "observed" ? "서버에서 요청을 처리하고 있어요."
+    : execution.reason === "deadline" ? "자동 확인 시간이 끝났어요. 요청 결과는 아직 확인이 필요해요."
+    : history ? history.response.data.result.text : error ? assistantHttpErrorNotice(error)
+    : "요청 결과를 확인하지 못했어요. 원래 요청의 확인이 필요해요.";
+  const next: ConversationMessage = { ...(previous?.role === "assistant" && previous.apiErrorRecovery ? { apiErrorRecovery: previous.apiErrorRecovery } : {}),
+    id: previous?.id ?? (source === "request" ? `assistant-${execution.reference.requestId}` : `assistant-recovery-${JSON.stringify([
+    execution.reference.serverId, execution.reference.requestId.toLowerCase(),
+    ])}`), role: "assistant", serverId: execution.reference.serverId, text, apiExecution: execution, apiSource: source,
+    ...(history ? { apiUncertain: history } : {}) };
+  if (previous && JSON.stringify(previous) === JSON.stringify(next)) return messages;
+  if (index < 0) return [...messages, next];
+  return messages.map((message, position) => position === index ? next : message);
+}

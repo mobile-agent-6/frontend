@@ -40,6 +40,13 @@ function harness(initialMode = "mock") {
       compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX }, fileName: file,
     }).outputText;
     const resolve = (name) => {
+      // 서버 설정이 없는 기존 경계 검증은 통신 계층을 실행하지 않는다.
+      if (name === "@/services/api/assistant") return { assistantHttpClient: { getServerId: () => null } };
+      if (name === "@/services/api/assistant-orchestrator") return { assistantOrchestrator: { startRequest: () => { throw new Error("서버 설정 없이 전송 금지"); } } };
+      if (name === "@/services/api/assistant-lifecycle") return { assistantLifecycle: { getSnapshot: () => ({ phase: "idle", initialCheck: "pending", serverId: null, results: [] }), subscribe: () => () => {} } };
+      if (name === "@/services/api/assistant-schedule-sync") return { assistantScheduleSync: { getSnapshot: () => [], subscribe: () => () => {} } };
+      // 실제 사용자 저장소를 읽지 않는다. 정리·저장 안전성은 전용 Assistant 화면 테스트에서 검증한다.
+      if (name === "@/services/storage/assistant-recovery") return { assistantRecoveryStorage: { readAll: async () => [] } };
       if (name === "react") return react;
       if (name === "react/jsx-runtime") return { jsx: (type, props) => ({ type, props }), jsxs: (type, props) => ({ type, props }) };
       if (name === "react-native") return { KeyboardAvoidingView: "KeyboardAvoidingView", Platform: { OS: "ios" }, StyleSheet: { create: (s) => s } };
@@ -145,13 +152,13 @@ test("Mock 화면 후보 선택·삭제 확인·완료 interaction 재실행 차
     assert.equal(h.mock.getState().schedules.some((s) => s.id === id(1)), false);
   } finally { h.close(); }
 });
-test("서버 초기 진입에서도 Assistant Mock write·HTTP 쓰기 허용 없이 미연동 안내", () => {
+test("서버 초기 진입에서도 Assistant Mock write 차단·설정 누락 안내 유지", () => {
   const h = harness("server"); try {
     const before = h.mock.getState().schedules;
     assert.equal(h.mode.scheduleDataModeStore.getState().mode, "server");
     const result = h.service.runMockAssistantScenario("내일 오후 3시 팀 회의 추가해 줘");
     assert.equal(result.text, h.mode.ASSISTANT_NOT_CONNECTED_MESSAGE);
-    h.send("재고 일정 삭제해 줘"); assert.equal(messages(h).at(-1).text, h.mode.ASSISTANT_NOT_CONNECTED_MESSAGE);
+    h.send("재고 일정 삭제해 줘"); assert.match(messages(h).at(-1).text, /서버 설정/);
     assert.equal(h.mode.isScheduleRequestAllowed("POST", "/assistant/requests"), false);
     assert.equal(h.mode.isScheduleRequestAllowed("POST", "/system/time-sync"), false);
     assert.strictEqual(h.mock.getState().schedules, before); assert.equal(h.timers.size, 0);
@@ -176,12 +183,12 @@ test("서버 모드의 모든 공개 Mock 진입점은 조회·생성·수정·�
     assert.equal(writes, 0); assert.strictEqual(h.mock.getState().schedules, before); unsubscribe();
   } finally { h.close(); }
 });
-test("서버 모드 화면은 사용자 기록을 남기고 미연동 안내·잠금 복구", () => {
+test("설정 없는 서버 모드 화면은 입력 보존·설정 안내·잠금 복구", () => {
   const h = harness();
   try {
     h.switchMode("server"); h.send("내일 오후 3시 팀 회의 추가해 줘");
-    assert.ok(messages(h).some((m) => m.role === "user"));
-    assert.equal(messages(h).at(-1).text, h.mode.ASSISTANT_NOT_CONNECTED_MESSAGE);
+    assert.equal(h.find("MessageInput").value, "내일 오후 3시 팀 회의 추가해 줘");
+    assert.match(messages(h).at(-1).text, /서버 설정/);
     assert.equal(h.find("MessageInput").disabled, false); assert.equal(h.find("ConversationList").isProcessing, false);
     assert.equal(h.timers.size, 0); assert.equal(h.mock.getState().schedules.length, 10);
   } finally { h.close(); }
@@ -211,8 +218,9 @@ test("모드 변경 전 후보·확인 callback은 서버 및 Mock 복귀 후 �
       h.send(input); h.fire(); const interaction = messages(h).at(-1), callbacks = h.find("ConversationList");
       h.switchMode("server");
       callbacks.onCandidateSelection(interaction.id, id(1)); callbacks.onDeleteConfirmation(interaction.id, true); h.render();
-      assert.equal(messages(h).find((m) => m.id === interaction.id).interaction.resolved, true);
-      h.switchMode("mock"); callbacks.onDeleteConfirmation(interaction.id, true); h.render();
+      assert.equal(messages(h).find((m) => m.id === interaction.id), undefined);
+      h.switchMode("mock"); assert.equal(messages(h).find((m) => m.id === interaction.id).interaction.resolved, true);
+      callbacks.onDeleteConfirmation(interaction.id, true); h.render();
       assert.equal(h.mock.getState().schedules.length, 10); assert.equal(h.find("MessageInput").disabled, false);
     } finally { h.close(); }
   }
@@ -270,7 +278,7 @@ test("Mock 변경 후 모드 전환이 발생하면 이전 성공 메시지를 �
     const unsubscribe = h.mock.subscribe(() => h.mode.scheduleDataModeStore.getState().setMode("server"));
     h.send("내일 오후 3시 팀 회의 추가해 줘"); h.fire(); unsubscribe();
     assert.equal(h.mock.getState().schedules.length, 11);
-    assert.equal(messages(h).at(-1).text, h.mode.ASSISTANT_NOT_CONNECTED_MESSAGE);
+    assert.match(messages(h).at(-1).text, /데이터 모드가 변경/);
     assert.equal(messages(h).some((m) => m.text === "네, 일정을 추가했어요."), false);
     assert.equal(h.find("MessageInput").disabled, false);
   } finally { h.close(); }
