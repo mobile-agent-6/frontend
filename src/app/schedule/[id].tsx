@@ -1,6 +1,6 @@
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import { SymbolView } from "expo-symbols";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ActivityIndicator, Platform, Pressable, StyleSheet, View } from "react-native";
 import { useStore } from "zustand";
 
@@ -18,6 +18,16 @@ import { useScheduleDeletion } from "@/hooks/use-schedule-deletion";
 import { useServerScheduleDetail } from "@/hooks/use-server-schedule-data";
 import { ScheduleListState } from "@/components/schedule-list/schedule-list-state";
 import type { Schedule } from "@/types/schedule";
+
+// iOS의 우측 항목은 Toolbar만 담당하며 이전 headerRight 항목도 명시적으로 비운다.
+const iosHeaderOptions = { headerRight: () => null };
+
+function userMessage(message: string | null | undefined) {
+  return message
+    ?.replaceAll("GET 조회만 다시 시도해 주세요.", "최신 정보를 다시 불러와 주세요.")
+    .replaceAll("GET으로 일정 존재 여부를 확인해 주세요.", "최신 일정 정보를 확인해 주세요.")
+    .replaceAll("삭제 성공으로 처리하지 않고 GET으로 확인해 주세요.", "삭제 결과는 아직 확인되지 않았어요. 최신 정보를 확인해 주세요.") ?? null;
+}
 
 export default function ScheduleEditScreen() {
   const { id } = useLocalSearchParams<{ id?: string | string[] }>();
@@ -71,15 +81,16 @@ function ScheduleEditContent({ id, serverMode, generation, detail }: {
   // 확정 성공 또는 결과 확인 중에는 원래 폼을 유지해 입력 유실·not-found 깜빡임을 막는다.
   const displayedSchedule = schedule ?? ((serverMode ? serverUpdate.busy || serverUpdate.blocked || serverDeletion.active : actionLocked) ? actionSchedule : null);
   const initialLoading = serverMode && detail.initialLoading && !displayedSchedule && !serverDeletion.active;
+  const hasSchedule = Boolean(schedule);
 
-  const openDeleteModal = () => {
+  const openDeleteModal = useCallback(() => {
     if (!mountedRef.current || generation !== scheduleDataModeStore.getState().generation) return;
     if (serverMode ? isMockScheduleMode() || deleteDisabled || !id ||
       !isScheduleRequestAllowed("DELETE", `/schedules/${encodeURIComponent(id)}`) : !isMockScheduleMode(generation)) return;
-    if (actionLockedRef.current || deleteModalDismissingRef.current || !schedule) return;
+    if (actionLockedRef.current || deleteModalDismissingRef.current || !hasSchedule) return;
     deleteModalVisibleRef.current = true;
     setIsDeleteModalVisible(true);
-  };
+  }, [deleteDisabled, generation, hasSchedule, id, serverMode]);
 
   const navigateServerDelete = () => {
     if (!mountedRef.current || isMockScheduleMode() || generation !== scheduleDataModeStore.getState().generation || serverDeleteNavigatedRef.current) return;
@@ -203,49 +214,122 @@ function ScheduleEditContent({ id, serverMode, generation, detail }: {
 
   const needsRefresh = serverMode && Boolean(displayedSchedule) && detail.stale && !detail.isFetching &&
     !detail.error && !detail.refreshPending;
-  const readFeedback = serverMode && (detail.error || detail.notFound || needsRefresh) && !serverDeletion.active ? (
+  const readError = serverMode && (detail.error || detail.notFound || needsRefresh) && !serverDeletion.active
+    ? detail.notFound ? "일정을 찾을 수 없어요." : detail.hasSuccessfulRead
+      ? needsRefresh ? "일정 정보를 다시 확인해 주세요." : "최신 정보를 불러오지 못했어요. 이전 정보를 표시하고 있어요."
+      : "일정을 불러오지 못했어요."
+    : null;
+  // 미확인 PATCH의 retryServerRead는 같은 단건 GET과 잠금을 보존한다.
+  // 성공 PATCH의 retryServerRead는 목록 GET이므로 단건 복구도 별도로 제공한다.
+  const additionalDetailRetry = serverMode && serverUpdate.saved && serverUpdate.needsCheck && readError
+    ? detail.retryRead : undefined;
+  // 기존 Hook의 안내 상태를 사용자용 문구로만 변환한다. 요청·복구·잠금 상태는 그대로 사용한다.
+  const updateFeedback = (() => {
+    if (!serverMode || serverDeletion.active || !serverUpdate.needsCheck || (!serverUpdate.error && !readError)) return null;
+    if (serverUpdate.saved) {
+      if (readError) return {
+        title: "일정은 수정됐어요",
+        description: "일정 목록과 상세 정보를 최신 상태로 불러오지 못했어요.",
+        retryLabel: "일정 목록 다시 불러오기",
+      };
+      return serverUpdate.error === "목록을 갱신하지 못했어요. GET 조회만 다시 시도해 주세요." ? {
+        title: "일정 목록을 불러오지 못했어요",
+        description: "수정은 완료됐지만 목록을 갱신하지 못했어요.",
+        retryLabel: "일정 목록 다시 불러오기",
+      } : {
+        title: "일정은 수정됐어요",
+        description: "다만 일정 목록에 변경 내용이 표시되지 않을 수 있어요.",
+        retryLabel: "일정 목록 새로고침",
+      };
+    }
+    if (serverUpdate.error === "서버 상태를 확인하지 못했어요. 입력과 수정 잠금을 유지하고 GET 조회만 다시 시도해 주세요." ||
+      serverUpdate.error === "서버 상태를 조회하지 못했어요. GET 조회만 다시 시도해 주세요." ||
+      (!detail.notFound && Boolean(detail.error) && Boolean(readError))) return {
+      title: "최신 정보를 불러오지 못했어요",
+      description: "수정 여부가 확인되지 않았어요. 연결 상태를 확인하고 다시 조회해 주세요.",
+      retryLabel: "수정 결과 다시 확인하기",
+    };
+    if (detail.notFound) return {
+      title: "일정을 확인할 수 없어요",
+      description: "현재 서버에서 일정을 찾지 못했어요. 수정 결과도 아직 확인되지 않았어요.",
+      retryLabel: "수정 결과 확인하기",
+    };
+    if (serverUpdate.error === "서버 상태를 다시 조회했어요. 기존 수정의 적용 여부를 확인해 주세요. 자동으로 다시 저장하지 않습니다.") return {
+      title: "최신 일정 정보를 불러왔어요",
+      description: "변경 사항이 반영됐는지 확인해 주세요.",
+      retryLabel: "다시 확인하기",
+    };
+    return {
+      title: "수정 결과를 확인할 수 없어요",
+      description: "변경 사항이 저장됐을 수도 있어요. 중복 수정을 막기 위해 먼저 최신 상태를 확인해 주세요.",
+      retryLabel: "수정 결과 확인하기",
+    };
+  })();
+  const formActionError = serverMode ? serverDeletion.error ?? serverUpdate.error ?? actionError ??
+    (!patchAllowed && !deleteAllowed ? "현재 정책에서는 일정 수정·삭제를 사용할 수 없어요." : null) : actionError;
+  const detailFeedback = readError ? {
+    title: needsRefresh ? "일정 정보를 다시 확인해 주세요" : "일정 정보를 불러오지 못했어요",
+    description: detail.notFound ? "현재 서버에서 일정을 찾지 못했어요."
+      : needsRefresh ? "일정 정보를 다시 불러와 최신 상태를 확인해 주세요." : "현재 이전 정보를 표시하고 있어요.",
+  } : null;
+  const readFeedback = readError ? (
     <ScheduleListState state={needsRefresh ? "notice" : "error"} onRetry={detail.retryRead}
-      retryLabel={needsRefresh ? "GET 다시 조회" : undefined}
-      errorTitle={detail.notFound ? "일정을 찾을 수 없어요." : detail.hasSuccessfulRead
-        ? needsRefresh ? "일정 정보를 다시 확인해 주세요." : "최신 정보를 불러오지 못했어요. 이전 정보를 표시하고 있어요."
-        : "일정을 불러오지 못했어요."} />
+      retryLabel="일정 정보 다시 불러오기"
+      errorTitle={readError} />
   ) : null;
+
+  const showDeleteButton = Boolean(displayedSchedule);
+  const headerDeleteDisabled = deleteDisabled || actionLocked || isDeleteModalDismissing;
+  const destructiveColor = theme.destructive;
+  // Header는 일정의 내용이 아니라 표시 여부·비활성화·색상·동작이 바뀔 때만 재등록한다.
+  const headerOptions = useMemo(() => ({
+    headerRight: () => showDeleteButton ? (
+      <Pressable
+        accessibilityLabel="일정 삭제"
+        accessibilityRole="button"
+        disabled={headerDeleteDisabled}
+        accessibilityState={{ disabled: headerDeleteDisabled }}
+        onPress={openDeleteModal}
+        style={({ pressed }) => [
+          styles.deleteButton,
+          pressed && styles.deleteButtonPressed,
+        ]}
+      >
+        <SymbolView
+          name={{
+            ios: "trash",
+            android: "delete_outline",
+            web: "delete_outline",
+          }}
+          size={24}
+          tintColor={destructiveColor}
+          fallback={
+            <ThemedText type="small" style={{ color: destructiveColor }}>
+              삭제
+            </ThemedText>
+          }
+        />
+      </Pressable>
+    ) : null,
+  }), [destructiveColor, headerDeleteDisabled, openDeleteModal, showDeleteButton]);
+  const iosDeleteToolbar = useMemo(() => {
+    if (Platform.OS !== "ios") return null;
+    const button = headerOptions.headerRight();
+    return (
+      <Stack.Toolbar placement="right">
+        {button ? (
+          <Stack.Toolbar.View hidesSharedBackground>
+            {button}
+          </Stack.Toolbar.View>
+        ) : null}
+      </Stack.Toolbar>
+    );
+  }, [headerOptions]);
 
   return (
     <>
-      <Stack.Screen
-        options={{
-          headerRight: () =>
-            displayedSchedule ? (
-              <Pressable
-                accessibilityLabel="일정 삭제"
-                accessibilityRole="button"
-                disabled={deleteDisabled || actionLocked || isDeleteModalDismissing}
-                accessibilityState={{ disabled: deleteDisabled || actionLocked || isDeleteModalDismissing }}
-                onPress={openDeleteModal}
-                style={({ pressed }) => [
-                  styles.deleteButton,
-                  pressed && styles.deleteButtonPressed,
-                ]}
-              >
-                <SymbolView
-                  name={{
-                    ios: "trash",
-                    android: "delete_outline",
-                    web: "delete_outline",
-                  }}
-                  size={24}
-                  tintColor={theme.destructive}
-                  fallback={
-                    <ThemedText type="small" style={{ color: theme.destructive }}>
-                      삭제
-                    </ThemedText>
-                  }
-                />
-              </Pressable>
-            ) : null,
-        }}
-      />
+      <Stack.Screen options={Platform.OS === "ios" ? iosHeaderOptions : headerOptions} />
+      {iosDeleteToolbar}
 
       <View testID="schedule-edit-content" style={[styles.contentArea,
         { backgroundColor: colorScheme === "dark" ? theme.background : "#FCF9F7" }]}>
@@ -257,9 +341,14 @@ function ScheduleEditContent({ id, serverMode, generation, detail }: {
             onSave={handleSave}
             actionLocked={(serverMode && (!patchAllowed || detail.isFetching || !detail.hasDetailSuccess || Boolean(detail.error) ||
               serverUpdate.busy || serverUpdate.blocked || serverDeletion.busy || serverDeletion.blocked)) || actionLocked || isDeleteModalVisible || isDeleteModalDismissing}
-            actionError={serverMode ? serverDeletion.error ?? serverUpdate.error ?? actionError ?? (!patchAllowed && !deleteAllowed ? "현재 정책에서는 일정 수정·삭제를 사용할 수 없어요." : null) : actionError}
-            onRetryRead={serverMode && serverDeletion.needsCheck ? retryDeletionRead : serverMode && serverUpdate.needsCheck ? retryServerRead : undefined}
-            retryReadDisabled={serverUpdate.busy || serverDeletion.busy}
+            actionError={updateFeedback?.description ?? userMessage(formActionError)}
+            errorTitle={updateFeedback?.title ?? (formActionError ? undefined : detailFeedback?.title)}
+            readError={updateFeedback ? null : detailFeedback?.description}
+            onRetryRead={serverMode && serverDeletion.needsCheck ? retryDeletionRead
+              : serverMode && serverUpdate.needsCheck ? retryServerRead : readError ? detail.retryRead : undefined}
+            onRetryDetailRead={additionalDetailRetry}
+            retryReadLabel={updateFeedback?.retryLabel ?? (serverDeletion.needsCheck ? "서버 상태 다시 불러오기" : "일정 정보 다시 불러오기")}
+            retryReadDisabled={serverUpdate.busy || serverDeletion.busy || detail.isFetching}
           />
         ) : !serverMode ? (
           <ThemedView style={styles.notFound}>
@@ -268,10 +357,9 @@ function ScheduleEditContent({ id, serverMode, generation, detail }: {
         ) : null}
         {serverMode && !displayedSchedule && serverDeletion.active && (
           <ScheduleListState state={serverDeletion.busy ? "loading" : "error"}
-            errorTitle={serverDeletion.error ?? (detail.notFound ? "일정을 찾을 수 없어요." : "일정 삭제 결과를 확인하고 있어요.")}
+            errorTitle={userMessage(serverDeletion.error) ?? (detail.notFound ? "일정을 찾을 수 없어요." : "일정 삭제 결과를 확인하고 있어요.")}
             onRetry={serverDeletion.busy ? undefined : retryDeletionRead} />
         )}
-        {displayedSchedule && readFeedback}
         {initialLoading && <View testID="schedule-edit-loading-overlay" style={[styles.loadingOverlay,
           { backgroundColor: colorScheme === "dark" ? "rgba(0, 0, 0, 0.18)" : "rgba(252, 249, 247, 0.55)" }]}>
           <ActivityIndicator color={theme.primary} accessibilityLabel="일정을 불러오는 중" />
@@ -294,8 +382,10 @@ function ScheduleEditContent({ id, serverMode, generation, detail }: {
 
 const styles = StyleSheet.create({
   deleteButton: {
-    minWidth: 44,
-    minHeight: 44,
+    width: 44,
+    height: 44,
+    flexGrow: 0,
+    flexShrink: 0,
     alignItems: "center",
     justifyContent: "center",
   },

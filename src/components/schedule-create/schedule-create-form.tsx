@@ -17,6 +17,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { ScheduleCategorySelector } from "@/components/schedule-create/schedule-category-selector";
 import { ScheduleDateField } from "@/components/schedule-create/schedule-date-field";
 import { ScheduleTimeField } from "@/components/schedule-create/schedule-time-field";
+import { ScheduleErrorNotice } from "@/components/schedule-list/schedule-error-notice";
 import { Button } from "@/components/ui/button";
 import { ThemedText } from "@/components/ui/themed-text";
 import { ThemedView } from "@/components/ui/themed-view";
@@ -236,24 +237,23 @@ export function ScheduleCreateForm() {
             ) : null}
           </View>
 
-          <ScheduleCategorySelector
-            category={category}
-            onSelectCategory={setCategory}
-          />
+          <View style={styles.categorySection}>
+            <ScheduleCategorySelector
+              category={category}
+              onSelectCategory={setCategory}
+            />
 
-          {formError || (serverMode && (creation.error || readOnly)) ? (
-            <View accessibilityRole="alert" style={styles.formError}>
-              <ThemedText
-                type="small"
-                style={[styles.formErrorText, { color: theme.primary }]}
-              >
-                {readOnly ? SCHEDULE_CREATION_READ_ONLY_MESSAGE : serverMode ? creation.error ?? formError : formError}
-              </ThemedText>
-              {serverMode && creation.needsCheck && (
-                <Button label="목록 다시 불러오기" onPress={handleGetRetry} disabled={creation.busy} />
-              )}
-            </View>
-          ) : null}
+            {formError || (serverMode && (creation.error || readOnly)) ? (
+              <ScheduleErrorNotice
+                testID="schedule-create-feedback"
+                title="일정 등록 정보를 확인해 주세요."
+                description={readOnly ? SCHEDULE_CREATION_READ_ONLY_MESSAGE : serverMode ? creation.error ?? formError : formError}
+                actions={serverMode && creation.needsCheck ? [{
+                  key: "list", label: "목록 다시 불러오기", onPress: handleGetRetry, disabled: creation.busy,
+                }] : []}
+              />
+            ) : null}
+          </View>
         </ScrollView>
 
         <SafeAreaView
@@ -310,15 +310,7 @@ const styles = StyleSheet.create({
   picker: {
     minHeight: 180,
   },
-  formError: {
-    borderRadius: 12,
-    paddingHorizontal: Spacing.three,
-    paddingVertical: Spacing.two,
-  },
-  formErrorText: {
-    fontWeight: "600",
-    textAlign: "center",
-  },
+  categorySection: { gap: Spacing.four },
   footer: {
     flexShrink: 0,
     borderTopWidth: StyleSheet.hairlineWidth,

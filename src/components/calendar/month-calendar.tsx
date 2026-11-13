@@ -6,6 +6,7 @@ import { Calendar, LocaleConfig, type CalendarProps } from "react-native-calenda
 import { Spacing } from "@/constants/theme";
 import { ThemedText } from "@/components/ui/themed-text";
 import { useTheme } from "@/hooks/use-theme";
+import { useColorScheme } from "@/hooks/use-color-scheme";
 import { formatLocalDate } from "@/utils/schedule-date-time";
 
 const saturdayColor = "#0EA5E9";
@@ -37,6 +38,7 @@ export function MonthCalendar({
   onMonthChange,
 }: MonthCalendarProps) {
   const theme = useTheme();
+  const dark = useColorScheme() === "dark";
   const today = formatLocalDate(new Date());
   const markedDates = useMemo<NonNullable<CalendarProps["markedDates"]>>(() => {
     const scheduleMarkings: NonNullable<CalendarProps["markedDates"]> =
@@ -85,6 +87,8 @@ export function MonthCalendar({
 
   return (
     <Calendar
+      // 설치된 라이브러리는 내부 색상 스타일을 마운트 시 캐시한다. 테마가 바뀔 때만 갱신한다.
+      key={theme.background}
       style={[
         styles.panel,
         {
@@ -136,7 +140,8 @@ export function MonthCalendar({
         textMonthFontSize: 18,
         textMonthFontWeight: "700",
         textSectionTitleColor: theme.textSecondary,
-        textDisabledColor: `${theme.textSecondary}80`,
+        textDisabledColor: dark ? theme.textSecondary : `${theme.textSecondary}80`,
+        ...(dark ? { textInactiveColor: theme.textSecondary } : {}),
         arrowColor: theme.textSecondary,
         selectedDayBackgroundColor: theme.primary,
         selectedDayTextColor: theme.primaryForeground,

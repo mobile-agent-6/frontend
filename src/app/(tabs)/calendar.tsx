@@ -52,10 +52,10 @@ export default function CalendarScreen() {
   const feedback = <>
     {readError && !(serverMode && selected.completionRefreshFailed) && <ScheduleListState state="error" onRetry={retryRead}
       errorTitle={hasSuccessfulRead ? "최신 정보를 불러오지 못했어요. 이전 정보를 표시하고 있어요." : undefined} />}
-    {needsRefresh && <ScheduleListState state="notice" errorTitle="일정 정보를 다시 확인해 주세요." onRetry={retryRead} retryLabel="GET 다시 조회" />}
+    {needsRefresh && <ScheduleListState state="notice" errorTitle="일정 정보를 다시 확인해 주세요." onRetry={retryRead} retryLabel="일정 다시 불러오기" />}
     {completionError && <ScheduleListState state={serverMode ? completion.completionNoticeState : "error"}
       errorTitle={serverMode ? completion.completionError ?? undefined : "완료 상태를 변경하지 못했어요."}
-      onRetry={retryCompletion} retryLabel={serverMode ? "GET 상태 확인" : undefined} />}
+      onRetry={retryCompletion} retryLabel={serverMode ? "완료 상태 확인하기" : undefined} />}
   </>;
   const scheduleDates = useMemo(
     () => {

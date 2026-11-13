@@ -1,4 +1,4 @@
-import { Pressable, StyleSheet } from "react-native";
+import { Pressable, StyleSheet, type StyleProp, type TextStyle, type ViewStyle } from "react-native";
 
 import { ThemedText } from "@/components/ui/themed-text";
 import { useTheme } from "@/hooks/use-theme";
@@ -8,6 +8,8 @@ type ButtonProps = {
   onPress: () => void;
   disabled?: boolean;
   variant?: "primary" | "secondary" | "destructive";
+  style?: StyleProp<ViewStyle>;
+  textStyle?: StyleProp<TextStyle>;
 };
 
 export function Button({
@@ -15,6 +17,8 @@ export function Button({
   onPress,
   disabled = false,
   variant = "primary",
+  style,
+  textStyle,
 }: ButtonProps) {
   const theme = useTheme();
   const backgroundColor =
@@ -35,11 +39,12 @@ export function Button({
       style={({ pressed }) => [
         styles.button,
         { backgroundColor },
+        style,
         disabled && styles.disabled,
         pressed && !disabled && styles.pressed,
       ]}
     >
-      <ThemedText style={[styles.text, { color: textColor }]}>
+      <ThemedText style={[styles.text, textStyle, { color: textColor }]}>
         {label}
       </ThemedText>
     </Pressable>

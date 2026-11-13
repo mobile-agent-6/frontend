@@ -70,7 +70,9 @@ function harness({initialMode="server",baseUrl=origin,readOnly=false}={}){
 
 test("실제 root mount effect: cold start GET-only·결과 보관·기존 초기 경로 유지",async()=>{
   const h=harness();assert.equal(h.state.reads,0);await h.seed();assert.equal(h.listeners.size,0);
-  const tree=h.renderRoot();assert.equal(tree.props.children.props.children.length,4);assert.deepEqual(h.routes,["/(tabs)/assistant"]);
+  const tree=h.renderRoot();
+  const screens=tree.props.children.props.children;
+  assert.deepEqual(screens.map(screen=>screen.props.name),["(tabs)","schedule/create","schedule/[id]","settings"]);assert.deepEqual(h.routes,["/(tabs)/assistant"]);
   await until(()=>h.api.assistantLifecycle.getSnapshot().phase==="settled");assert.equal(h.state.calls.length,1);assert.equal(h.state.calls[0].init.method,"GET");
   assert.equal(h.state.calls[0].url,`${origin}/api/v1/assistant/requests/${id(1)}`);assert.equal(h.api.assistantLifecycle.getSnapshot().results[0].latestResult.kind,"completed");
   h.unmountRoot();await settle();assert.equal(h.listeners.size,0);assert.equal(h.state.cleanup,0);
