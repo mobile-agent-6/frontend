@@ -1,6 +1,8 @@
 const assert = require("node:assert/strict");
 const { test } = require("node:test");
 const { voiceSource, voiceFixture, wavBytes } = require("./helpers/local-voice.cjs");
+// package.json의 기존 npm test 진입점을 유지하며 재생 전용 회귀도 함께 실행한다.
+require("./test-local-audio-playback.cjs");
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
 const fixture = setup => voiceFixture(setup ?? (() => {}));
 

@@ -7,10 +7,10 @@ import { AppState, Platform } from "react-native";
 import { LOCAL_VOICE_LIMITS, localVoiceProfile, type VoiceRecordingProfile } from "@/constants/voice-recording";
 import type { LocalVoiceDependencies, LocalVoiceDiagnostic } from "@/services/local-voice-recording";
 import { inspectVoiceBytes } from "@/utils/voice-recording-metadata";
+import { localAudioSession } from "@/services/local-audio-session";
 
 const ownedBase = /^assistant-voice-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ownedFile = /^assistant-voice-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}(-result)?\.(wav|m4a)$/i;
-let audioOwner: symbol | null = null;
 
 function diagnose(event: string, detail: LocalVoiceDiagnostic) {
   if (__DEV__) console.info("[local-voice]", event, detail);
@@ -112,26 +112,30 @@ export function createVoiceFileStore(profile: VoiceRecordingProfile, platform: s
 
 export function createExpoVoiceDependencies(canStart: () => boolean): LocalVoiceDependencies {
   const profile = localVoiceProfile(Platform.OS), owner = Symbol("local-audio-session");
+  let reservation: symbol | null = null;
   let fileStore: ReturnType<typeof createVoiceFileStore> | undefined;
   const files = () => fileStore ??= createVoiceFileStore(profile, Platform.OS);
   return {
+    beforeStart() {
+      const next = Symbol("local-recording-job"), pending = localAudioSession.beginRecording(next);
+      reservation = next;
+      return pending;
+    },
+    afterEnd(safe) {
+      if (reservation) localAudioSession.endRecording(reservation, safe);
+      reservation = null;
+    },
     canStart, readAppState: () => AppState.currentState ?? null,
     permission: getRecordingPermissionsAsync, requestPermission: requestRecordingPermissionsAsync,
-    async activate() {
-      if (audioOwner && audioOwner !== owner) throw new Error("local-audio-session-busy");
-      audioOwner = owner;
-      await setIsAudioActiveAsync(true);
-    },
+    activate: () => localAudioSession.activate(owner, () => setIsAudioActiveAsync(true)),
     configure: () => setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true, interruptionMode: "doNotMix",
       shouldPlayInBackground: false, allowsBackgroundRecording: false }),
-    async reset() {
-      if (audioOwner !== owner) return;
+    reset: () => localAudioSession.reset(owner, async () => {
       let failed = false;
       try { await setAudioModeAsync({ allowsRecording: false, shouldPlayInBackground: false, allowsBackgroundRecording: false }); } catch { failed = true; }
       try { await setIsAudioActiveAsync(false); } catch { failed = true; }
-      audioOwner = null;
       if (failed) throw new Error("audio-session-cleanup");
-    },
+    }),
     create(name, listener) {
       const options = recordingOptions(profile, name);
       // 공개 AudioModule의 SharedObject를 작업별로 소유한다. prepare shim과 같은 플랫폼 옵션을 생성자에 전달한다.

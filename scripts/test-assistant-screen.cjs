@@ -6,6 +6,7 @@ const { randomUUID } = require("node:crypto");
 const { test } = require("node:test");
 const ts = require("typescript");
 const { voiceFixture } = require("./helpers/local-voice.cjs");
+const { playbackFixture } = require("./helpers/local-playback.cjs");
 const root = path.resolve(__dirname, "..");
 const origin = "https://example.invalid", serverId = `development:${origin}`;
 const id = n => `${n.toString(16).padStart(8, "0")}-abcd-4abc-8abc-abcdef123456`;
@@ -89,6 +90,14 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
           return () => { voiceFocusCleanups.delete(cleanup); cleanup?.(); }; }, [callback]);
       } };
       if (name === "expo-symbols") return { SymbolView: "SymbolView" };
+      if (name === "@/hooks/use-local-audio-playback") {
+        const actual = load(path.join(root, "src/hooks/use-local-audio-playback.ts"));
+        return { useLocalAudioPlayback(...args) {
+          const playback = actual.useLocalAudioPlayback(...args);
+          state.playbackHook = playback;
+          return playback;
+        } };
+      }
       // Schedule GET 통합은 전용 동기화·화면 회귀에서 검증하고 기존 Assistant 시험은 독립시킨다.
       if (name === "@/services/api/assistant-schedule-sync" && !actualScheduleSync) return { assistantScheduleSync: syncDouble };
       if (name === "react") return react;
@@ -98,8 +107,22 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
       if (name === "expo/fetch") return { fetch: send };
       if (name === "@react-native-async-storage/async-storage") return adapter;
       if (name === "expo-crypto") return { randomUUID: () => { state.uuidCalls++; state.beforeUuid?.(); if (state.failUuid) throw Error("UUID 실패"); return randomUUID(); } };
+      if (name === "@/services/expo-audio-playback") return { createExpoPlaybackDependencies(canPlay) {
+        const session = load(path.join(root, "src/services/local-audio-session.ts")).localAudioSession;
+        const playback = playbackFixture(deps => { deps.canPlay = canPlay; }, session);
+        state.playback = playback;
+        return playback.deps;
+      } };
       if (name === "@/services/expo-voice-recording") return { createExpoVoiceDependencies(canStart) {
-        const voice = voiceFixture(deps => { deps.canStart = canStart; });
+        const session = load(path.join(root, "src/services/local-audio-session.ts")).localAudioSession, owner = Symbol("screen-recording");
+        let reservation;
+        const voice = voiceFixture(deps => {
+          deps.canStart = canStart;
+          deps.beforeStart = () => { const next = Symbol("screen-record-job"), pending = session.beginRecording(next); reservation = next; return pending; };
+          deps.afterEnd = safe => { if (reservation) session.endRecording(reservation, safe); reservation = null; };
+          const activate = deps.activate, reset = deps.reset;
+          deps.activate = () => session.activate(owner, activate); deps.reset = () => session.reset(owner, reset);
+        });
         state.voice = voice;
         return voice.deps;
       } };
@@ -3408,6 +3431,47 @@ test("실제 로컬 녹음 화면: 서버/모드 전환은 녹음을 취소하�
     h.state.voice.emit({ isFinished: true, hasError: false }); h.switchMode("mock"); await h.settle();
     assert.equal(h.state.voice.state.files.size, 0); assert.equal(h.state.voice.state.starts, 1);
     assert.deepEqual(h.find("VoiceInputStatus").input, { source: "text" }); assert.equal(h.messages().length, 0);
+    assert.equal(h.state.calls.length, 0); assert.equal(h.state.mockRuns, 0);
+  } finally { h.close(); await h.settle(); }
+});
+
+test("실제 로컬 재생 Hook: 재생만으로 대화·초안·Mock/서버 요청·일정 상태를 바꾸지 않음", async () => {
+  const h = harness({ initialMode: "mock" });
+  try {
+    h.edit("보존할 초안"); const original = h.mock.getState().schedules;
+    await h.state.playbackHook.play({ kind: "asset", asset: 42 }); await h.settle();
+    assert.equal(h.state.playbackHook.snapshot.phase, "playing");
+    assert.equal(h.find("MessageInput").value, "보존할 초안"); assert.equal(h.find("MessageInput").disabled, false);
+    assert.deepEqual(h.find("VoiceInputStatus").input, { source: "text" }); assert.equal(h.messages().length, 0);
+    assert.equal(h.state.calls.length, 0); assert.equal(h.state.mockRuns, 0); assert.strictEqual(h.mock.getState().schedules, original);
+    h.send("일정 보여줘"); await h.advance(700); assert.equal(h.state.mockRuns, 1); assert.equal(h.messages().length, 2);
+  } finally { h.close(); await h.settle(); }
+});
+test("실제 로컬 재생 Hook: 마이크 시작은 재생 해제 후 녹음, 녹음 중 재생 가드", async () => {
+  const h = harness({ initialMode: "mock" });
+  try {
+    await h.state.playbackHook.play({ kind: "asset", asset: 42 }); await h.settle();
+    const play = h.state.playbackHook.play;
+    h.find("MessageInput").onStartVoice(); await play({ kind: "asset", asset: 42 }); await h.settle();
+    assert.equal(h.state.playback.state.releases, 1); assert.equal(h.state.playback.state.creates, 1);
+    assert.equal(h.find("VoiceInputStatus").input.phase, "recording"); assert.equal(h.state.voice.state.starts, 1);
+    await play({ kind: "asset", asset: 42 }); assert.equal(h.state.playback.state.creates, 1);
+    h.find("MessageInput").onStopVoice(); await h.settle(); assert.equal(h.find("VoiceInputStatus").input.phase, "recorded");
+    assert.equal(h.messages().length, 0); assert.equal(h.state.calls.length, 0); assert.equal(h.state.mockRuns, 0);
+  } finally { h.close(); await h.settle(); }
+});
+for (const exit of ["blur", "background", "unmount", "mode"]) test(`실제 로컬 재생 Hook: ${exit} 정리·자동 재생 없음·unmount 지연 업데이트 없음`, async () => {
+  const h = harness({ initialMode: "mock" });
+  try {
+    await h.state.playbackHook.play({ kind: "asset", asset: 42 }); await h.settle();
+    if (exit === "blur") h.blurVoice(); else if (exit === "background") h.app("background");
+    else if (exit === "mode") h.switchMode("server"); else h.close();
+    await h.settle(); assert.equal(h.state.playback.state.releases, 1); assert.equal(h.state.playback.state.resets, 1);
+    h.app("active"); await h.settle(); assert.equal(h.state.playback.state.starts, 1);
+    if (exit === "unmount") {
+      h.state.playback.emit({ playing: true, didJustFinish: true });
+      assert.equal(h.state.lateUpdates, 0); assert.equal(h.listeners.size, 0);
+    }
     assert.equal(h.state.calls.length, 0); assert.equal(h.state.mockRuns, 0);
   } finally { h.close(); await h.settle(); }
 });

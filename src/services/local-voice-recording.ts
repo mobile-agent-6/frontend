@@ -16,6 +16,8 @@ export type LocalRecorder = {
   release(): void;
 };
 export type LocalVoiceDependencies = {
+  beforeStart?(): Promise<void>;
+  afterEnd?(safe: boolean): void;
   canStart(): boolean;
   readAppState(): string | null;
   permission(): Promise<{ granted: boolean; canAskAgain: boolean }>;
@@ -91,6 +93,7 @@ export function createLocalVoiceRecording(deps: LocalVoiceDependencies) {
   }
   async function settle(active: Job, info?: LocalVoiceFileInfo, issue?: LocalVoiceIssue) {
     const cleaned = await cleanup(active);
+    deps.afterEnd?.(cleaned);
     if (!cleaned) issue = "cleanup";
     if (!cleaned || !current(active) || issue || !info) {
       if (active.name && !remove(active.name)) issue = "cleanup";
@@ -143,6 +146,8 @@ export function createLocalVoiceRecording(deps: LocalVoiceDependencies) {
   async function runStart(active: Job) {
     let handedOff = false, issue: LocalVoiceIssue | undefined = "permission-request";
     try {
+      if (deps.beforeStart) { issue = "prepare"; await deps.beforeStart(); check(active); }
+      issue = "permission-request";
       if (retained) {
         if (!remove(retained)) { issue = "cleanup"; throw new Error("cleanup"); }
         retained = null;

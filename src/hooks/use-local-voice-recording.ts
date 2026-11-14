@@ -6,12 +6,14 @@ import { createExpoVoiceDependencies } from "@/services/expo-voice-recording";
 import { createLocalVoiceRecording } from "@/services/local-voice-recording";
 import { scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
 import type { AssistantInputUi } from "@/utils/assistant-voice-ui";
+import { useLocalAudioPlayback } from "@/hooks/use-local-audio-playback";
 
 export function useLocalVoiceRecording(canStart: () => boolean, onInput: (input: AssistantInputUi) => void) {
   const callbacks = useRef({ canStart, onInput });
   const supported = Platform.OS === "ios" || Platform.OS === "android";
   const controllerRef = useRef<ReturnType<typeof createLocalVoiceRecording> | null>(null);
   const [busy, setBusy] = useState(false);
+  const playback = useLocalAudioPlayback(() => supported && !(controllerRef.current?.isBusy() ?? false));
   useLayoutEffect(() => { callbacks.current = { canStart, onInput }; }, [canStart, onInput]);
 
   useEffect(() => {
@@ -37,6 +39,7 @@ export function useLocalVoiceRecording(canStart: () => boolean, onInput: (input:
   useEffect(() => { controllerRef.current?.checkAvailability(); });
 
   return {
+    playback,
     busy, supported,
     isBusy: () => controllerRef.current?.isBusy() ?? false,
     start: () => controllerRef.current?.start() ?? Promise.resolve(),
