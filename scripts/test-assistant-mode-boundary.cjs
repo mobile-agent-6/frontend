@@ -26,6 +26,7 @@ function harness(initialMode = "mock") {
       const index = cursor++; if (!same(slots[index]?.deps, deps)) slots[index] = { deps, fn };
       return slots[index].fn;
     },
+    useLayoutEffect(fn, deps) { react.useEffect(fn, deps); },
     useEffect(fn, deps) {
       const index = cursor++;
       if (!same(slots[index]?.deps, deps)) effects.push(() => {
@@ -40,6 +41,10 @@ function harness(initialMode = "mock") {
       compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX }, fileName: file,
     }).outputText;
     const resolve = (name) => {
+      // native 녹음은 별도 controller/Assistant 화면 통합 테스트에서 검증한다.
+      if (name === "@/hooks/use-local-voice-recording") return { useLocalVoiceRecording: () => ({
+        busy: false, supported: true, isBusy: () => false, start: async () => {}, stop: async () => {}, discard() {},
+      }) };
       // 서버 설정이 없는 기존 경계 검증은 통신 계층을 실행하지 않는다.
       if (name === "@/services/api/assistant") return { assistantHttpClient: { getServerId: () => null } };
       if (name === "@/services/api/assistant-orchestrator") return { assistantOrchestrator: { startRequest: () => { throw new Error("서버 설정 없이 전송 금지"); } } };

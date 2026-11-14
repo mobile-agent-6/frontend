@@ -35,6 +35,7 @@ function harness(initialMode, { readOnly = false, assistantSyncUi = false, assis
       return current.slots[index].value;
     },
     useCallback(fn, deps) { return react.useMemo(() => fn, deps); },
+    useLayoutEffect(fn, deps) { react.useEffect(fn, deps); },
     useEffect(fn, deps) {
       const owner = current, index = owner.cursor++;
       if (!same(owner.slots[index]?.deps, deps)) owner.effects.push(() => {
@@ -69,6 +70,10 @@ function harness(initialMode, { readOnly = false, assistantSyncUi = false, assis
       module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX,
     }, fileName: filename }).outputText;
     const resolve = (name) => {
+      // native 녹음은 별도 controller/Assistant 화면 통합 테스트에서 검증한다.
+      if (name === "@/hooks/use-local-voice-recording") return { useLocalVoiceRecording: () => ({
+        busy: false, supported: true, isBusy: () => false, start: async () => {}, stop: async () => {}, discard() {},
+      }) };
       // Assistant의 서버 통신 검증은 전용 화면 테스트에서 실행한다.
       if (name === "@/services/api/assistant") return { assistantHttpClient: { getServerId: () => assistantSyncUi && config?.status === "ready" ? config.config.serverId : null } };
       if (name === "@/services/api/assistant-orchestrator") return { assistantOrchestrator: { startRequest: () => { throw new Error("Schedule 화면 검증에서 Assistant 전송 금지"); } } };

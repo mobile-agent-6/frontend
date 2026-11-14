@@ -5,6 +5,7 @@ const path = require("node:path");
 const { randomUUID } = require("node:crypto");
 const { test } = require("node:test");
 const ts = require("typescript");
+const { voiceFixture } = require("./helpers/local-voice.cjs");
 const root = path.resolve(__dirname, "..");
 const origin = "https://example.invalid", serverId = `development:${origin}`;
 const id = n => `${n.toString(16).padStart(8, "0")}-abcd-4abc-8abc-abcdef123456`;
@@ -29,6 +30,7 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
   const cache = new Map(), slots = [], effects = [], timers = new Map(), listeners = new Set();
   const displayStates = new Map();
   const displayFocusCleanups = new Set();
+  const voiceFocusCleanups = new Set();
   let displayOwner = null, displayCursor = 0;
   let inputUiIndex, statusIndex;
   let cursor = 0, dirty = false, tree, wall = 1000, mono = 0, timerId = 0, closed = false, displaying = false;
@@ -60,7 +62,7 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
       if (displaying) return { current: initial }; return slots[cursor++] ??= { current: initial }; },
     useCallback(fn, deps) { if (displaying) return fn; const i = cursor++; if (!same(slots[i]?.deps, deps)) slots[i] = { deps, value: fn }; return slots[i].value; },
     useEffect(fn, deps) { if (displaying) return; const i = cursor++; if (!same(slots[i]?.deps, deps)) effects.push(() => { slots[i]?.cleanup?.(); slots[i] = { deps, cleanup: fn() }; }); },
-    useLayoutEffect(fn) { if (displaying) fn(); },
+    useLayoutEffect(fn, deps) { if (displaying) fn(); else react.useEffect(fn, deps); },
     useMemo(factory) { return factory(); },
     useImperativeHandle() {},
   };
@@ -81,7 +83,11 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
     const module = { exports: {} }; cache.set(file, module);
     const code = ts.transpileModule(fs.readFileSync(file, "utf8"), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX }, fileName: file }).outputText;
     function resolve(name) {
-      if (name === "expo-router") return { useFocusEffect: callback => { displayFocusCleanups.add(callback()); } };
+      if (name === "expo-router") return { useFocusEffect: callback => {
+        if (displaying) displayFocusCleanups.add(callback());
+        else react.useEffect(() => { const cleanup = callback(); voiceFocusCleanups.add(cleanup);
+          return () => { voiceFocusCleanups.delete(cleanup); cleanup?.(); }; }, [callback]);
+      } };
       if (name === "expo-symbols") return { SymbolView: "SymbolView" };
       // Schedule GET 통합은 전용 동기화·화면 회귀에서 검증하고 기존 Assistant 시험은 독립시킨다.
       if (name === "@/services/api/assistant-schedule-sync" && !actualScheduleSync) return { assistantScheduleSync: syncDouble };
@@ -92,6 +98,11 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
       if (name === "expo/fetch") return { fetch: send };
       if (name === "@react-native-async-storage/async-storage") return adapter;
       if (name === "expo-crypto") return { randomUUID: () => { state.uuidCalls++; state.beforeUuid?.(); if (state.failUuid) throw Error("UUID 실패"); return randomUUID(); } };
+      if (name === "@/services/expo-voice-recording") return { createExpoVoiceDependencies(canStart) {
+        const voice = voiceFixture(deps => { deps.canStart = canStart; });
+        state.voice = voice;
+        return voice.deps;
+      } };
       if (["@/components/assistant/assistant-message", "@/components/assistant/assistant-schedule-card"].includes(name)) return load(path.join(root, "src", `${name.slice(2)}.tsx`));
       if (name.startsWith("@/components/")) { const component = name.split("/").at(-1).split("-").map(s => s[0].toUpperCase() + s.slice(1)).join(""); return { [component]: component }; }
       if (name === "@/constants/theme") return { Spacing: { one: 4, two: 8, three: 16 } };
@@ -186,6 +197,7 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
     attachLifecycle: () => realLifecycle.attach(),
     app(value) { state.app = value; for (const listener of [...listeners]) listener(value); },
     blurResults() { for (const cleanup of displayFocusCleanups) cleanup?.(); displayFocusCleanups.clear(); },
+    blurVoice() { for (const cleanup of voiceFocusCleanups) cleanup?.(); voiceFocusCleanups.clear(); render(); },
     close() { if (closed) return; closed = true; this.blurResults(); slots.forEach(slot => slot?.cleanup?.()); },
   };
 }
@@ -3193,12 +3205,12 @@ test("음성 UI: 시작·정지·text callback 분리, 녹음 중 초안이 있�
   assert.equal(nodes(blocked, "Pressable")[0].props.onPress, undefined); assert.equal(nodes(blocked, "TextInput")[0].props.onSubmitEditing, undefined);
 });
 
-for (const initialMode of ["mock", "server"]) test(`음성 UI ${initialMode}: 제품 기본값은 text·마이크 미연결·기존 대화 보존`, async () => {
+for (const initialMode of ["mock", "server"]) test(`음성 UI ${initialMode}: 제품 기본값은 text·로컬 마이크 연결·기존 대화 보존`, async () => {
   const h = harness({ initialMode });
   try {
     assert.deepEqual(h.find("VoiceInputStatus").input, { source: "text" }); assert.equal(h.messages().length, 0);
-    assert.equal(h.find("MessageInput").voiceDisabled, true); assert.equal(h.find("MessageInput").onStartVoice, undefined);
-    assert.equal(h.find("MessageInput").onStopVoice, undefined);
+    assert.equal(h.find("MessageInput").voiceDisabled, false); assert.equal(typeof h.find("MessageInput").onStartVoice, "function");
+    assert.equal(typeof h.find("MessageInput").onStopVoice, "function");
     h.send("일정 보여줘"); await h.advance(700);
     const previous = h.messages(), schedules = h.mock.getState().schedules, calls = h.state.calls.length, runs = h.state.mockRuns;
     for (const phase of Object.keys(voiceNotices)) {
@@ -3306,4 +3318,96 @@ test("음성 UI Mock 후보·삭제 확인은 녹음 fixture 동안 유지·차�
     const added = { ...schedules[0], id: id(888), title: "수동 일정" }; h.mock.getState().addSchedule(added);
     assert.ok(h.mock.getState().schedules.some(schedule => schedule.id === added.id)); assert.equal(h.state.calls.length, 0);
   } finally { h.close(); }
+});
+
+for (const initialMode of ["mock", "server"]) test(`실제 로컬 녹음 화면 ${initialMode}: 권한·시작·정지 연결은 메시지/Assistant 요청/일정 변경 없음`, async () => {
+  const h = harness({ initialMode });
+  try {
+    const original = h.mock.getState().schedules;
+    assert.equal(h.find("MessageInput").voiceDisabled, false);
+    assert.equal(h.state.voice.state.permissionReads, 0); assert.equal(h.state.voice.state.activations, 0);
+    h.find("MessageInput").onStartVoice(); h.render(); await h.settle();
+    assert.deepEqual(h.find("VoiceInputStatus").input, { source: "voice", phase: "recording" });
+    assert.equal(h.find("MessageInput").isRecording, true); assert.equal(h.find("MessageInput").voiceDisabled, false);
+    assert.equal(h.find("MessageInput").disabled, true); assert.equal(h.find("ConversationList").interactionsDisabled, true);
+    h.find("MessageInput").onStopVoice(); h.render();
+    assert.equal(h.find("VoiceInputStatus").input.phase, "stopping"); await h.settle();
+    assert.equal(h.find("VoiceInputStatus").input.phase, "recorded"); assert.equal(h.find("MessageInput").disabled, false);
+    assert.equal(h.messages().length, 0); assert.equal(h.state.calls.length, 0); assert.equal(h.state.starts.length, 0);
+    assert.equal(h.state.mockRuns, 0); assert.strictEqual(h.mock.getState().schedules, original);
+    assert.equal(h.state.voice.state.starts, 1); assert.equal(h.state.voice.state.stops, 1);
+  } finally { h.close(); await h.settle(); }
+});
+
+test("실제 로컬 녹음 화면: 권한 대기 즉시 오래된 text callback도 차단·초안 보존", async () => {
+  const h = harness({ initialMode: "mock" }), gate = deferred();
+  try {
+    h.edit("보존할 초안"); const send = h.find("MessageInput").onSend;
+    h.state.voice.deps.permission = () => gate.promise;
+    h.find("MessageInput").onStartVoice(); send(); h.render();
+    assert.equal(h.find("MessageInput").value, "보존할 초안"); assert.equal(h.messages().length, 0);
+    assert.deepEqual(h.find("VoiceInputStatus").input, { source: "text" });
+    assert.equal(h.find("MessageInput").disabled, true); assert.equal(h.state.voice.state.starts, 0);
+    gate.resolve({ granted: true }); await h.settle(); send(); h.render();
+    assert.equal(h.find("VoiceInputStatus").input.phase, "recording"); assert.equal(h.messages().length, 0);
+    const manual = { ...h.mock.getState().schedules[0], id: id(889), title: "수동 입력" };
+    h.mock.getState().addSchedule(manual); assert.ok(h.mock.getState().schedules.some(item => item.id === manual.id));
+    h.find("MessageInput").onStopVoice(); await h.settle();
+    assert.equal(h.find("MessageInput").value, "보존할 초안"); assert.equal(h.state.calls.length, 0);
+  } finally { h.close(); await h.settle(); }
+});
+
+test("실제 로컬 녹음 화면: 재요청 불가 권한 거절은 초안/대화 유지·텍스트 입력 복구", async () => {
+  const h = harness({ initialMode: "mock" });
+  try {
+    h.edit("초안"); h.state.voice.deps.permission = async () => ({ granted: false, canAskAgain: false });
+    h.find("MessageInput").onStartVoice(); await h.settle();
+    assert.equal(h.find("VoiceInputStatus").input.phase, "permission-error"); assert.equal(h.find("MessageInput").disabled, false);
+    assert.equal(h.find("MessageInput").value, "초안"); assert.equal(h.messages().length, 0); assert.equal(h.state.voice.state.requests, 0);
+    assert.equal(h.state.calls.length, 0); assert.equal(h.state.mockRuns, 0);
+  } finally { h.close(); }
+});
+
+for (const exit of ["blur", "background", "unmount"]) test(`실제 로컬 녹음 화면: ${exit}은 실제 Hook에서 취소·파일 삭제·자동 재개 없음`, async () => {
+  const h = harness({ initialMode: "mock" });
+  try {
+    h.find("MessageInput").onStartVoice(); await h.settle();
+    if (exit === "blur") h.blurVoice(); else if (exit === "background") h.app("background"); else h.close();
+    await h.settle(); assert.equal(h.state.voice.state.files.size, 0); assert.equal(h.state.voice.state.releases, 1);
+    h.app("active"); await h.settle(); assert.equal(h.state.voice.state.starts, 1);
+    assert.equal(h.state.calls.length, 0); assert.equal(h.state.mockRuns, 0);
+    if (exit !== "unmount") assert.deepEqual(h.find("VoiceInputStatus").input, { source: "text" });
+    else assert.equal(h.state.lateUpdates, 0);
+  } finally { h.close(); await h.settle(); }
+});
+
+test("실제 로컬 녹음 화면: 녹음 결과 후 정상 text 제출은 파일 정리·기존 Mock 실행", async () => {
+  const h = harness({ initialMode: "mock" });
+  try {
+    h.find("MessageInput").onStartVoice(); await h.settle(); h.find("MessageInput").onStopVoice(); await h.settle();
+    assert.equal(h.state.voice.state.files.size, 1); h.send("일정 보여줘"); await h.advance(700);
+    assert.equal(h.state.voice.state.files.size, 0); assert.equal(h.state.mockRuns, 1); assert.equal(h.messages().length, 2);
+    assert.deepEqual(h.find("VoiceInputStatus").input, { source: "text" }); assert.equal(h.state.calls.length, 0);
+  } finally { h.close(); }
+});
+
+for (const kind of ["candidate_selection", "confirmation", "uncertain"]) test(`실제 로컬 녹음 화면: ${kind}의 기존 정책을 우회하는 녹음 시작 금지`, async () => {
+  const h = harness();
+  try {
+    h.state.handle = responseWith(results[kind]); h.send("변경"); await h.settle();
+    assert.equal(h.find("MessageInput").voiceDisabled, true);
+    h.find("MessageInput").onStartVoice(); await h.settle(); assert.equal(h.state.voice.state.starts, 0);
+    assert.equal(postedBodies(h).length, 1);
+  } finally { h.close(); }
+});
+
+test("실제 로컬 녹음 화면: 서버/모드 전환은 녹음을 취소하고 이전 파일과 지연 이벤트 격리", async () => {
+  const h = harness({ initialMode: "mock" });
+  try {
+    h.find("MessageInput").onStartVoice(); await h.settle(); h.switchMode("server"); await h.settle();
+    h.state.voice.emit({ isFinished: true, hasError: false }); h.switchMode("mock"); await h.settle();
+    assert.equal(h.state.voice.state.files.size, 0); assert.equal(h.state.voice.state.starts, 1);
+    assert.deepEqual(h.find("VoiceInputStatus").input, { source: "text" }); assert.equal(h.messages().length, 0);
+    assert.equal(h.state.calls.length, 0); assert.equal(h.state.mockRuns, 0);
+  } finally { h.close(); await h.settle(); }
 });

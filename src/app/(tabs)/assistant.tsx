@@ -1,5 +1,5 @@
 import * as Crypto from "expo-crypto";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { KeyboardAvoidingView, Platform, StyleSheet } from "react-native";
 
 import { formatAssistantCardDateTime } from "@/components/assistant/assistant-schedule-card";
@@ -14,6 +14,7 @@ import { Header } from "@/components/navigation/header";
 import { ThemedView } from "@/components/ui/themed-view";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useTheme } from "@/hooks/use-theme";
+import { useLocalVoiceRecording } from "@/hooks/use-local-voice-recording";
 import { assistantHttpClient } from "@/services/api/assistant";
 import {
   assistantLifecycle,
@@ -96,10 +97,15 @@ export default function AssistantScreen() {
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
   const [inputText, setInputText] = useState("");
   const [status, setStatus] = useState<AssistantStatus>("idle");
-  // recorder 미연결: 제품에서는 text로 유지하며 음성 상태는 독립 fixture에서만 검증한다.
+  // 로컬 녹음 표시와 기존 Assistant 요청 상태를 분리한다.
   const [inputUi, setInputUi] = useState<AssistantInputUi>({ source: "text" });
-  const voiceInputBusy = isVoiceInputBusy(inputUi);
   const inputUiRef = useRef(inputUi);
+  const voiceStartAllowedRef = useRef<() => boolean>(() => false);
+  const localVoice = useLocalVoiceRecording(() => voiceStartAllowedRef.current(), (input) => {
+    inputUiRef.current = input;
+    setInputUi(input);
+  });
+  const voiceInputBusy = isVoiceInputBusy(inputUi) || localVoice.busy;
   const [isBusy, setIsBusy] = useState(false);
   const [questionUi, setQuestionUi] = useState<{
     serverId: string;
@@ -678,7 +684,7 @@ export default function AssistantScreen() {
     const confirmation = action?.type === "confirmation" ? action : undefined;
     if (
       !mountedRef.current ||
-      isVoiceInputBusy(inputUiRef.current) ||
+      isVoiceInputBusy(inputUiRef.current) || localVoice.isBusy() ||
       sendLockedRef.current ||
       status === "processing"
     )
@@ -877,6 +883,7 @@ export default function AssistantScreen() {
         clearInputExpiry = () => clearTimeout(timer);
       }
       pendingInputRef.current = label;
+      localVoice.discard();
       setInputUi({ source: "text" });
       setMessages((current) => [
         ...current,
@@ -1373,7 +1380,7 @@ export default function AssistantScreen() {
   };
 
   const handleSend = () => {
-    if (isVoiceInputBusy(inputUiRef.current)) return;
+    if (isVoiceInputBusy(inputUiRef.current) || localVoice.isBusy()) return;
     if (!isMockScheduleMode()) {
       void sendServerInput();
       return;
@@ -1392,6 +1399,7 @@ export default function AssistantScreen() {
     pendingInputRef.current = text;
 
     try {
+      localVoice.discard();
       const message: ConversationMessage = {
         id: Crypto.randomUUID(),
         role: "user",
@@ -1424,7 +1432,7 @@ export default function AssistantScreen() {
     if (!isMockScheduleMode()) return;
     if (
       !mountedRef.current ||
-      isVoiceInputBusy(inputUiRef.current) ||
+      isVoiceInputBusy(inputUiRef.current) || localVoice.isBusy() ||
       sendLockedRef.current ||
       status === "processing" ||
       activeInteractionIdRef.current !== messageId ||
@@ -1641,6 +1649,13 @@ export default function AssistantScreen() {
     return () => clearTimeout(timer);
   }, [timedRequestId, timedExpiresAt, syncQuestionUi]);
 
+  const voiceStartAllowed = !isBusy && status !== "processing" && !recoveryPending && !recoveryProcessing &&
+    !uncertainView?.held && !activeCandidate && !activeConfirmation &&
+    (mockMode || (currentServerId !== null && recoveryMatches && recoverySnapshot.initialCheck === "checked"));
+  useLayoutEffect(() => {
+    voiceStartAllowedRef.current = () => mountedRef.current && !sendLockedRef.current && !serverTaskRef.current && voiceStartAllowed;
+  }, [voiceStartAllowed]);
+
   return (
     <ThemedView
       style={[
@@ -1782,6 +1797,8 @@ export default function AssistantScreen() {
             setInputText(text);
           }}
           onSend={handleSend}
+          onStartVoice={() => { void localVoice.start(); }}
+          onStopVoice={() => { void localVoice.stop(); }}
           disabled={
             isBusy ||
             status === "processing" ||
@@ -1791,7 +1808,8 @@ export default function AssistantScreen() {
           isRecording={
             inputUi.source === "voice" && inputUi.phase === "recording"
           }
-          voiceDisabled
+          voiceDisabled={!localVoice.supported ||
+            (!(inputUi.source === "voice" && inputUi.phase === "recording") && !voiceStartAllowed)}
         />
       </KeyboardAvoidingView>
     </ThemedView>
