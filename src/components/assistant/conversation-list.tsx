@@ -51,6 +51,8 @@ type ConversationListProps = {
   ref?: Ref<ConversationListHandle>;
   messages: readonly ConversationMessage[];
   isProcessing?: boolean;
+  // 진행 요청 식별·복구 footer는 isProcessing을 유지하고 안내 문구만 별도로 제어한다.
+  showProcessingNotice?: boolean;
   interactionsDisabled?: boolean;
   onDeleteConfirmation?: (messageId: string, confirmed: boolean) => void;
   onCandidateSelection?: (messageId: string, scheduleId: string) => void;
@@ -77,6 +79,7 @@ export function ConversationList({
   ref,
   messages,
   isProcessing = false,
+  showProcessingNotice = true,
   interactionsDisabled = false,
   onDeleteConfirmation,
   onCandidateSelection,
@@ -294,7 +297,7 @@ export function ConversationList({
       ItemSeparatorComponent={MessageSeparator}
       ListFooterComponent={
         <View>
-          {isProcessing && (
+          {isProcessing && showProcessingNotice && (
             <View style={styles.processing} accessibilityLiveRegion="polite">
               <ThemedText themeColor="textSecondary">
                 일정을 확인하고 있어요...
