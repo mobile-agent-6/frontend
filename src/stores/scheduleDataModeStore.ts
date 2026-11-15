@@ -1,5 +1,7 @@
 import { createStore } from "zustand/vanilla";
 
+import { createConnectionSnapshot, createDevelopmentTarget, getDevelopmentServerConfig, getServerTargetSource } from "@/services/api/config";
+
 export type ScheduleDataMode = "mock" | "server";
 
 export function resolveScheduleDataMode(value: string | undefined): ScheduleDataMode {
@@ -15,6 +17,7 @@ export const scheduleDataModeStore = createStore<{
   mode: ScheduleDataMode;
   generation: number;
   setMode: (mode: ScheduleDataMode) => void;
+  resetConnectionAuthority: () => void;
 }>((set) => ({
   // effect 이전에 결정해 첫 화면부터 올바른 원본을 사용한다. Expo 정적 치환 표기법을 유지한다.
   mode: resolveScheduleDataMode(process.env.EXPO_PUBLIC_SCHEDULE_DATA_MODE),
@@ -22,7 +25,17 @@ export const scheduleDataModeStore = createStore<{
   setMode: (mode) => set((state) => state.mode === mode ? state : {
     mode, generation: state.generation + 1,
   }),
+  // 동일 대상으로 돌아와도 이전 callback의 권한은 되살리지 않는다. 대상 활성화는 수행하지 않는다.
+  resetConnectionAuthority: () => set(state => ({ generation: state.generation + 1 })),
 }));
+
+/** 기존 mode generation이 공통 연결 권한이다. Schedule cache 무효화 generation과 별개다. */
+export function getConnectionSnapshot() {
+  const state = scheduleDataModeStore.getState(), source = getServerTargetSource();
+  const config = getDevelopmentServerConfig();
+  return createConnectionSnapshot({ mode: state.mode, generation: state.generation, source,
+    target: source === "development" && config.status === "ready" ? createDevelopmentTarget(config.config.baseUrl) : null });
+}
 
 export function isMockScheduleMode(generation?: number) {
   const current = scheduleDataModeStore.getState();
