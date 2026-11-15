@@ -229,3 +229,126 @@ test("소비자의 조회 조건은 외부 객체 변경에도 고정됨", async
   const retry = a.retry(); await tick(); assert.equal(h.calls[1].url, h.calls[0].url);
   h.calls[1].resolve(response([])); await retry; a.release();
 });
+
+for (const scenario of ["equal", "reverse-registration", "missing", "outside", "filtered", "empty", "title", "completed", "category", "date", "mixed", "timestamp-only"]) {
+  test(`35 store equality and completeness: ${scenario}`, async () => {
+    const h = harness(), owners = [];
+    const first = scenario === "reverse-registration" ? wide : query;
+    const second = scenario === "reverse-registration" ? query : wide;
+    const q = scenario === "filtered" ? { ...first, category: "INVENTORY" } : first;
+    let latest = dto("shared"), extra = { ...dto("extra"), scheduledAt: "2026-11-20T00:00:00Z" };
+    if (scenario === "outside") extra.scheduledAt = "2026-12-15T00:00:00Z";
+    if (scenario === "filtered") extra.category = "OTHER";
+    const newer = scenario === "empty" ? [] : [latest, ...(["missing", "outside", "filtered", "mixed"].includes(scenario) ? [extra] : [])];
+    let older = scenario === "empty" ? [] : [{ ...latest }];
+    if (scenario === "title") older[0].title = "과거";
+    if (scenario === "completed") older[0].completed = true;
+    if (scenario === "category") older[0].category = "OTHER";
+    if (scenario === "date") older[0].scheduledAt = "2026-11-16T00:00:00Z";
+    if (scenario === "mixed") older.push({ ...extra, title: "과거 다른 일정" });
+    if (scenario === "timestamp-only") older[0].updatedAt = "2026-11-01T00:00:00.000001Z";
+    try {
+      owners.push(h.cache.acquire(q), h.cache.acquire(second)); await tick();
+      h.calls[1].resolve(response(newer)); await owners[1].promise;
+      const original = h.data().entities.shared, version = h.data().entityVersions.shared;
+      h.calls[0].resolve(response(older)); await owners[0].promise;
+      assert.strictEqual(h.data().entities.shared, original);
+      assert.equal(h.data().entityVersions.shared, version);
+      const stale = ["missing", "title", "completed", "category", "date", "mixed"].includes(scenario);
+      assert.equal(h.entry(q).stale, stale);
+      assert.equal(h.mod.getScheduleCoverage(h.entry(q), q.from, q.to), stale ? "stale" : "covered");
+      assert.equal(h.entry(second).stale, false);
+      assert.deepEqual(h.entry(second).ids, newer.map(s => s.id));
+    } finally {
+      owners.forEach(owner => owner.release());
+      h.calls.forEach(call => call.resolve(response([]))); await tick();
+    }
+  });
+}
+// A starts first; B confirms S; C supplies newer membership evidence; A arrives last.
+for (const scenario of ["absent", "other-id", "present", "outside", "category", "completed-false-excluded", "completed-true-excluded", "completed-false-missing", "completed-true-missing", "from", "to", "partial-from", "partial-to", "one-minute", "microseconds", "loading", "error", "stale", "replacement"]) {
+  test(`35 membership evidence ${scenario}`, async () => {
+    const h = harness(), owners = [];
+    const item = { ...dto("shared"), scheduledAt: "2026-10-31T15:00:30.123456Z" };
+    const aQuery = { from: "2026-10-01T00:00:00+09:00", to: "2026-12-01T00:00:00+09:00" };
+    const bQuery = { from: "2026-10-15T00:00:00+09:00", to: "2026-12-01T00:00:00+09:00" };
+    const cQuery = { ...query };
+    if (scenario === "outside") cQuery.from = "2026-11-02T00:00:00+09:00";
+    if (scenario === "category") cQuery.category = "OTHER";
+    if (scenario.startsWith("completed-")) {
+      cQuery.completed = scenario.includes("true");
+      item.completed = scenario.endsWith("missing") ? cQuery.completed : !cQuery.completed;
+    }
+    if (scenario === "to") { cQuery.from = "2026-10-31T14:00:00Z"; cQuery.to = "2026-10-31T15:00:00Z"; }
+    if (scenario === "partial-from") cQuery.from = "2026-10-31T15:00:00.000001Z";
+    if (scenario === "partial-to") { cQuery.from = "2026-10-31T14:00:00Z"; cQuery.to = "2026-10-31T15:00:59.999999Z"; }
+    if (scenario === "one-minute") cQuery.to = "2026-10-31T15:01:00Z";
+    const ignored = ["present", "outside", "category", "completed-false-excluded", "completed-true-excluded", "to", "partial-from", "partial-to", "loading", "error", "stale", "replacement"].includes(scenario);
+    try {
+      owners.push(h.cache.acquire(aQuery)); await tick();
+      owners.push(h.cache.acquire(bQuery)); await tick();
+      h.calls[1].resolve(response([item])); await owners[1].promise;
+      owners.push(h.cache.acquire(cQuery)); await tick();
+      assert.deepEqual([h.entry(aQuery).sequence, h.entry(bQuery).sequence, h.entry(cQuery).sequence], [1, 2, 3]);
+      if (scenario !== "loading") {
+        h.calls[2].resolve(scenario === "error" ? new Response("broken", { status: 200 }) : response(scenario === "present" ? [{ ...item }] : scenario === "other-id" ? [{ ...dto("other"), scheduledAt: item.scheduledAt }] : []));
+        await owners[2].promise;
+      }
+      if (scenario === "stale") {
+        // A later actual read changes an entity in C, making C stale without direct state injection.
+        // Empty C cannot be invalidated through an entity, so retry it and release the last consumer.
+        const retry = owners[2].retry(); await tick(); owners[2].release(); await retry;
+      }
+      if (scenario === "replacement") { void owners[2].retry(); await tick(); }
+      const saved = h.data().entities.shared, version = h.data().entityVersions.shared;
+      const cIds = [...h.entry(cQuery).ids];
+      h.calls[0].resolve(response([{ ...item }])); await owners[0].promise;
+      assert.strictEqual(h.data().entities.shared, saved); assert.equal(h.data().entityVersions.shared, version);
+      assert.deepEqual(h.entry(cQuery).ids, cIds);
+      assert.equal(h.entry(aQuery).stale, !ignored);
+      assert.equal(h.mod.getScheduleCoverage(h.entry(aQuery), aQuery.from, aQuery.to), ignored ? "covered" : "stale");
+    } finally {
+      owners.forEach(owner => owner.release());
+      h.calls.forEach(call => call.resolve(response([]))); await tick();
+    }
+  });
+}
+for (const completed of [false, true]) for (const included of [false, true]) {
+  test(`35 forward membership completed=${completed} included=${included}`, async () => {
+    const h = harness(), q = { ...query, completed }, owners = [];
+    try {
+      owners.push(h.cache.acquire(q), h.cache.acquire(wide)); await tick();
+      h.calls[1].resolve(response([{ ...dto("extra"), completed: included ? completed : !completed }])); await owners[1].promise;
+      h.calls[0].resolve(response([])); await owners[0].promise;
+      assert.equal(h.entry(q).stale, included);
+      assert.equal(h.entry(wide).stale, false);
+    } finally { owners.forEach(o => o.release()); h.calls.forEach(c => c.resolve(response([]))); await tick(); }
+  });
+}
+
+for (const barrier of ["invalidate", "mutation", "connection", "same-query-replacement"]) {
+  test(`35 membership evidence barrier ${barrier}`, async () => {
+    const h = harness(), owners = [];
+    try {
+      const a = h.cache.acquire(query); owners.push(a); await tick();
+      const b = h.cache.acquire(wide); owners.push(b); await tick();
+      h.calls[1].resolve(response([])); await b.promise;
+      if (barrier === "connection") {
+        h.setServer("https://other.example.invalid"); h.setServer("https://example.invalid");
+      } else if (barrier === "mutation") {
+        h.cache.applyScheduleResult(h.client.getServerId(), h.load("src/utils/schedule-mapper.ts").scheduleDtoToSchedule(dto()));
+      } else if (barrier === "same-query-replacement") {
+        a.release();
+      } else h.cache.invalidate();
+      const fresh = h.cache.acquire(query); owners.push(fresh); await tick();
+      const next = h.calls.at(-1); assert.notStrictEqual(next, h.calls[0]);
+      next.resolve(response([dto("current")])); await fresh.promise;
+      const saved = h.entry(), entity = h.data().entities.current;
+      h.calls[0].resolve(response([dto("obsolete")])); await a.promise; await tick();
+      assert.strictEqual(h.entry(), saved); assert.strictEqual(h.data().entities.current, entity);
+      assert.equal(h.data().entities.obsolete, undefined);
+      assert.equal(h.entry().stale, false);
+      assert.deepEqual(h.entry().ids, ["current"]);
+    } finally { owners.forEach(o => o.release()); h.calls.forEach(c => c.resolve(response([]))); await tick(); }
+  });
+}
