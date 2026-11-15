@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { ThemedText } from "@/components/ui/themed-text";
 import { Spacing } from "@/constants/theme";
 import { useTheme } from "@/hooks/use-theme";
+import { SETTINGS_CONNECTION_BADGE_HEIGHT } from "@/components/settings/settings-connection-status";
 
 type SettingsIpCardProps = {
   inputIp: string;
@@ -92,7 +93,7 @@ export function SettingsIpCard({
         />
       </View>
 
-      {!hasCurrentResult && (
+      {(
         <Button
           label={
             isChecking
@@ -103,15 +104,14 @@ export function SettingsIpCard({
           onPress={onCheckConnection}
         />
       )}
-      {connectionFeedback}
-
       <ThemedText
         type="small"
         themeColor="textSecondary"
         style={styles.description}
       >
-        Orange Pi 핫스팟에 연결한 뒤 Pi IP를 입력하세요
+        Orange Pi와 휴대폰을 통신 가능한 네트워크에 연결한 후 Orange Pi의 IP 주소를 입력해 주세요.
       </ThemedText>
+      {connectionFeedback}
     </View>
   );
 }
@@ -121,6 +121,7 @@ const styles = StyleSheet.create({
     gap: Spacing.two,
   },
   labelRow: {
+    minHeight: SETTINGS_CONNECTION_BADGE_HEIGHT,
     flexDirection: "row",
     flexWrap: "wrap",
     alignItems: "center",
@@ -129,6 +130,8 @@ const styles = StyleSheet.create({
     marginBottom: Spacing.one,
   },
   label: {
+    // Wrapped flex lines use their tallest child; keep the title independent of badge height.
+    alignSelf: "flex-start",
     fontSize: 16,
     lineHeight: 24,
     fontWeight: "700",

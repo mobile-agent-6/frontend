@@ -36,7 +36,7 @@ export default function ScheduleEditScreen() {
   const mode = useStore(scheduleDataModeStore);
   const serverMode = mode.mode === "server";
   useEffect(() => retainScheduleRoute(connectionKey), [connectionKey]);
-  const owner = resolveScheduleRoute(connectionKey, scheduleId ?? null);
+  const owner = resolveScheduleRoute(connectionKey, scheduleId ?? null, mode);
   const detail = useServerScheduleDetail(scheduleId, serverMode && Boolean(owner));
   if (!owner) return <><Stack.Screen options={iosHeaderOptions} /><ScheduleListState state="error" errorTitle="일정을 찾을 수 없어요." /></>;
   // 대상·서버·모드가 달라지면 폼과 native 모달 상태도 별도 수명으로 시작한다.

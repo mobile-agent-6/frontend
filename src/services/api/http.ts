@@ -1,7 +1,7 @@
 import { fetch as expoFetch } from "expo/fetch";
 
 import { getDevelopmentServerConfig } from "@/services/api/config";
-import { isScheduleRequestAllowed, scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
+import { getBusinessTransport, isScheduleRequestAllowed, scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
 
 export type ValidationErrorItem = {
   location: "body" | "query" | "header" | "path";
@@ -96,7 +96,7 @@ export function createScheduleHttpClient({
   function captureScope(): ScheduleRequestScope | undefined {
     const value = readConfig(), state = scheduleDataModeStore.getState();
     return value.status === "ready" ? Object.freeze({ config: Object.freeze({ ...value.config }),
-      generation: state.generation, mode: state.mode, send: fetchImpl ?? expoFetch }) : undefined;
+      generation: state.generation, mode: state.mode, send: fetchImpl ?? getBusinessTransport()?.fetchImpl ?? expoFetch }) : undefined;
   }
   function isScopeCurrent(scope: ScheduleRequestScope) {
     const value = readConfig(), state = scheduleDataModeStore.getState();
@@ -127,7 +127,7 @@ export function createScheduleHttpClient({
     const config = scope.config;
     const authority = scheduleDataModeStore.getState();
     const generation = authority.generation;
-    const send = options.scope ? scope.send : fetchImpl ?? (method === "GET" ? fetch : expoFetch);
+    const send = options.scope ? scope.send : fetchImpl ?? getBusinessTransport()?.fetchImpl ?? (method === "GET" ? fetch : expoFetch);
     if (options.expectedServerId !== undefined && options.expectedServerId !== config.serverId) {
       return { ok: false, attempts: 0, error: { kind: "aborted", requestState: "not-sent" } };
     }

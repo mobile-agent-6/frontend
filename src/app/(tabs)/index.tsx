@@ -1,4 +1,5 @@
-import { captureScheduleOwner, createScheduleRoute, discardScheduleRoute } from "@/utils/schedule-ownership";
+import { createScheduleRoute, discardScheduleRoute } from "@/utils/schedule-ownership";
+import { useCurrentScheduleOwner } from "@/hooks/use-schedule-owner";
 import { SymbolView } from "expo-symbols";
 import { useRouter } from "expo-router";
 import { useMemo, useState } from "react";
@@ -28,7 +29,7 @@ export default function ScheduleListScreen() {
   const theme = useTheme();
   const colorScheme = useColorScheme();
   const router = useRouter();
-  const owner = captureScheduleOwner();
+  const owner = useCurrentScheduleOwner();
   const insets = useSafeAreaInsets();
   const openSchedule = useScheduleEditNavigation();
   const [selectedCategory, setSelectedCategory] =

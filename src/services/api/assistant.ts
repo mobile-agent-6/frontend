@@ -2,7 +2,7 @@ import { fetch as expoFetch } from "expo/fetch";
 
 import { getDevelopmentServerConfig, createDevelopmentTarget, createPiCandidate, type DevelopmentServerConfig } from "@/services/api/config";
 import { assistantRecoveryStorage, AssistantRecoveryStorageError } from "@/services/storage/assistant-recovery";
-import { scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
+import { getBusinessTransport, scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
 import type {
   AssistantCancelRequest,
   AssistantCancelResponse,
@@ -104,7 +104,7 @@ export function createAssistantHttpClient({
       const pi = /^(?:mock:)?pi:/.test(current.config.serverId);
       const ip = /^http:\/\/([^/]+):8000$/.exec(current.config.baseUrl)?.[1];
       const canonical = pi ? createPiCandidate(ip, transport) : createDevelopmentTarget(current.config.baseUrl, transport);
-      if (!canonical || (transport === "mock" && !fetchImpl) || canonical.serverId !== current.config.serverId ||
+      if (!canonical || (transport === "mock" && !fetchImpl && !getBusinessTransport()) || canonical.serverId !== current.config.serverId ||
         canonical.baseUrl !== current.config.baseUrl || canonical.apiBaseUrl !== current.config.apiBaseUrl) return { status: "invalid" as const };
       return { status: "ready" as const, config: canonical };
     } catch { return { status: "invalid" as const }; }
@@ -119,7 +119,7 @@ export function createAssistantHttpClient({
     if (current.config.serverId !== expectedServerId) return failure(context, "server-mismatch");
     const mode = readMode();
     if (mode.mode !== "server") return failure(context, "policy");
-    return Object.freeze({ ...current.config, modeGeneration: mode.generation, send: fetchImpl ?? expoFetch });
+    return Object.freeze({ ...current.config, modeGeneration: mode.generation, send: fetchImpl ?? getBusinessTransport()?.fetchImpl ?? expoFetch });
   }
   function isCurrent(server: BoundServer) {
     const current = config(), mode = readMode();

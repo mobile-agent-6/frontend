@@ -9,8 +9,9 @@ const root = path.resolve(__dirname, "..");
 
 // 실제 화면·Hook·서비스를 실행하되 native 컴포넌트와 React 실행기만 메모리 대역으로 둔다.
 // native 렌더링·레이아웃·아이폰 통신을 검증하는 테스트는 아니다.
-function harness(initialMode, { readOnly = false, assistantSyncUi = false, assistantDetails = false, compileEditScreen = false, platform = "ios", renderListState = false, colorScheme = "light", bottomInset = 0 } = {}) {
+function harness(initialMode, { readOnly = false, assistantSyncUi = false, assistantDetails = false, compileEditScreen = false, compileSettingsScreen = false, compileNavigation = false, connectionProfile = false, clockState, renderSettingsModal = false, platform = "ios", renderListState = false, colorScheme = "light", bottomInset = 0, settingsConnection } = {}) {
   const modules = new Map(), screens = [], calls = [], navigations = [];
+  const persisted = new Map();
   const assistantListeners = new Set();
   const theme = { background: colorScheme === "dark" ? "#000000" : "white", backgroundElement: colorScheme === "dark" ? "#212225" : "#F0F0F3", primary: "#FB6C2D", destructive: "red" };
   let assistantSnapshot;
@@ -53,13 +54,19 @@ function harness(initialMode, { readOnly = false, assistantSyncUi = false, assis
     react.useEffect(() => store.subscribe(() => mark(owner)), [store]);
     return select(store.getState());
   };
-  class FixedDate extends Date { constructor(...args) { super(...(args.length ? args : ["2026-11-07T03:00:00Z"])); } }
+  class FixedDate extends Date {
+    constructor(...args) { super(...(args.length ? args : [clockState?.now ?? "2026-11-07T03:00:00Z"])); }
+    static now() { return clockState ? clockState.now : Date.now(); }
+  }
   function source(file) {
     const filename = path.join(root, file);
     if (modules.has(filename)) return modules.get(filename).exports;
     const module = { exports: {} }; modules.set(filename, module);
     let input = fs.readFileSync(filename, "utf8");
-    if (compileEditScreen && file === "src/app/schedule/[id].tsx") {
+    if ((compileNavigation && ["src/app/(tabs)/index.tsx", "src/app/(tabs)/calendar.tsx", "src/hooks/use-schedule-edit-navigation.ts", "src/hooks/use-schedule-owner.ts", "src/hooks/use-server-schedule-data.ts", "src/app/schedule/[id].tsx", "src/app/schedule/create.tsx"].includes(file)) ||
+      (compileEditScreen && file === "src/app/schedule/[id].tsx") || (compileSettingsScreen && [
+      "src/components/settings/settings-screen.tsx", "src/components/ui/confirmation-modal.tsx", "src/components/ui/button.tsx",
+    ].includes(file))) {
       input = require("@babel/core").transformSync(input, {
         filename, configFile: false, babelrc: false,
         parserOpts: { plugins: ["typescript", "jsx"] },
@@ -70,6 +77,7 @@ function harness(initialMode, { readOnly = false, assistantSyncUi = false, assis
       module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX,
     }, fileName: filename }).outputText;
     const resolve = (name) => {
+      if (name === "@/services/settings-runtime" && settingsConnection) return { settingsConnection };
       // native 녹음은 별도 controller/Assistant 화면 통합 테스트에서 검증한다.
       if (name === "@/hooks/use-local-voice-recording") return { useLocalVoiceRecording: () => ({
         busy: false, supported: true, isBusy: () => false, start: async () => {}, stop: async () => {}, discard() {},
@@ -82,7 +90,12 @@ function harness(initialMode, { readOnly = false, assistantSyncUi = false, assis
         getSnapshot: () => assistantSnapshot ?? { phase: assistantSyncUi ? "settled" : "idle", initialCheck: assistantSyncUi ? "checked" : "pending",
           serverId: assistantSyncUi && config?.status === "ready" ? config.config.serverId : null, results: [] },
         subscribe: listener => { assistantListeners.add(listener); return () => assistantListeners.delete(listener); } } };
-      if (name === "@/services/storage/assistant-recovery") return { assistantRecoveryStorage: { readAll: async () => [] } };
+      if (name === "@/services/storage/assistant-recovery") return connectionProfile ? source("src/services/storage/assistant-recovery.ts") : { assistantRecoveryStorage: { readAll: async () => [] } };
+      if (name === "@react-native-async-storage/async-storage" && connectionProfile) return {
+        getItem: async key => persisted.get(key) ?? null,
+        setItem: async (key, value) => { persisted.set(key, value); },
+        removeItem: async key => { persisted.delete(key); },
+      };
       if (name === "react") return react;
       if (name === "react/compiler-runtime") return { c(size) {
         return current.slots[current.cursor++] ??= Array(size).fill(Symbol.for("react.memo_cache_sentinel"));
@@ -110,11 +123,14 @@ function harness(initialMode, { readOnly = false, assistantSyncUi = false, assis
       if (name === "expo/fetch") return { fetch: (url, options) => new Promise((resolve, reject) =>
         calls.push({ url, ...options, resolve, reject, transport: "expo" })) };
       if (name === "@/constants/theme") return { Spacing: { half: 2, one: 4, two: 8, three: 16, four: 24, five: 32, six: 64 }, BottomTabInset: 0 };
-      if (name === "react-native") return { ...Object.fromEntries(["FlatList", "Pressable", "View", "ScrollView", "TextInput", "KeyboardAvoidingView", "ActivityIndicator"].map((s) => [s, s])),
+      if (name === "react-native") return { ...Object.fromEntries(["FlatList", "Pressable", "View", "ScrollView", "TextInput", "KeyboardAvoidingView", "ActivityIndicator", "Modal"].map((s) => [s, s])),
+        AppState: { addEventListener: () => ({ remove() {} }) },
         Platform: { OS: platform }, useColorScheme: () => "light", Keyboard: { dismiss() {} }, StyleSheet: { create: (s) => s, hairlineWidth: 0.5 } };
       if (name === "@expo/ui/community/datetime-picker") return { DateTimePicker: "DateTimePicker" };
       if (name === "react-native-safe-area-context") return { SafeAreaView: "SafeAreaView", useSafeAreaInsets: () => ({ top: 0, bottom: bottomInset, left: 0, right: 0 }) };
       if (name === "@/components/schedule-edit/schedule-edit-form") return source("src/components/schedule-edit/schedule-edit-form.tsx");
+      if (name.startsWith("@/components/settings/")) return source(`src/${name.slice(2)}.tsx`);
+      if (renderSettingsModal && ["@/components/ui/confirmation-modal", "@/components/ui/button"].includes(name)) return source(`src/${name.slice(2)}.tsx`);
       if (name === "@/components/schedule-create/schedule-create-form") return source("src/components/schedule-create/schedule-create-form.tsx");
       if (name === "@/components/schedule-list/schedule-error-notice") return source("src/components/schedule-list/schedule-error-notice.tsx");
       if (renderListState && name === "@/components/schedule-list/schedule-list-state") return source("src/components/schedule-list/schedule-list-state.tsx");
@@ -129,6 +145,7 @@ function harness(initialMode, { readOnly = false, assistantSyncUi = false, assis
     new Function("require", "module", "exports", "fetch", "Date", "process", code)(resolve, module, module.exports,
       (url, options) => new Promise((resolve, reject) => calls.push({ url, ...options, resolve, reject, transport: "global" })), FixedDate,
       { env: { EXPO_PUBLIC_SCHEDULE_DATA_MODE: initialMode,
+        ...(connectionProfile ? { EXPO_PUBLIC_SERVER_TARGET: "pi" } : {}),
         EXPO_PUBLIC_SCHEDULE_READ_ONLY: String(readOnly) } });
     // 기존 목록·필터 회귀는 단건 카드 조회와 분리하며 카드 통합 사례에서만 함께 실행한다.
     if (file === "src/services/api/assistant-schedule-sync.ts" && !assistantDetails) {
@@ -138,9 +155,9 @@ function harness(initialMode, { readOnly = false, assistantSyncUi = false, assis
   }
   const configModule = source("src/services/api/config.ts");
   let config = configModule.parseDevelopmentServerConfig("https://example.invalid");
-  configModule.getDevelopmentServerConfig = () => config;
+  if (!connectionProfile) configModule.getDevelopmentServerConfig = () => config;
   const http = source("src/services/api/http.ts");
-  http.scheduleHttpClient = http.createScheduleHttpClient({ readConfig: () => config, fetchImpl: (url, options) =>
+  if (!connectionProfile) http.scheduleHttpClient = http.createScheduleHttpClient({ readConfig: () => config, fetchImpl: (url, options) =>
     new Promise((resolve, reject) => calls.push({ url, ...options, resolve, reject })) });
   const modeModule = source("src/stores/scheduleDataModeStore.ts");
   // 테스트 전용 환경값으로 실제 정책을 사용한다. 네트워크는 항상 메모리 fetch다.
@@ -188,7 +205,8 @@ function harness(initialMode, { readOnly = false, assistantSyncUi = false, assis
   function mount(kind, routeId, routeKey) {
     const connectionKey = routeKey === undefined && ["detail", "create"].includes(kind) ? source("src/utils/schedule-ownership.ts").createScheduleRoute(kind === "detail" ? routeId : null)?.params.connectionKey : routeKey;
     const s = { connectionKey, slots: [], effects: [], children: new Map(), dirty: true, routeId, focused: true, focusEffects: new Set(),
-      Screen: kind === "notice" ? () => ({ type: source("src/components/schedule-list/schedule-error-notice.tsx").ScheduleErrorNotice, props: routeId })
+      Screen: kind === "settings" ? source("src/components/settings/settings-screen.tsx").SettingsScreen
+        : kind === "notice" ? () => ({ type: source("src/components/schedule-list/schedule-error-notice.tsx").ScheduleErrorNotice, props: routeId })
         : source(kind === "detail" ? "src/app/schedule/[id].tsx" : kind === "create" ? "src/app/schedule/create.tsx" : kind === "layout" ? "src/app/_layout.tsx" : `src/app/(tabs)/${kind}.tsx`).default };
     screens.push(s); flush();
     return { all: (type) => nodes(s.tree, type), one: (type) => nodes(s.tree, type)[0],
@@ -225,6 +243,292 @@ function harness(initialMode, { readOnly = false, assistantSyncUi = false, assis
 }
 const dto = (id, category = "INVENTORY", completed = false) => ({ id, title: id, category, completed,
   scheduledAt: "2026-11-07T03:00:00Z", createdAt: "2026-11-01T00:00:00Z", updatedAt: "2026-11-01T00:00:00Z" });
+
+test("3단계 실제 Settings 카드·동의 모달·저장소·system client 통합 및 이전 모달 보호", async () => {
+  const system = require("./helpers/system-api.cjs").harness();
+  const profile = system.load("src/development/connection-profile.ts").createConnectionProfile("normal");
+  const storage = system.load("src/services/storage/verified-settings.ts").createVerifiedSettingsStorage("mock:screen");
+  const connection = system.load("src/services/settings-connection.ts").createSettingsConnection({ ...profile, storage, business: () => false, legacy: async () => null });
+  const h = harness("mock", { settingsConnection: connection }), screen = h.mount("settings");
+  await h.settle();
+  const button = label => screen.all("Button").find(p => p.label === label);
+  screen.one("TextInput").onChangeText("192.0.2.10"); h.flush();
+  assert.equal(button("저장").disabled, true);
+  button("연결 확인").onPress(); await h.settle();
+  assert.equal(button("저장").disabled, true);
+  button("Pi 시간 맞추기").onPress(); h.flush();
+  assert.equal(screen.one("ConfirmationModal").visible, true);
+  screen.one("ConfirmationModal").onCancel(); h.flush();
+  assert.equal(profile.transport.kind, "mock"); assert.equal(connection.store.getState().phase, "consent");
+  button("Pi 시간 맞추기").onPress(); h.flush();
+  const oldModal = screen.one("ConfirmationModal");
+  screen.one("TextInput").onChangeText("192.0.2.20"); h.flush();
+  await oldModal.onConfirm(); await h.settle(); assert.equal(connection.store.getState().phase, "idle");
+  button("연결 확인").onPress(); await h.settle(); button("Pi 시간 맞추기").onPress(); h.flush();
+  screen.one("ConfirmationModal").onConfirm(); await h.settle();
+  assert.equal(button("저장").disabled, false); button("저장").onPress(); await h.settle();
+  assert.equal((await storage.read()).ip, "192.0.2.20"); assert.equal(connection.store.getState().phase, "saved");
+  assert.equal(button("연결 확인").disabled, false); assert.equal(button("Pi 시간 맞추기").disabled, false);
+  assert.equal(system.liveCalls, 0); assert.equal(h.calls.length, 0);
+  screen.close(); h.close();
+});
+
+function compiledSettingsFixture({ failFirstSync = false } = {}) {
+  const system = require("./helpers/system-api.cjs").harness({ EXPO_PUBLIC_SERVER_TARGET: "pi", EXPO_PUBLIC_SCHEDULE_DATA_MODE: "server" });
+  const profile = system.load("src/development/connection-profile.ts").createConnectionProfile("normal");
+  let postCount = 0;
+  const requests = [], transport = { ...profile.transport, fetchImpl: (...args) => {
+    const method = args[1]?.method ?? "GET";
+    requests.push({ url: String(args[0]), method });
+    if (method === "POST" && ++postCount === 1 && failFirstSync) {
+      return system.mock.createMockTransport([{ method: "POST", url: String(args[0]), steps: [
+        require("./helpers/system-api.cjs").problemStep(503, "TIME_SYNC_UNAVAILABLE"),
+      ] }]).fetchImpl(...args);
+    }
+    return profile.transport.fetchImpl(...args);
+  } };
+  const storage = system.load("src/services/storage/verified-settings.ts").createVerifiedSettingsStorage("mock:compiled-screen");
+  const connection = system.load("src/services/settings-connection.ts").createSettingsConnection({ transport, clock: profile.clock, storage, legacy: async () => null });
+  const callbacks = [], dismiss = connection.dismissConsent, confirm = connection.confirmConsent;
+  connection.dismissConsent = token => { callbacks.push({ action: "cancel", token }); return dismiss(token); };
+  connection.confirmConsent = token => { callbacks.push({ action: "confirm", token }); return confirm(token); };
+  const h = harness("mock", { settingsConnection: connection, compileSettingsScreen: true, renderSettingsModal: true });
+  const screen = h.mount("settings");
+  const button = label => screen.all("Pressable").find(p => p.children?.props?.children === label);
+  const posts = () => requests.filter(r => r.method === "POST");
+  return { system, connection, h, screen, button, posts, requests, storage, callbacks,
+    close() { screen.close(); h.close(); connection.dispose(); } };
+}
+
+test("Settings compiler + 실제 Modal/Button: 취소·재진입·동의·중복 클릭·저장 활성화", async () => {
+  const f = compiledSettingsFixture();
+  const { system, connection, h, screen, button, posts, requests, storage, callbacks } = f;
+  try {
+    await h.settle(); screen.one("TextInput").onChangeText("192.0.2.10"); h.flush();
+    button("연결 확인").onPress(); await h.settle();
+    assert.equal(button("저장").disabled, true);
+    button("Pi 시간 맞추기").onPress(); h.flush();
+    assert.equal(screen.one("Modal").visible, true);
+    assert.equal(button("취소").disabled, false); assert.equal(button("시간 맞추기").disabled, false);
+    button("취소").onPress(); h.flush();
+    assert.equal(callbacks[0].action, "cancel"); assert.ok(callbacks[0].token > 0);
+    assert.equal(screen.one("Modal").visible, false, "compiled 실제 취소 callback은 현재 동의 token으로 닫아야 한다");
+    assert.equal(posts().length, 0);
+    button("Pi 시간 맞추기").onPress(); h.flush();
+    const confirm = button("시간 맞추기").onPress; confirm(); confirm();
+    await h.settle();
+    assert.equal(screen.one("Modal").visible, false);
+    assert.equal(posts().length, 1); assert.equal(requests.filter(r => r.url.endsWith("/health")).length, 2);
+    assert.equal(connection.store.getState().phase, "ready"); assert.equal(button("저장").disabled, false);
+    assert.equal(system.config.getDevelopmentServerConfig().status, "missing");
+    button("저장").onPress(); await h.settle();
+    assert.equal(connection.store.getState().phase, "saved"); assert.equal((await storage.read()).ip, "192.0.2.10");
+    assert.equal(system.load("src/stores/scheduleDataModeStore.ts").getConnectionSnapshot().active, true);
+    assert.equal(system.liveCalls, 0); assert.equal(h.calls.length, 0);
+  } finally { f.close(); }
+});
+
+test("Settings compiler + 실제 모달: 동기화 실패 후 loading 해제·새 동의 재시도만 POST", async () => {
+  const f = compiledSettingsFixture({ failFirstSync: true });
+  const { screen, button, h, connection, posts } = f;
+  try {
+    await h.settle(); screen.one("TextInput").onChangeText("192.0.2.10"); h.flush();
+    button("연결 확인").onPress(); await h.settle(); button("Pi 시간 맞추기").onPress(); h.flush();
+    const first = button("시간 맞추기").onPress; first(); first(); await h.settle();
+    assert.equal(posts().length, 1); assert.equal(screen.one("Modal").visible, false);
+    assert.equal(connection.store.getState().phase, "consent"); assert.equal(connection.store.getState().error, "Pi 시간을 맞추지 못했어요. 다시 시간 맞추기를 눌러 주세요.");
+    assert.ok(screen.all("ThemedText").some(p => p.children === connection.store.getState().error));
+    assert.equal(button("연결 확인").disabled, false); assert.equal(button("Pi 시간 맞추기").disabled, false);
+    assert.equal(button("저장").disabled, true);
+    first(); await h.settle(); assert.equal(posts().length, 1);
+    button("Pi 시간 맞추기").onPress(); h.flush(); button("시간 맞추기").onPress(); await h.settle();
+    assert.equal(posts().length, 2); assert.equal(connection.store.getState().phase, "ready");
+    assert.equal(button("저장").disabled, false); assert.equal(f.system.liveCalls, 0); assert.equal(h.calls.length, 0);
+  } finally { f.close(); }
+});
+
+test("Settings compiler + 실제 모달: 이전 후보·이전 동의 버튼은 새 모달의 권한을 사용하지 않음", async () => {
+  const f = compiledSettingsFixture();
+  const { screen, button, h, connection, posts } = f;
+  try {
+    await h.settle(); screen.one("TextInput").onChangeText("192.0.2.10"); h.flush();
+    button("연결 확인").onPress(); await h.settle(); button("Pi 시간 맞추기").onPress(); h.flush();
+    const oldConfirm = button("시간 맞추기").onPress, oldCancel = button("취소").onPress;
+    screen.one("TextInput").onChangeText("192.0.2.20"); h.flush();
+    screen.one("TextInput").onChangeText("192.0.2.10"); h.flush();
+    button("연결 확인").onPress(); await h.settle(); button("Pi 시간 맞추기").onPress(); h.flush();
+    const token = connection.store.getState().consentToken;
+    oldCancel(); oldConfirm(); await h.settle();
+    assert.equal(screen.one("Modal").visible, true); assert.equal(connection.store.getState().consentToken, token);
+    assert.equal(posts().length, 0);
+    button("시간 맞추기").onPress(); await h.settle();
+    assert.equal(connection.store.getState().phase, "ready"); assert.equal(posts().length, 1);
+    assert.equal(f.system.liveCalls, 0); assert.equal(h.calls.length, 0);
+  } finally { f.close(); }
+});
+
+for (const kind of ["index", "calendar"]) test(`compiler navigation ${kind}: 미연결 mount→A→B→A, fresh callbacks only`, async () => {
+  const h = harness("server", { connectionProfile: true, compileNavigation: true });
+  const config = h.source("src/services/api/config.ts"), authority = h.source("src/stores/scheduleDataModeStore.ts");
+  const profile = h.source("src/development/connection-profile.ts").createConnectionProfile("normal");
+  const sent = [], transport = { ...profile.transport, fetchImpl: (...args) => { sent.push(args[1]?.method ?? "GET"); return profile.transport.fetchImpl(...args); } };
+  let createScreen, oldSubmit;
+  const screen = h.mount(kind);
+  const item = { id: "11111111-1111-4111-8111-111111111111", title: "fixture", date: "2026-11-07", time: "03:00", category: "기타", completed: false };
+  const card = () => kind === "index" ? listCard(screen) : screen.one("ScheduleCard");
+  const add = () => screen.all("Pressable").find(p => p.accessibilityLabel === "새 일정 추가");
+  const before = kind === "index" ? screen.one("FlatList").renderItem({ item }).props.onPress : null;
+  const oldAdd = kind === "index" ? add().onPress : null;
+  const activate = async ip => { authority.commitVerifiedConnection(config.createPiCandidate(ip, "mock"), transport); await h.settle(); };
+  const click = async () => { screen.focus(false); screen.focus(true); const count = h.navigations.length; card().onPress(); await h.settle(); assert.equal(h.navigations.length, count + 1); return h.navigations.at(-1); };
+  try {
+    await activate("192.0.2.10"); before?.(); oldAdd?.(); assert.equal(h.navigations.length, 0);
+    assert.match(card().schedule.title, /^A/); const firstA = card().onPress;
+    const routeA = await click(); assert.ok(h.source("src/utils/schedule-ownership.ts").resolveScheduleRoute(routeA.params.connectionKey, item.id));
+    if (kind === "index") {
+      const count = h.navigations.length; add().onPress(); assert.equal(h.navigations.length, count + 1);
+      const route = h.navigations.at(-1); assert.equal(route.pathname, "/schedule/create");
+      createScreen = h.mount("create", undefined, route.params.connectionKey); fillCreation(h, createScreen); oldSubmit = createButton(createScreen).onPress;
+    }
+    await activate("192.0.2.20"); const countB = h.navigations.length; firstA(); oldAdd?.(); assert.equal(h.navigations.length, countB);
+    assert.equal(h.source("src/utils/schedule-ownership.ts").resolveScheduleRoute(routeA.params.connectionKey, item.id), null);
+    if (createScreen) { assert.equal(createScreen.one("TextInput"), undefined); oldSubmit(); await h.settle(); }
+    assert.match(card().schedule.title, /^B/); const oldB = card().onPress; await click();
+    await activate("192.0.2.10"); const countA = h.navigations.length; firstA(); oldB(); assert.equal(h.navigations.length, countA);
+    assert.match(card().schedule.title, /^A/); await click(); assert.equal(h.calls.length, 0);
+    assert.equal(sent.some(method => method !== "GET"), false);
+  } finally { h.close(); }
+});
+
+test("compiler 상세 route는 연결 변경 뒤 재평가되어 다른 서버 단건 GET·form 생성 금지", async () => {
+  const h = harness("server", { connectionProfile: true, compileNavigation: true });
+  const cfg = h.source("src/services/api/config.ts"), mode = h.source("src/stores/scheduleDataModeStore.ts");
+  const profile = h.source("src/development/connection-profile.ts").createConnectionProfile("normal");
+  const list = h.mount("index");
+  try {
+    mode.commitVerifiedConnection(cfg.createPiCandidate("192.0.2.10", "mock"), profile.transport); await h.settle();
+    listCard(list).onPress(); const route = h.navigations.at(-1);
+    const detail = h.mount("detail", route.params.id, route.params.connectionKey); await h.settle();
+    assert.ok(detail.one("TextInput"));
+    mode.commitVerifiedConnection(cfg.createPiCandidate("192.0.2.20", "mock"), profile.transport); await h.settle();
+    assert.equal(detail.one("TextInput"), undefined, "이전 A route에 B form을 만들면 안 된다");
+    const cache = Object.entries(h.server.store.getState().servers).find(([key]) => key.includes("192.0.2.20"))[1];
+    assert.equal(cache.details[route.params.id], undefined);
+    detail.route(route.params.id); await h.settle();
+    assert.equal(detail.one("TextInput")?.value, "B 검수 일정", "새로 발급한 B key로 재사용한 화면은 B 설정을 읽어야 한다");
+    mode.commitVerifiedConnection(cfg.createPiCandidate("192.0.2.10", "mock"), profile.transport); await h.settle();
+    assert.equal(detail.one("TextInput"), undefined); assert.equal(h.calls.length, 0);
+  } finally { h.close(); }
+});
+
+test("compiler 완료 callback의 새 렌더 generation은 활성화 후 갱신되고 이전 callback 차단", async () => {
+  const h = harness("server", { connectionProfile: true, compileNavigation: true });
+  const cfg = h.source("src/services/api/config.ts"), mode = h.source("src/stores/scheduleDataModeStore.ts");
+  const raw = h.source("src/development/connection-profile.ts").createConnectionProfile("normal").transport;
+  const sent = [], transport = { ...raw, fetchImpl: (...args) => { sent.push(args[1]?.method ?? "GET"); return raw.fetchImpl(...args); } };
+  const list = h.mount("index");
+  try {
+    mode.commitVerifiedConnection(cfg.createPiCandidate("192.0.2.10", "mock"), transport); await h.settle();
+    const old = listCard(list).onToggleCompleted;
+    mode.scheduleDataModeStore.getState().resetConnectionAuthority(); await h.settle(); old(); await h.settle();
+    assert.equal(sent.filter(x => x === "PATCH").length, 0);
+    listCard(list).onToggleCompleted(); await h.settle();
+    assert.equal(sent.filter(x => x === "PATCH").length, 1); assert.equal(h.calls.length, 0);
+  } finally { h.close(); }
+});
+
+test("Settings 편집 세션: 저장 A·잘못된 draft·미저장 B·재진입, 초기 Health와 generation 중복 없음", async () => {
+  const f = compiledSettingsFixture(), { screen, button, h, connection, requests, system } = f;
+  const mode = system.load("src/stores/scheduleDataModeStore.ts");
+  const syncAndSave = async () => { button("Pi 시간 맞추기").onPress(); h.flush(); button("시간 맞추기").onPress(); await h.settle(); button("저장").onPress(); await h.settle(); };
+  try {
+    await h.settle(); screen.one("TextInput").onChangeText("192.0.2.10"); h.flush(); button("연결 확인").onPress(); await h.settle(); await syncAndSave();
+    const generation = mode.getConnectionSnapshot().generation;
+    screen.one("TextInput").onChangeText("192.0.2.999"); h.flush(); button("연결 확인").onPress(); await h.settle();
+    assert.equal(screen.one("TextInput").value, "192.0.2.999"); assert.ok(connection.store.getState().error);
+    const count = requests.length; screen.focus(false); screen.focus(true); await h.settle();
+    assert.equal(screen.one("TextInput").value, "192.0.2.10"); assert.equal(requests.length, count);
+    assert.equal(mode.getConnectionSnapshot().generation, generation);
+    screen.one("TextInput").onChangeText("192.0.2.20"); h.flush(); button("연결 확인").onPress(); await h.settle();
+    button("Pi 시간 맞추기").onPress(); h.flush(); button("시간 맞추기").onPress(); await h.settle();
+    assert.equal(button("저장").disabled, false);
+    assert.equal((await f.storage.read()).ip, "192.0.2.10");
+    const checked = requests.length; screen.focus(false); screen.focus(true); await h.settle();
+    assert.equal(screen.one("TextInput").value, "192.0.2.10"); assert.equal(requests.length, checked);
+    assert.equal(mode.getConnectionSnapshot().generation, generation); assert.match(mode.getConnectionSnapshot().target.serverId, /192\.0\.2\.10/);
+    screen.one("TextInput").onChangeText("192.0.2.20"); h.flush(); connection.cancel(); h.flush();
+    assert.equal(screen.one("TextInput").value, "192.0.2.20", "background 무효화 자체는 현재 편집 draft를 덮지 않는다");
+    assert.equal(system.liveCalls, 0); assert.equal(h.calls.length, 0);
+  } finally { f.close(); }
+});
+
+test("normal profile 실제 목록·캘린더→상세→복귀: 분 경계·반복 GET·A/B 복귀에도 snapshot과 cache 일관", async () => {
+  const clockState = { now: Date.parse("2026-11-07T03:00:59Z") };
+  const h = harness("server", { connectionProfile: true, compileNavigation: true, clockState });
+  const cfg = h.source("src/services/api/config.ts"), mode = h.source("src/stores/scheduleDataModeStore.ts");
+  const profile = h.source("src/development/connection-profile.ts").createConnectionProfile("normal");
+  const list = h.mount("index"), calendar = h.mount("calendar");
+  const activate = async ip => { mode.commitVerifiedConnection(cfg.createPiCandidate(ip, "mock"), profile.transport); await h.settle(); };
+  try {
+    await activate("192.0.2.10"); const original = { ...listCard(list).schedule };
+    for (const screen of [list, calendar]) {
+      clockState.now += 120000; screen.focus(false); screen.focus(true);
+      (screen === list ? listCard(screen) : screen.one("ScheduleCard")).onPress();
+      const route = h.navigations.at(-1), detail = h.mount("detail", route.params.id, route.params.connectionKey); await h.settle();
+      await h.server.retryDetail(route.params.id); await h.settle();
+      assert.ok(detail.one("TextInput")); detail.close(); await h.settle();
+      const cache = Object.values(h.server.store.getState().servers)[0];
+      assert.deepEqual(cache.entities[original.id], original);
+      assert.ok(Object.values(cache.queries).every(q => q.status === "success" && !q.stale));
+    }
+    const system = h.source("src/services/api/system.ts").createSystemApiService(profile);
+    const first = await system.checkHealth(cfg.createPiCandidate("192.0.2.10", "mock")); clockState.now += 120000;
+    const second = await system.checkHealth(cfg.createPiCandidate("192.0.2.10", "mock"));
+    assert.equal(first.ok, true); assert.equal(second.ok, true); assert.notEqual(first.data.serverTime, second.data.serverTime);
+    const currentTime = new Date(clockState.now).toISOString();
+    const synced = await system.syncTimeAfterConsent(cfg.createPiCandidate("192.0.2.10", "mock"), { currentTime }, { consent: "confirmed" });
+    assert.equal(synced.ok, true); assert.equal(synced.data.serverTime, currentTime);
+    await activate("192.0.2.20"); assert.equal(listCard(list).schedule.id, original.id); assert.match(listCard(list).schedule.title, /^B/);
+    await activate("192.0.2.10"); assert.deepEqual(listCard(list).schedule, original);
+    const client = h.source("src/services/api/assistant.ts").assistantHttpClient;
+    const result = await client.getAssistantRequest({ serverId: mode.getConnectionSnapshot().target.serverId, requestId: "33333333-3333-4333-8333-333333333333" });
+    assert.equal(result.ok, true); assert.equal(result.data.result.items[0].scheduledAt, "2026-11-07T03:00:59.000Z");
+    assert.equal(list.all("ScheduleListState").some(p => p.state === "notice"), false); assert.equal(calendar.all("ScheduleListState").some(p => p.state === "notice"), false);
+    assert.equal(h.calls.length, 0);
+  } finally { h.close(); }
+});
+
+for (const colorScheme of ["light", "dark"]) test(`Settings 공통 제목 높이·피드백 순서는 연결 상태에 독립적 (${colorScheme})`, async () => {
+  const f = compiledSettingsFixture();
+  const ui = harness("mock", { settingsConnection: f.connection, colorScheme });
+  const screen = ui.mount("settings");
+  const flatten = value => Object.assign({}, ...[value].flat().filter(Boolean));
+  const row = () => screen.all("View").find(p => p.children?.[0]?.props?.children === "서버 주소 (Pi IP)");
+  const section = () => screen.all("View").find(p => p.children?.[0]?.props?.style?.minHeight !== undefined);
+  const check = () => {
+    const heading = flatten(row().style), title = flatten(row().children[0].props.style);
+    const badge = row().children[1];
+    assert.equal(heading.alignItems, "center"); assert.ok(heading.minHeight >= title.lineHeight);
+    assert.equal(title.alignSelf, "flex-start", "제목은 배지에 따라 달라지는 flex 줄의 중앙 정렬을 상속하지 않아야 한다");
+    if (badge) {
+      const style = flatten(badge.props.style), text = flatten(badge.props.children[1].props.style);
+      assert.equal(heading.minHeight, text.lineHeight + style.paddingVertical * 2);
+    }
+    const children = section().children;
+    assert.match(children[3].props.children, /Orange Pi와 휴대폰/);
+    assert.ok(children[4], "상태 피드백은 네트워크 공통 안내 뒤에 있어야 한다");
+    return heading.minHeight;
+  };
+  try {
+    await ui.settle(); const height = check();
+    f.connection.input("192.0.2.10"); const health = f.connection.check(); ui.flush(); assert.equal(check(), height);
+    await health; ui.flush(); assert.equal(check(), height);
+    f.connection.openConsent(); await f.connection.confirmConsent(f.connection.consentToken()); ui.flush(); assert.equal(check(), height);
+    await f.connection.save(); ui.flush(); assert.equal(check(), height);
+    f.connection.input("192.0.2.999"); await f.connection.check(); ui.flush(); assert.equal(check(), height);
+    assert.equal(f.system.liveCalls, 0); assert.equal(ui.calls.length, 0);
+  } finally { screen.close(); ui.close(); f.close(); }
+});
 
 function resetAuthority(h) {
   h.source("src/stores/scheduleDataModeStore.ts").scheduleDataModeStore.getState().resetConnectionAuthority(); h.flush();

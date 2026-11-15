@@ -4,8 +4,8 @@ import { scheduleHttpClient } from "@/services/api/http";
 import { scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
 
 // Runtime-only route capabilities. URL strings cannot grant a new connection's authority.
-export function captureScheduleOwner() {
-  const { mode, generation } = scheduleDataModeStore.getState();
+export function captureScheduleOwner(connection = scheduleDataModeStore.getState()) {
+  const { mode, generation } = connection;
   return Object.freeze({ mode, generation, serverId: mode === "server" ? scheduleHttpClient.getServerId() : null });
 }
 export type ScheduleOwner = ReturnType<typeof captureScheduleOwner>;
@@ -38,8 +38,9 @@ export function createScheduleRoute(id: string | null, owner = captureScheduleOw
   return id === null ? { pathname: "/schedule/create" as const, params: { connectionKey } }
     : { pathname: "/schedule/[id]" as const, params: { id, connectionKey } };
 }
-export function resolveScheduleRoute(key: unknown, id: string | null) {
+export function resolveScheduleRoute(key: unknown, id: string | null, connection = scheduleDataModeStore.getState()) {
   const route = typeof key === "string" ? routes.get(key) : undefined;
   if (route && !isScheduleOwnerCurrent(route.owner)) { routes.delete(key as string); owners.delete(key as string); }
-  return route && route.id === id && isScheduleOwnerCurrent(route.owner) ? route.owner : null;
+  return route && route.id === id && route.owner.mode === connection.mode && route.owner.generation === connection.generation &&
+    isScheduleOwnerCurrent(route.owner) ? route.owner : null;
 }

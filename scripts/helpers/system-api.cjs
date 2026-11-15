@@ -27,6 +27,7 @@ function harness(initialEnv = {}) {
   const storage = {
     async getItem(key) { storageCalls.push(["get", key]); return data.get(key) ?? null; },
     async setItem(key, value) { storageCalls.push(["set", key]); data.set(key, value); },
+    async removeItem(key) { storageCalls.push(["remove", key]); data.delete(key); },
   };
   function load(relative) {
     if (modules.has(relative)) return modules.get(relative).exports;
@@ -43,8 +44,8 @@ function harness(initialEnv = {}) {
       assert.ok(name.startsWith("@/"), name);
       return load(`src/${name.slice(2)}.ts`);
     };
-    new Function("require", "module", "exports", "fetch", "process", "setTimeout", "clearTimeout", code)(
-      resolve, module, module.exports, denied, { env }, timers.setTimeout, timers.clearTimeout);
+    new Function("require", "module", "exports", "fetch", "process", "setTimeout", "clearTimeout", "__DEV__", code)(
+      resolve, module, module.exports, denied, { env }, timers.setTimeout, timers.clearTimeout, env.NODE_ENV !== "production");
     return module.exports;
   }
   const config = load("src/services/api/config.ts");

@@ -65,6 +65,7 @@ export function createSystemApiService({ transport, clock = { now: Date.now, mon
   timers = { setTimeout, clearTimeout } }: { transport: ApiTransport; clock?: SystemClock; timers?: ApiTimers }) {
   // 호출 중 주입 객체를 바꿔도 Mock에서 HTTP로 전환하거나 다른 fetch로 retry하지 않는다.
   const { kind: transportKind, fetchImpl } = transport;
+  const checkedLiveTargets = new WeakSet<ServerTarget>();
   function invalid<T>(kind: SystemApiError["kind"]): SystemApiResult<T> {
     return { ok: false, attempts: 0, timings: [], error: { kind, requestState: "not-sent" } };
   }
@@ -174,14 +175,26 @@ export function createSystemApiService({ transport, clock = { now: Date.now, mon
     return invalid("request");
   }
   return {
-    checkHealth: (target: ServerTarget, options: SystemRequestOptions = {}) =>
-      exchange(target, "GET", "/health", undefined, parseHealthResponse, options),
-    // Settings 확인 조작 전용 입구다. 1단계에서는 live POST 자체를 닫는다.
+    checkHealth: async (target: ServerTarget, options: SystemRequestOptions = {}) => {
+      const result = await exchange(target, "GET", "/health", undefined, parseHealthResponse, options);
+      checkedLiveTargets.delete(target);
+      if (result.ok) {
+        const timing = result.timings.at(-1);
+        if (timing && timing.monotonicReceivedAt !== null) {
+          const rtt = timing.monotonicReceivedAt - timing.monotonicStartedAt;
+          const parsed = parseScheduleApiDateTime(result.data.serverTime);
+          if (rtt >= 0 && Math.abs(parsed.milliseconds + parsed.microseconds / 1000 - timing.wallStartedAt - rtt / 2) <= 60_000) checkedLiveTargets.add(target);
+        }
+      }
+      return result;
+    },
+    // Settings 동의 전용 입구. 실제 Pi POST에는 같은 후보의 유효한 Health 확인도 필요하다.
     syncTimeAfterConsent: (target: ServerTarget, input: TimeSyncRequest,
       options: SystemRequestOptions & { consent: "confirmed" }): Promise<SystemApiResult<TimeSyncResponse>> => {
-      if (!options || options.consent !== "confirmed" || target?.source !== "pi" || transportKind !== "mock") {
+      if (!options || options.consent !== "confirmed" || target?.source !== "pi" || (transportKind === "http" && !checkedLiveTargets.has(target))) {
         return Promise.resolve(invalid("policy"));
       }
+      checkedLiveTargets.delete(target);
       const payload = parseTimeSyncRequest(input);
       return payload ? exchange(target, "POST", "/api/v1/system/time-sync", JSON.stringify(payload), parseTimeSyncResponse, options)
         : Promise.resolve(invalid("request"));

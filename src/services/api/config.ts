@@ -52,10 +52,18 @@ export function parseDevelopmentServerConfig(
 export function getDevelopmentServerConfig(): DevelopmentServerConfigResult {
   // Pi는 후속 격리·저장 단계 전까지 업무 client에 공개하지 않는다. 개발 주소로 fallback하지 않는다.
   const source = getServerTargetSource();
-  if (source !== "development") return { status: source === "pi" ? "missing" : "invalid" };
+  if (source === "pi") {
+    const active = businessConnectionReader?.();
+    return active && isServerTarget(active) ? { status: "ready", config: active } : { status: "missing" };
+  }
+  if (source !== "development") return { status: "invalid" };
   // Expo가 공개 환경 변수를 치환할 수 있도록 정적인 점 표기법을 유지한다.
   return parseDevelopmentServerConfig(process.env.EXPO_PUBLIC_DEV_SERVER_BASE_URL);
 }
+
+let businessConnectionReader: (() => ServerTarget | null) | undefined;
+/** Central store registers a reader; candidate construction never publishes business authority. */
+export function registerBusinessConnectionReader(reader: () => ServerTarget | null) { businessConnectionReader = reader; }
 
 export type ServerTargetSource = "development" | "pi";
 export type TransportKind = "http" | "mock";
@@ -120,7 +128,7 @@ export type ConnectionSnapshot = Readonly<{
   target: ServerTarget | null;
   generation: number;
   active: boolean;
-  businessAccess: "development" | "blocked";
+  businessAccess: "development" | "pi" | "blocked";
 }>;
 
 /** Settings가 맡을 네 역할의 경계만 정의한다. 저장 schema·복원·활성화는 아직 연결하지 않는다. */
@@ -131,19 +139,20 @@ export type ConnectionSelection = Readonly<{
   active: ConnectionSnapshot;
 }>;
 
-export function createConnectionSnapshot({ mode, generation, source, target: candidate = null }: {
+export function createConnectionSnapshot({ mode, generation, source, target: candidate = null, authorized = false }: {
   mode: "mock" | "server";
   generation: number;
   source: ServerTargetSource | "invalid";
   target?: ServerTarget | null;
+  authorized?: boolean;
 }): ConnectionSnapshot {
   if (!Number.isSafeInteger(generation) || generation < 0) throw new RangeError("invalid-connection-generation");
   const valid = candidate !== null && isServerTarget(candidate) && candidate.source === source;
   const bound = valid ? Object.freeze({ ...candidate }) : null;
   // 1단계는 기존 development HTTP만 업무 대상으로 허용한다. Pi·검수는 후보 표현만 가능하다.
-  const active = mode === "server" && source === "development" && bound?.transport === "http";
+  const active = mode === "server" && bound !== null && ((source === "development" && bound.transport === "http") || authorized);
   return Object.freeze({ dataMode: mode, generation, target: bound, active,
-    businessAccess: active ? "development" : "blocked",
+    businessAccess: active ? source === "pi" ? "pi" : "development" : "blocked",
     environment: source === "invalid" || (candidate !== null && !valid) ? "invalid"
       : mode === "mock" ? "mock" : bound?.transport === "mock" ? "verification" : source });
 }
