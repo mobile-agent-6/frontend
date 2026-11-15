@@ -72,7 +72,9 @@ export function createServerScheduleStore({
   readServerId = scheduleHttpClient.getServerId,
   list = listSchedules,
   get = getSchedule,
-}: { readServerId?: () => string | null; list?: typeof listSchedules; get?: typeof getSchedule } = {}) {
+  prepareUpdate = prepareScheduleUpdate,
+  prepareDeletion = prepareScheduleDeletion,
+}: { readServerId?: () => string | null; list?: typeof listSchedules; get?: typeof getSchedule; prepareUpdate?: typeof prepareScheduleUpdate; prepareDeletion?: typeof prepareScheduleDeletion } = {}) {
   const store = createStore<QueryState>(() => ({ serverId: null, generation: 0, servers: {} }));
   let sequence = 0;
   type Flight = { controller: AbortController; promise: Promise<void>; sequence: number; detailId?: string };
@@ -80,7 +82,10 @@ export function createServerScheduleStore({
   const consumers = new Map<string, Set<symbol>>();
   const mutationLocks = new Map<string, symbol>();
   const mutationControllers = new Map<symbol, AbortController>();
-  const checking = new Set<string>();
+  const checking = new Map<string, symbol>();
+  let authority = scheduleDataModeStore.getState().generation;
+  const returnedServers = new Set<string>();
+  const owns = (serverId: string, generation: number) => scheduleDataModeStore.getState().generation === generation && readServerId() === serverId;
 
   function setMutation(serverId: string, id: string, mutation: ScheduleMutationState | undefined) {
     update(serverId, (cache) => {
@@ -91,15 +96,16 @@ export function createServerScheduleStore({
   }
   /** 화면 수명과 독립적인 일정별 잠금. 불확실한 작업은 GET 확인 전까지 보유한다. */
   function beginMutation(serverId: string, id: string, kind: ScheduleMutationState["kind"]) {
-    if (syncServer() !== serverId) return null;
+    if (syncServer() !== serverId || !confirmedForMutation(serverId, id)) return null;
     const key = JSON.stringify([serverId, id]);
     if (mutationLocks.has(key) || checking.has(key) || Object.hasOwn(store.getState().servers[serverId]?.deletedIds ?? {}, id)) return null;
+    const generation = authority;
     const token = Symbol(), controller = new AbortController();
     mutationLocks.set(key, token); mutationControllers.set(token, controller);
     setMutation(serverId, id, { kind, phase: "pending" });
     return { controller,
       finish(blocked = false) {
-        if (mutationLocks.get(key) !== token) return;
+        if (!owns(serverId, generation) || mutationLocks.get(key) !== token) return;
         mutationControllers.delete(token);
         if (blocked) setMutation(serverId, id, { kind, phase: "uncertain" });
         else { mutationLocks.delete(key); setMutation(serverId, id, undefined); }
@@ -134,12 +140,16 @@ export function createServerScheduleStore({
   /** 설정 변경 시 호출한다. HTTP 계층의 완료 시점 검사와 함께 이전 응답을 차단한다. */
   function syncServer() {
     const serverId = readServerId();
-    if (serverId === store.getState().serverId) return serverId;
+    const next = scheduleDataModeStore.getState().generation;
+    if (serverId === store.getState().serverId && next === authority) return serverId;
+    if (store.getState().serverId) returnedServers.add(store.getState().serverId!);
+    authority = next;
     for (const controller of mutationControllers.values()) controller.abort();
+    mutationControllers.clear(); checking.clear();
     for (const key of flights.keys()) cancel(key);
     store.setState((state) => ({ serverId, generation: state.generation + 1,
       servers: Object.fromEntries(Object.entries(state.servers).map(([id, cache]) => [id, {
-        ...cache, details: Object.fromEntries(Object.entries(cache.details).map(([key, entry]) => [key, { ...entry, stale: true }])),
+        ...cache, mutations: Object.fromEntries(Object.entries(cache.mutations).map(([key, value]) => [key, value.phase === "pending" ? { ...value, phase: "uncertain" as const } : value])), details: Object.fromEntries(Object.entries(cache.details).map(([key, entry]) => [key, { ...entry, stale: true }])),
         queries: Object.fromEntries(Object.entries(cache.queries).map(([key, entry]) =>
           [key, { ...entry, stale: true }])) }])) }));
     return serverId;
@@ -175,7 +185,7 @@ export function createServerScheduleStore({
     } } }));
     // 마이크로태스크에서 시작해 동기 중복 소비자도 하나의 실행을 공유한다.
     const promise = Promise.resolve().then(async () => {
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted || readServerId() !== serverId || authority !== scheduleDataModeStore.getState().generation) return;
       const result = await list(query, controller.signal);
       syncServer();
       if (controller.signal.aborted || store.getState().generation !== generation ||
@@ -215,13 +225,14 @@ export function createServerScheduleStore({
       const owners = consumers.get(key) ?? new Set<symbol>();
       owners.add(token); consumers.set(key, owners);
     }
+    const ownerGeneration = authority;
     let released = false;
-    return { promise: fetchQuery(snapshot), retry: () => released ? Promise.resolve() : fetchQuery(snapshot, true), release() {
+    return { promise: fetchQuery(snapshot), retry: () => released || !owns(serverId!, ownerGeneration) ? Promise.resolve() : fetchQuery(snapshot, true), release() {
       if (released || !key) return;
       released = true;
       const owners = consumers.get(key);
       owners?.delete(token);
-      if (owners?.size === 0) { consumers.delete(key); cancel(key, true); }
+      if (owners?.size === 0) { consumers.delete(key); if (ownerGeneration === authority) cancel(key, true); }
     } };
   }
 
@@ -240,7 +251,7 @@ export function createServerScheduleStore({
       status: "loading", hasSuccess: entry?.hasSuccess ?? false, stale: entry?.stale ?? true, error: null, sequence: requestSequence,
     } } }));
     const promise = Promise.resolve().then(async () => {
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted || readServerId() !== serverId || authority !== scheduleDataModeStore.getState().generation) return;
       const result = await get(scheduleId, controller.signal);
       syncServer();
       if (controller.signal.aborted || store.getState().generation !== generation ||
@@ -284,19 +295,21 @@ export function createServerScheduleStore({
     const key = serverId ? JSON.stringify(["detail", serverId, scheduleId]) : null;
     const token = Symbol();
     if (key) { const owners = consumers.get(key) ?? new Set<symbol>(); owners.add(token); consumers.set(key, owners); }
+    const ownerGeneration = authority;
     let released = false;
-    return { promise: fetchDetail(scheduleId), retry: () => released ? Promise.resolve() : fetchDetail(scheduleId, true),
+    return { promise: fetchDetail(scheduleId), retry: () => released || !owns(serverId!, ownerGeneration) ? Promise.resolve() : fetchDetail(scheduleId, true),
       release() {
         if (released || !key) return;
         released = true;
         const owners = consumers.get(key); owners?.delete(token);
-        if (owners?.size === 0) { consumers.delete(key); cancel(key, true); }
+        if (owners?.size === 0) { consumers.delete(key); if (ownerGeneration === authority) cancel(key, true); }
       } };
   }
   /** 성공 write와 GET 실패를 분리한다. 재시도 인자가 있으면 실패한 GET만 실행한다. */
   async function refreshLists(expectedServerId: string, retryQueries?: ScheduleListQuery[]) {
     if (syncServer() !== expectedServerId) return { ok: false,
       failedQueries: retryQueries?.length ? retryQueries : [getMainScheduleRange(new Date())] };
+    const scopeGeneration = authority;
     const cache = store.getState().servers[expectedServerId];
     const active = Object.entries(cache?.queries ?? {}).filter(([key]) => consumers.has(key)).map(([, entry]) => entry.query);
     const queries = retryQueries ?? (active.length ? active : [getMainScheduleRange(new Date())]);
@@ -304,7 +317,7 @@ export function createServerScheduleStore({
     // 목록의 이전 응답은 각 flight 취소·요청 순번으로 차단하고 mutation의 세대 장벽은 유지한다.
     if (!retryQueries) invalidate(false);
     await Promise.all(queries.map((query) => fetchQuery(query, true)));
-    if (syncServer() !== expectedServerId) return { ok: false, failedQueries: queries };
+    if (!owns(expectedServerId, scopeGeneration) || syncServer() !== expectedServerId) return { ok: false, failedQueries: queries };
     const current = store.getState().servers[expectedServerId];
     const failedQueries = queries.filter((query) => {
       const entry = current?.queries[scheduleQueryKey(expectedServerId, query)];
@@ -380,8 +393,16 @@ export function createServerScheduleStore({
     return true;
   }
 
+  function confirmedForMutation(serverId: string | null, id: string) {
+    syncServer();
+    if (!serverId || !returnedServers.has(serverId)) return true;
+    const cache = store.getState().servers[serverId];
+    return Boolean(cache?.details[id]?.hasSuccess && !cache.details[id].stale) ||
+      Object.values(cache?.queries ?? {}).some(entry => entry.hasSuccess && !entry.stale && entry.ids.includes(id));
+  }
+
   function deletionAllowed(serverId: string | null, id: string) {
-    return Boolean(serverId) && scheduleDataModeStore.getState().mode === "server" && readServerId() === serverId &&
+    return confirmedForMutation(serverId, id) && Boolean(serverId) && scheduleDataModeStore.getState().mode === "server" && readServerId() === serverId &&
       isScheduleRequestAllowed("DELETE", `/schedules/${encodeURIComponent(id)}`);
   }
 
@@ -389,7 +410,7 @@ export function createServerScheduleStore({
     if (!serverId || signal?.aborted || !deletionAllowed(serverId, id)) return false;
     const previous = store.getState().servers[serverId]?.mutations[id];
     if (previous?.kind === "delete" && (previous.deleted || previous.phase !== "error")) return false;
-    const prepared = prepareScheduleDeletion(id);
+    const prepared = prepareDeletion(id);
     if (!prepared.ok) return false;
     const lease = beginMutation(serverId, id, "delete");
     if (!lease) return false;
@@ -398,12 +419,13 @@ export function createServerScheduleStore({
       generation === scheduleDataModeStore.getState().generation && scheduleDataModeStore.getState().mode === "server" && syncServer() === serverId;
     const abort = () => lease.controller.abort();
     signal?.addEventListener("abort", abort, { once: true });
-    const unsubscribe = scheduleDataModeStore.subscribe((next) => { if (next.generation !== generation) { abort(); invalidate(); } });
+    const unsubscribe = scheduleDataModeStore.subscribe((next) => { if (next.generation !== generation) { abort(); syncServer(); } });
     let deleted = false, blocked = false;
     let state: ScheduleMutationState = { kind: "delete", phase: "uncertain", message: "삭제 결과를 확인하지 못했어요. GET으로 일정 존재 여부를 확인해 주세요." };
     invalidate();
     try {
       const result = await prepared.operation.submit(lease.controller.signal);
+      if (!owns(serverId, generation)) return false;
       if ("response" in result && result.response.serverId === serverId && current()) {
         deleted = applyScheduleDeletion(serverId, id);
         setMutation(serverId, id, { kind: "delete", phase: "pending", deleted });
@@ -428,7 +450,7 @@ export function createServerScheduleStore({
       return false;
     } finally {
       signal?.removeEventListener("abort", abort); unsubscribe();
-      lease.finish(blocked); setMutation(serverId, id, state);
+      if (owns(serverId, generation)) { lease.finish(blocked); setMutation(serverId, id, state); }
     }
   }
 
@@ -441,8 +463,8 @@ export function createServerScheduleStore({
     const generation = scheduleDataModeStore.getState().generation;
     const current = () => !signal?.aborted && generation === scheduleDataModeStore.getState().generation &&
       scheduleDataModeStore.getState().mode === "server" && syncServer() === serverId;
-    const unsubscribe = scheduleDataModeStore.subscribe((next) => { if (next.generation !== generation) invalidate(); });
-    checking.add(key);
+    const unsubscribe = scheduleDataModeStore.subscribe((next) => { if (next.generation !== generation) syncServer(); });
+    const checkToken = Symbol(); checking.set(key, checkToken);
     try {
       if (!mutation.deleted) {
         await fetchDetail(id, true);
@@ -471,12 +493,12 @@ export function createServerScheduleStore({
         message: "일정 상태를 확인하지 못했어요. GET 조회만 다시 시도해 주세요." });
       return false;
     } finally {
-      checking.delete(key); unsubscribe();
+      if (checking.get(key) === checkToken) checking.delete(key); unsubscribe();
     }
   }
 
   function completionAllowed(serverId: string | null, id: string) {
-    return Boolean(serverId) && scheduleDataModeStore.getState().mode === "server" &&
+    return confirmedForMutation(serverId, id) && Boolean(serverId) && scheduleDataModeStore.getState().mode === "server" &&
       readServerId() === serverId && isScheduleRequestAllowed("PATCH", `/schedules/${encodeURIComponent(id)}`);
   }
   async function toggleCompleted(serverId: string | null, id: string) {
@@ -484,7 +506,7 @@ export function createServerScheduleStore({
     const original = store.getState().servers[serverId]?.entities[id];
     if (!original) return;
     if (store.getState().servers[serverId]?.mutations[id]?.phase === "refresh-error") return;
-    const prepared = prepareScheduleUpdate(id, { completed: !original.completed });
+    const prepared = prepareUpdate(id, { completed: !original.completed });
     if (!prepared.ok) return;
     const lease = beginMutation(serverId, id, "completion");
     if (!lease) return;
@@ -493,7 +515,7 @@ export function createServerScheduleStore({
     const current = () => generation === scheduleDataModeStore.getState().generation &&
       scheduleDataModeStore.getState().mode === "server" && syncServer() === serverId;
     const unsubscribe = scheduleDataModeStore.subscribe((next) => {
-      if (next.generation !== generation) { lease.controller.abort(); invalidate(); }
+      if (next.generation !== generation) { lease.controller.abort(); syncServer(); }
     });
     let blocked = false, message: string | undefined, phase: ScheduleMutationState["phase"] = "error";
     let failedQueries: ScheduleListQuery[] | undefined;
@@ -502,6 +524,9 @@ export function createServerScheduleStore({
     setMutation(serverId, id, { kind: "completion", phase: "pending", completed });
     try {
       const result = await prepared.operation.submit(lease.controller.signal);
+      // A definite rejection may settle before a connection switch but reach this await later.
+      // Its rollback has no authority over data freshly read in the returning generation.
+      if (!owns(serverId, generation)) return;
       if ("response" in result && result.response.serverId === serverId && result.response.data.id === id && current()) {
         confirmed = true;
         applyScheduleResult(serverId, result.response.data);
@@ -530,8 +555,10 @@ export function createServerScheduleStore({
         : "완료 변경 결과가 불확실해요. GET으로 상태를 확인해 주세요.";
     } finally {
       unsubscribe();
-      lease.finish(blocked);
-      if (message) setMutation(serverId, id, { kind: "completion", phase, message, failedQueries });
+      if (owns(serverId, generation)) {
+        lease.finish(blocked);
+        if (message) setMutation(serverId, id, { kind: "completion", phase, message, failedQueries });
+      }
     }
   }
 
@@ -542,7 +569,7 @@ export function createServerScheduleStore({
     const key = JSON.stringify([serverId, id]);
     if (!mutation || mutation.kind !== "completion" || mutation.phase === "pending" || checking.has(key)) return;
     const generation = scheduleDataModeStore.getState().generation;
-    checking.add(key);
+    const checkToken = Symbol(); checking.set(key, checkToken);
     try {
       // 불확실 결과는 해당 ID의 단건을 먼저 확인하고 현재 목록 조건도 다시 조회한다.
       if (mutation.phase === "uncertain") await fetchDetail(id, true);
@@ -559,7 +586,7 @@ export function createServerScheduleStore({
         message: "서버의 현재 상태를 조회했어요. 이전 PATCH의 성공 여부를 뜻하지 않아요." } : undefined)
         : { kind: "completion", phase: "refresh-error", failedQueries: refresh.failedQueries,
           message: "목록을 갱신하지 못했어요. GET 조회만 다시 시도해 주세요." });
-    } finally { checking.delete(key); }
+    } finally { if (checking.get(key) === checkToken) checking.delete(key); }
   }
   return { store, syncServer, acquire, acquireDetail, invalidate, refreshLists, refreshAfterExternalChange, applyScheduleResult,
     beginMutation, completionAllowed, toggleCompleted, checkCompletion,

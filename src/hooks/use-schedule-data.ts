@@ -1,3 +1,4 @@
+import { captureScheduleOwner, isScheduleOwnerCurrent } from "@/utils/schedule-ownership";
 import { useMemo, useRef, useState } from "react";
 
 import { readMockSchedules, setMockScheduleCompleted } from "@/services/mock/schedule-operations";
@@ -6,6 +7,7 @@ import type { Schedule } from "@/types/schedule";
 
 // 일정 변경 원본은 store에 유지하고, 각 화면은 마지막 조회 성공 결과의 참조만 보관한다.
 export function useScheduleData(enabled = true) {
+  const owner = captureScheduleOwner();
   const currentSchedules = useScheduleStore((state) => state.schedules);
   const [readAttempt, setReadAttempt] = useState(0);
   const [lastSuccessfulSchedules, setLastSuccessfulSchedules] = useState<Schedule[] | null>(null);
@@ -29,7 +31,7 @@ export function useScheduleData(enabled = true) {
   }
 
   const changeCompleted = (id: string, completed: boolean) => {
-    if (!enabled) return;
+    if (!enabled || !isScheduleOwnerCurrent(owner)) return;
     if (lockedRef.current) return;
     lockedRef.current = true;
     const before = useScheduleStore.getState().schedules;

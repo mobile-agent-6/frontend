@@ -1,3 +1,4 @@
+import { useScheduleOwner } from "@/hooks/use-schedule-owner";
 import { DateTimePicker } from "@expo/ui/community/datetime-picker";
 import { useState } from "react";
 import {
@@ -54,6 +55,7 @@ export function ScheduleEditForm({
   retryReadLabel = "일정 정보 다시 불러오기",
   retryReadDisabled,
 }: ScheduleEditFormProps) {
+  const ownsScreen = useScheduleOwner();
   const theme = useTheme();
   const colorScheme = useColorScheme();
   const [original] = useState(() => ({
@@ -88,7 +90,7 @@ export function ScheduleEditForm({
   const isDirty = Object.keys(updates).length > 0;
 
   const handleSave = () => {
-    if (actionLocked) return;
+    if (!ownsScreen() || actionLocked) return;
 
     if (!isValid) {
       setFormError("필수 항목을 모두 입력해 주세요.");

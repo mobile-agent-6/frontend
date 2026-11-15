@@ -1,8 +1,8 @@
 import { fetch as expoFetch } from "expo/fetch";
 
-import { getDevelopmentServerConfig, parseDevelopmentServerConfig, type DevelopmentServerConfig } from "@/services/api/config";
+import { getDevelopmentServerConfig, createDevelopmentTarget, createPiCandidate, type DevelopmentServerConfig } from "@/services/api/config";
 import { assistantRecoveryStorage, AssistantRecoveryStorageError } from "@/services/storage/assistant-recovery";
-import { scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
+import { getBusinessTransport, scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
 import type {
   AssistantCancelRequest,
   AssistantCancelResponse,
@@ -50,16 +50,16 @@ export type AssistantHttpResult<T> =
   | (Extract<ResponseResult<T>, { ok: true }> & { metadata: AssistantMetadataUpdate })
   | Extract<ResponseResult<T>, { ok: false }>;
 
-export type AssistantRequestOptions = { expectedServerId: string; signal?: AbortSignal };
+export type AssistantRequestOptions = { expectedServerId: string; signal?: AbortSignal; expectedGeneration?: number };
 export type AssistantPostOptions = AssistantRequestOptions & {
   // 저장 장벽 뒤 실제 fetch 직전에 복구 계층의 접수·시각 조건을 동기 검사한다.
   beforeSend?: (metadata: Readonly<AssistantRecoveryMetadata>) => boolean;
 };
 // cancel 전용 timeout 수치는 미합의다. 호출자 취소 신호를 필수로 받고 임의 기본값은 두지 않는다.
-export type AssistantCancelOptions = { expectedServerId: string; signal: AbortSignal };
+export type AssistantCancelOptions = AssistantRequestOptions & { signal: AbortSignal };
 type RecoveryStorage = Pick<typeof assistantRecoveryStorage, "saveBeforePost" | "read" | "recordResponse">;
 type Context = Pick<AssistantHttpError, "operation" | "serverId" | "assistantRequestId" | "conversationId">;
-type BoundServer = DevelopmentServerConfig & { modeGeneration: number };
+type BoundServer = DevelopmentServerConfig & { modeGeneration: number; send: typeof fetch };
 
 const RESPONSE_TIMEOUT_MS = 5_000;
 const sameUuid = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
@@ -100,12 +100,13 @@ export function createAssistantHttpClient({
     try {
       const current = readConfig();
       if (current.status !== "ready") return current;
-      const canonical = parseDevelopmentServerConfig(current.config.baseUrl);
-      if (canonical.status !== "ready" || canonical.config.baseUrl !== current.config.baseUrl ||
-        canonical.config.apiBaseUrl !== current.config.apiBaseUrl || canonical.config.serverId !== current.config.serverId) {
-        return { status: "invalid" as const };
-      }
-      return canonical;
+      const transport = current.config.serverId.startsWith("mock:") ? "mock" : "http";
+      const pi = /^(?:mock:)?pi:/.test(current.config.serverId);
+      const ip = /^http:\/\/([^/]+):8000$/.exec(current.config.baseUrl)?.[1];
+      const canonical = pi ? createPiCandidate(ip, transport) : createDevelopmentTarget(current.config.baseUrl, transport);
+      if (!canonical || (transport === "mock" && !fetchImpl && !getBusinessTransport()) || canonical.serverId !== current.config.serverId ||
+        canonical.baseUrl !== current.config.baseUrl || canonical.apiBaseUrl !== current.config.apiBaseUrl) return { status: "invalid" as const };
+      return { status: "ready" as const, config: canonical };
     } catch { return { status: "invalid" as const }; }
   }
 
@@ -118,7 +119,7 @@ export function createAssistantHttpClient({
     if (current.config.serverId !== expectedServerId) return failure(context, "server-mismatch");
     const mode = readMode();
     if (mode.mode !== "server") return failure(context, "policy");
-    return { ...current.config, modeGeneration: mode.generation };
+    return Object.freeze({ ...current.config, modeGeneration: mode.generation, send: fetchImpl ?? getBusinessTransport()?.fetchImpl ?? expoFetch });
   }
   function isCurrent(server: BoundServer) {
     const current = config(), mode = readMode();
@@ -129,7 +130,7 @@ export function createAssistantHttpClient({
   // 한 번의 HTTP 교환만 수행한다. retry·GET-first 복구·polling·복구 항목 정리는 호출자 책임이다.
   async function send<T>(server: BoundServer, context: Context, path: string, method: "POST" | "GET", body: string | undefined,
     signal: AbortSignal | undefined, timeoutMs: number | null, parse: (data: unknown, status: number) => T | null,
-    beforeSend?: () => boolean): Promise<ResponseResult<T>> {
+    beforeSend?: () => boolean, onStaleResponse?: (value: T) => Promise<void>): Promise<ResponseResult<T>> {
     if (signal?.aborted) return failure(context, "aborted");
     if (!isCurrent(server)) return failure(context, "context-changed");
     const controller = new AbortController();
@@ -154,8 +155,9 @@ export function createAssistantHttpClient({
         try { if (beforeSend && !beforeSend()) return failure(context, "policy"); }
         catch { return failure(context, "policy"); }
         if (signal?.aborted) return failure(context, "aborted");
+        if (!isCurrent(server)) return failure(context, "context-changed");
         // Expo fetch는 RN의 기본 fetch와 달리 redirect:error를 지원한다. GET도 원래 origin 밖으로 보내지 않는다.
-        const response = await (fetchImpl ?? expoFetch)(`${server.apiBaseUrl}${path}`, {
+        const response = await server.send(`${server.apiBaseUrl}${path}`, {
           method, headers, body, signal: controller.signal, redirect: "error",
         });
         status = response.status;
@@ -168,6 +170,7 @@ export function createAssistantHttpClient({
         if (status >= 200 && status < 300) {
           if (mediaType !== "application/json" || !httpRequestId) return error("response");
           const parsed = parse(data, status);
+          if (parsed && !isCurrent(server) && onStaleResponse) await onStaleResponse(parsed);
           return parsed ? { ok: true, data: parsed, status, serverId: server.serverId, httpRequestId } : error("response");
         }
         const problem = mediaType === "application/problem+json" ? parseAssistantProblemDetails(data) : null;
@@ -192,12 +195,12 @@ export function createAssistantHttpClient({
   }
 
   async function record<T extends AssistantRequestStatusResponse>(result: ResponseResult<T>, ref: AssistantRecoveryReference,
-    server: BoundServer, context: Context, tracked: boolean): Promise<AssistantHttpResult<T>> {
+    server: BoundServer, context: Context, tracked: boolean, expectedFirstPostAttemptAt?: number): Promise<AssistantHttpResult<T>> {
     if (!result.ok) return result;
     acceptedRequestKeys.add(acceptanceKey(ref));
     let metadata: AssistantMetadataUpdate = { status: "not-tracked" };
     if (tracked) {
-      try { await recovery.recordResponse(ref, result.data); metadata = { status: "updated" }; }
+      try { await recovery.recordResponse(ref, result.data, { expectedFirstPostAttemptAt }); metadata = { status: "updated" }; }
       catch (error) { metadata = { status: "failed", code: storageCode(error) }; }
     }
     if (!isCurrent(server)) return failure(context, "context-changed", {
@@ -214,6 +217,7 @@ export function createAssistantHttpClient({
     const signal = options.signal;
     const server = bind(context, options.expectedServerId);
     if ("ok" in server) return server;
+    if (options.expectedGeneration !== undefined && options.expectedGeneration !== server.modeGeneration) return failure(context, "context-changed");
     if (signal?.aborted) return failure(context, "aborted");
     const ref = { serverId: server.serverId, requestId: payload.data.requestId };
     let saved;
@@ -225,17 +229,21 @@ export function createAssistantHttpClient({
         (payload.data.conversationId !== undefined && !sameUuid(payload.data.conversationId, parsed.conversationId)) ||
         (saved.acceptConfirmed && !sameUuid(saved.conversationId, parsed.conversationId))) return null;
       return parsed;
-    }, () => options.beforeSend?.({ ...saved }) !== false);
-    return record(result, ref, server, context, true);
+    }, () => options.beforeSend?.({ ...saved }) !== false, async value => {
+      acceptedRequestKeys.add(acceptanceKey(ref));
+      try { await recovery.recordResponse(ref, value, { expectedFirstPostAttemptAt: saved.firstPostAttemptAt }); } catch {}
+    });
+    return record(result, ref, server, context, true, saved.firstPostAttemptAt);
   }
 
-  async function getAssistantRequest(reference: AssistantRecoveryReference, options: { signal?: AbortSignal } = {}): Promise<AssistantHttpResult<AssistantRequestStatusResponse>> {
+  async function getAssistantRequest(reference: AssistantRecoveryReference, options: { signal?: AbortSignal; expectedGeneration?: number } = {}): Promise<AssistantHttpResult<AssistantRequestStatusResponse>> {
     const ref = { serverId: reference?.serverId, requestId: reference?.requestId };
     const context: Context = { operation: "get", serverId: ref.serverId, assistantRequestId: ref.requestId };
     if (!isAssistantUuidV4(ref.requestId) || typeof ref.serverId !== "string" || !validSignal(options.signal)) return failure(context, "request");
     const signal = options.signal;
     const server = bind(context, ref.serverId);
     if ("ok" in server) return server;
+    if (options.expectedGeneration !== undefined && options.expectedGeneration !== server.modeGeneration) return failure(context, "context-changed");
     if (signal?.aborted) return failure(context, "aborted");
     let saved;
     try { saved = await recovery.read(ref); }
@@ -244,9 +252,14 @@ export function createAssistantHttpClient({
       const parsed = status === 200 ? parseAssistantRequestStatusResponse(data) : null;
       return parsed && sameUuid(parsed.requestId, ref.requestId) &&
         (!saved?.acceptConfirmed || sameUuid(saved.conversationId, parsed.conversationId)) ? parsed : null;
+    }, undefined, async value => {
+      acceptedRequestKeys.add(acceptanceKey(ref));
+      if (saved) {
+        try { await recovery.recordResponse(ref, value, { expectedFirstPostAttemptAt: saved.firstPostAttemptAt }); } catch {}
+      }
     });
     // blockingRequestId/activeQuestionRequestId 등 미저장 ID의 GET에서는 모르는 POST 시각을 만들지 않는다.
-    return record(result, ref, server, context, saved !== null);
+    return record(result, ref, server, context, saved !== null, saved?.firstPostAttemptAt);
   }
 
   async function cancelAssistantConversation(conversationId: string, input: AssistantCancelRequest,
@@ -259,6 +272,7 @@ export function createAssistantHttpClient({
     const signal = options.signal;
     const server = bind(context, options.expectedServerId);
     if ("ok" in server) return server;
+    if (options.expectedGeneration !== undefined && options.expectedGeneration !== server.modeGeneration) return failure(context, "context-changed");
     const result = await send(server, context, `/assistant/conversations/${conversationId}/cancel`, "POST", payload.body, signal, null, (data, status) => {
       const parsed = status === 200 ? parseAssistantCancelResponse(data) : null;
       return parsed && parsed.target.type === payload.data.target.type && sameUuid(parsed.target.id, payload.data.target.id) ? parsed : null;

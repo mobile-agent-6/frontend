@@ -468,7 +468,7 @@ test("저장 대기 중 서버 또는 모드 왕복 변경 시 이전 요청을 
   }
 });
 
-test("응답 대기 중 서버 변경은 늦은 응답의 metadata 갱신·현재 서버 성공 표시 차단", async () => {
+test("응답 대기 중 서버 변경은 원래 접수 증거를 보존하고 현재 서버 성공 표시 차단", async () => {
   const h = harness(), gate = deferred(); h.state.handle = ()=>gate.promise;
   const pending = h.post(); await until(()=>h.state.calls.length === 1);
   h.state.config = h.config.parseDevelopmentServerConfig(otherOrigin);
@@ -476,7 +476,7 @@ test("응답 대기 중 서버 변경은 늦은 응답의 metadata 갱신·현�
   const result = await pending;
   assert.equal(result.error.kind, "context-changed");
   assert.equal(result.error.serverId, serverId);
-  assert.equal((await h.recovery.read(reference())).acceptConfirmed, false);
+  assert.equal((await h.recovery.read(reference())).acceptConfirmed, true);
 });
 
 test("응답 저장 중 서버 변경도 원래 서버 기록만 갱신하고 새 서버 성공으로 반환하지 않음", async () => {

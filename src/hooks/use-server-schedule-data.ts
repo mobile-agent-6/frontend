@@ -6,11 +6,17 @@ import { scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
 import { getScheduleCoverage, normalizeScheduleQuery, scheduleQueryKey, serverScheduleStore } from "@/stores/serverScheduleStore";
 import type { ScheduleDateRange, ScheduleListQuery } from "@/utils/schedule-query";
 
+/** Render-time configuration belongs to the subscribed authority, not a compiler-cached getter. */
+function configForGeneration(generation: number) {
+  return generation === scheduleDataModeStore.getState().generation ? getDevelopmentServerConfig() : { status: "missing" as const };
+}
+
 /** 명시적으로 활성화한 소비자만 조회하며 선택 날짜는 기존 성공 coverage를 재사용한다. */
 export function useServerScheduleData(query: ScheduleListQuery, enabled = false, coverageRange?: ScheduleDateRange) {
   const state = useStore(serverScheduleStore.store);
+  const generation = useStore(scheduleDataModeStore, value => value.generation);
   const subscription = useRef<{ release: () => void; retry: () => Promise<void> } | null>(null);
-  const config = getDevelopmentServerConfig();
+  const config = configForGeneration(generation);
   const serverId = config.status === "ready" ? config.config.serverId : null;
   const { category, completed } = query;
   const cache = serverId && state.serverId === serverId ? state.servers[serverId] : undefined;
@@ -34,7 +40,7 @@ export function useServerScheduleData(query: ScheduleListQuery, enabled = false,
     const consumer = serverScheduleStore.acquire(prepared.query);
     subscription.current = consumer;
     return consumer.release;
-  }, [enabled, serverId, prepared]);
+  }, [enabled, serverId, generation, prepared]);
   const key = serverId && prepared.query ? scheduleQueryKey(serverId, prepared.query) : null;
   // effect가 서버 세대를 전환하기 전 렌더에서는 이전 서버의 성공 이력을 노출하지 않는다.
   const entry = key ? cache?.queries[key] : undefined;
@@ -62,7 +68,7 @@ export function useServerScheduleData(query: ScheduleListQuery, enabled = false,
       mutation.kind === "completion" && mutation.phase === "refresh-error" && mutation.message &&
       mutation.failedQueries?.some((query) => scheduleQueryKey(serverId!, query) === key))),
     coverage: (from: string, to: string) => getScheduleCoverage(entry, from, to),
-    retryRead: () => enabled ? subscription.current?.retry() ?? Promise.resolve() : Promise.resolve(),
+    retryRead: () => enabled && generation === scheduleDataModeStore.getState().generation ? subscription.current?.retry() ?? Promise.resolve() : Promise.resolve(),
     cancel: () => subscription.current?.release(),
   };
 }
@@ -70,7 +76,7 @@ export function useServerScheduleData(query: ScheduleListQuery, enabled = false,
 /** 목록·캘린더는 같은 mutation 상태와 GET-only 복구를 사용한다. */
 export function useScheduleCompletion(serverId: string | null, enabled: boolean) {
   const state = useStore(serverScheduleStore.store);
-  const generation = scheduleDataModeStore.getState().generation;
+  const generation = useStore(scheduleDataModeStore, value => value.generation);
   const mutations = serverId && state.serverId === serverId ? state.servers[serverId]?.mutations : undefined;
   const notices = Object.entries(mutations ?? {}).filter(([, entry]) => entry.kind === "completion" && entry.message);
   return {
@@ -85,7 +91,7 @@ export function useScheduleCompletion(serverId: string | null, enabled: boolean)
       }
     },
     retryCompletion: () => {
-      if (enabled) void Promise.all(notices.map(([id]) => serverScheduleStore.checkCompletion(serverId, id)));
+      if (enabled && generation === scheduleDataModeStore.getState().generation) void Promise.all(notices.map(([id]) => serverScheduleStore.checkCompletion(serverId, id)));
     },
   };
 }
@@ -93,8 +99,9 @@ export function useScheduleCompletion(serverId: string | null, enabled: boolean)
 /** 단건 성공은 공유 객체에만 반영하며 목록 coverage를 만들지 않는다. */
 export function useServerScheduleDetail(scheduleId: string | undefined, enabled = false) {
   const state = useStore(serverScheduleStore.store);
+  const generation = useStore(scheduleDataModeStore, value => value.generation);
   const subscription = useRef<{ release: () => void; retry: () => Promise<void> } | null>(null);
-  const config = getDevelopmentServerConfig();
+  const config = configForGeneration(generation);
   const serverId = config.status === "ready" ? config.config.serverId : null;
   useEffect(() => {
     if (!enabled) return;
@@ -103,7 +110,7 @@ export function useServerScheduleDetail(scheduleId: string | undefined, enabled 
     const consumer = serverScheduleStore.acquireDetail(scheduleId);
     subscription.current = consumer;
     return consumer.release;
-  }, [enabled, serverId, scheduleId]);
+  }, [enabled, serverId, generation, scheduleId]);
   const cache = serverId && state.serverId === serverId ? state.servers[serverId] : undefined;
   const entry = scheduleId ? cache?.details[scheduleId] : undefined;
   const localError = enabled && (config.status !== "ready" ? {
@@ -120,6 +127,6 @@ export function useServerScheduleDetail(scheduleId: string | undefined, enabled 
     hasSuccessfulRead: Boolean(schedule),
     refreshPending: Boolean(scheduleId && cache?.mutations[scheduleId]?.phase === "pending"),
     stale: entry?.stale ?? true,
-    retryRead: () => enabled ? subscription.current?.retry() ?? Promise.resolve() : Promise.resolve(),
+    retryRead: () => enabled && generation === scheduleDataModeStore.getState().generation ? subscription.current?.retry() ?? Promise.resolve() : Promise.resolve(),
   };
 }

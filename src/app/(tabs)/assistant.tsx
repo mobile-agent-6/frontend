@@ -92,6 +92,9 @@ function resolveInteraction(message: ConversationMessage, id: string) {
 }
 
 export default function AssistantScreen() {
+  const viewGeneration = scheduleDataModeStore.getState().generation;
+  const viewServerId = assistantHttpClient.getServerId();
+  const viewCurrent = () => scheduleDataModeStore.getState().generation === viewGeneration && assistantHttpClient.getServerId() === viewServerId;
   const theme = useTheme();
   const colorScheme = useColorScheme();
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
@@ -125,7 +128,7 @@ export default function AssistantScreen() {
   const [retryingScheduleSync, setRetryingScheduleSync] = useState<
     readonly string[]
   >([]);
-  const scheduleSyncRetryLocksRef = useRef(new Set<string>());
+  const scheduleSyncRetryLocksRef = useRef(new Map<string, symbol>());
   const [uncertainUi, setUncertainUi] = useState<{
     serverId: string;
     generation: number;
@@ -170,6 +173,7 @@ export default function AssistantScreen() {
   > | null>(null);
   const operationVersionRef = useRef(0);
   const mountedRef = useRef(true);
+  const connectionRef = useRef({ generation: viewGeneration, serverId: viewServerId });
   const errorIdRef = useRef(0);
   const pendingInputRef = useRef("");
   const mockTextPendingRef = useRef(false);
@@ -405,7 +409,12 @@ export default function AssistantScreen() {
   const clearMockOperation = useCallback(
     (notify: boolean) => {
       if (!mountedRef.current) return;
+      connectionRef.current = { generation: scheduleDataModeStore.getState().generation, serverId: assistantHttpClient.getServerId() };
       operationVersionRef.current += 1;
+      committedMessagesRef.current = []; setMessages([]);
+      inputTextRef.current = ""; inputRevisionRef.current += 1; setInputText("");
+      setRecoveryRecords([]); setRecoveryReadError(false);
+      scheduleSyncRetryLocksRef.current.clear(); setRetryingScheduleSync([]);
       serverTaskRef.current?.cancel();
       serverTaskRef.current = null;
       textQuestionRef.current = null;
@@ -420,10 +429,14 @@ export default function AssistantScreen() {
       pendingMockRef.current = null;
       invalidateActiveInteraction();
       finishOperation();
-      if (notify) reportError("데이터 모드가 변경되어 이전 요청을 중단했어요.");
+      if (notify) reportError("서버 연결이 변경되어 이전 대화가 초기화되었어요.");
     },
     [finishOperation, invalidateActiveInteraction, reportError],
   );
+
+  useLayoutEffect(() => {
+    if (connectionRef.current.generation !== viewGeneration || connectionRef.current.serverId !== viewServerId) clearMockOperation(false);
+  }, [viewGeneration, viewServerId, clearMockOperation]);
 
   useEffect(
     () =>
@@ -469,6 +482,9 @@ export default function AssistantScreen() {
     const consume = () => {
       if (!subscribed || !mountedRef.current) return;
       const snapshot = assistantLifecycle.getSnapshot();
+      if (snapshot.generation !== undefined && snapshot.generation !== scheduleDataModeStore.getState().generation) return;
+      if (connectionRef.current.serverId !== assistantHttpClient.getServerId() ||
+        connectionRef.current.generation !== scheduleDataModeStore.getState().generation) clearMockOperation(false);
       setRecoverySnapshot(snapshot);
       if (isMockScheduleMode()) return;
       const serverId = assistantHttpClient.getServerId();
@@ -582,6 +598,7 @@ export default function AssistantScreen() {
       unsubscribe();
     };
   }, [
+    clearMockOperation,
     getTextQuestionContext,
     getUncertainContext,
     reportRecoveryIssue,
@@ -680,6 +697,7 @@ export default function AssistantScreen() {
       | { type: "selection"; messageId: string; candidateId: string }
       | { type: "confirmation"; messageId: string; approved: boolean },
   ) => {
+    if (!viewCurrent()) return;
     const selection = action?.type === "selection" ? action : undefined;
     const confirmation = action?.type === "confirmation" ? action : undefined;
     if (
@@ -1362,24 +1380,25 @@ export default function AssistantScreen() {
       !data.result.schedulesChanged
     )
       return;
-    scheduleSyncRetryLocksRef.current.add(key);
-    setRetryingScheduleSync([...scheduleSyncRetryLocksRef.current]);
+    const syncToken = Symbol(); scheduleSyncRetryLocksRef.current.set(key, syncToken);
+    setRetryingScheduleSync([...scheduleSyncRetryLocksRef.current.keys()]);
     try {
       // 반환된 과거 상태를 메시지에 덮지 않는다. 최신 상태는 구독을 통해서만 읽는다.
-      await assistantScheduleSync.retry(ref);
+      await assistantScheduleSync.retry(ref, { generation });
     } catch {
       // 기존 실패 안내를 유지한다. 표시 예외가 Assistant POST나 Schedule write의 근거가 되지 않는다.
       if (current())
         setScheduleSyncSnapshot(assistantScheduleSync.getSnapshot());
     } finally {
-      scheduleSyncRetryLocksRef.current.delete(key);
+      if (scheduleSyncRetryLocksRef.current.get(key) === syncToken) scheduleSyncRetryLocksRef.current.delete(key);
       // 이 호출의 로컬 잠금만 해제하며 다른 요청의 메시지·입력·처리 상태는 변경하지 않는다.
       if (mountedRef.current)
-        setRetryingScheduleSync([...scheduleSyncRetryLocksRef.current]);
+        setRetryingScheduleSync([...scheduleSyncRetryLocksRef.current.keys()]);
     }
   };
 
   const handleSend = () => {
+    if (!viewCurrent()) return;
     if (isVoiceInputBusy(inputUiRef.current) || localVoice.isBusy()) return;
     if (!isMockScheduleMode()) {
       void sendServerInput();
@@ -1428,7 +1447,7 @@ export default function AssistantScreen() {
       | { type: "candidate"; scheduleId: string }
       | { type: "confirmation"; confirmed: boolean },
   ) => {
-    if (!mountedRef.current) return;
+    if (!viewCurrent() || !mountedRef.current) return;
     if (!isMockScheduleMode()) return;
     if (
       !mountedRef.current ||
@@ -1719,7 +1738,7 @@ export default function AssistantScreen() {
             mockMode
               ? []
               : scheduleSyncSnapshot.filter(
-                  (entry) => entry.reference.serverId === currentServerId,
+                  (entry) => entry.reference.serverId === currentServerId && (entry.generation === undefined || entry.generation === cleanupGeneration),
                 )
           }
           retryingScheduleSync={retryingScheduleSync}
@@ -1792,6 +1811,7 @@ export default function AssistantScreen() {
           onFocus={() => conversationListRef.current?.prepareForKeyboard()}
           value={inputText}
           onChangeText={(text) => {
+            if (!viewCurrent()) return;
             inputRevisionRef.current += 1;
             inputTextRef.current = text;
             setInputText(text);

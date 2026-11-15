@@ -1,3 +1,4 @@
+import { resolveScheduleRoute, retainScheduleRoute } from "@/utils/schedule-ownership";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import { SymbolView } from "expo-symbols";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -30,11 +31,14 @@ function userMessage(message: string | null | undefined) {
 }
 
 export default function ScheduleEditScreen() {
-  const { id } = useLocalSearchParams<{ id?: string | string[] }>();
+  const { id, connectionKey } = useLocalSearchParams<{ id?: string | string[]; connectionKey?: string | string[] }>();
   const scheduleId = typeof id === "string" && id.length > 0 ? id : undefined;
   const mode = useStore(scheduleDataModeStore);
   const serverMode = mode.mode === "server";
-  const detail = useServerScheduleDetail(scheduleId, serverMode);
+  useEffect(() => retainScheduleRoute(connectionKey), [connectionKey]);
+  const owner = resolveScheduleRoute(connectionKey, scheduleId ?? null, mode);
+  const detail = useServerScheduleDetail(scheduleId, serverMode && Boolean(owner));
+  if (!owner) return <><Stack.Screen options={iosHeaderOptions} /><ScheduleListState state="error" errorTitle="일정을 찾을 수 없어요." /></>;
   // 대상·서버·모드가 달라지면 폼과 native 모달 상태도 별도 수명으로 시작한다.
   return <ScheduleEditContent key={JSON.stringify([mode.generation, serverMode ? detail.serverId : null, scheduleId])}
     id={scheduleId} serverMode={serverMode} generation={mode.generation} detail={detail} />;
@@ -127,6 +131,7 @@ function ScheduleEditContent({ id, serverMode, generation, detail }: {
   };
 
   const handleDeleteModalDismiss = () => {
+    if (!mountedRef.current || generation !== scheduleDataModeStore.getState().generation) return;
     deleteModalDismissingRef.current = false;
     setIsDeleteModalDismissing(false);
     if (!pendingDeleteNavigationRef.current) return;

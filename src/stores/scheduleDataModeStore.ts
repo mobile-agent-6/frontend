@@ -1,5 +1,8 @@
 import { createStore } from "zustand/vanilla";
 
+import { createConnectionSnapshot, createDevelopmentTarget, getDevelopmentServerConfig, getServerTargetSource, isServerTarget, registerBusinessConnectionReader, type ServerTarget } from "@/services/api/config";
+import type { ApiTransport } from "@/services/api/transport";
+
 export type ScheduleDataMode = "mock" | "server";
 
 export function resolveScheduleDataMode(value: string | undefined): ScheduleDataMode {
@@ -14,15 +17,43 @@ const readOnly = process.env.EXPO_PUBLIC_SCHEDULE_READ_ONLY === "true";
 export const scheduleDataModeStore = createStore<{
   mode: ScheduleDataMode;
   generation: number;
+  connection: Readonly<{ target: ServerTarget; transport: ApiTransport }> | null;
   setMode: (mode: ScheduleDataMode) => void;
+  resetConnectionAuthority: () => void;
 }>((set) => ({
   // effect 이전에 결정해 첫 화면부터 올바른 원본을 사용한다. Expo 정적 치환 표기법을 유지한다.
   mode: resolveScheduleDataMode(process.env.EXPO_PUBLIC_SCHEDULE_DATA_MODE),
   generation: 0,
+  connection: null,
   setMode: (mode) => set((state) => state.mode === mode ? state : {
     mode, generation: state.generation + 1,
   }),
+  // 동일 대상으로 돌아와도 이전 callback의 권한은 되살리지 않는다. 대상 활성화는 수행하지 않는다.
+  resetConnectionAuthority: () => set(state => ({ generation: state.generation + 1 })),
 }));
+
+registerBusinessConnectionReader(() => {
+  const state = scheduleDataModeStore.getState();
+  return state.mode === "server" ? state.connection?.target ?? null : null;
+});
+export function getBusinessTransport() { return getServerTargetSource() === "pi" ? scheduleDataModeStore.getState().connection?.transport ?? null : null; }
+/** Called only after controller validation and durable write; publishes one atomic state. */
+export function commitVerifiedConnection(target: ServerTarget, transport: ApiTransport) {
+  if (getServerTargetSource() !== "pi" || target.source !== "pi" || !isServerTarget(target) || target.transport !== transport.kind) throw new Error("invalid-connection-authority");
+  const previous = scheduleDataModeStore.getState();
+  if (previous.connection?.target.serverId === target.serverId && previous.connection.transport.fetchImpl === transport.fetchImpl) return;
+  scheduleDataModeStore.setState({ connection: Object.freeze({ target, transport }), mode: "server", generation: previous.generation + 1 });
+}
+
+/** 기존 mode generation이 공통 연결 권한이다. Schedule cache 무효화 generation과 별개다. */
+export function getConnectionSnapshot() {
+  const state = scheduleDataModeStore.getState(), source = getServerTargetSource();
+  if (source === "pi" && state.connection) return createConnectionSnapshot({ mode: state.mode, generation: state.generation,
+    source, target: state.connection.target, authorized: true });
+  const config = getDevelopmentServerConfig();
+  return createConnectionSnapshot({ mode: state.mode, generation: state.generation, source,
+    target: source === "development" && config.status === "ready" ? createDevelopmentTarget(config.config.baseUrl) : null });
+}
 
 export function isMockScheduleMode(generation?: number) {
   const current = scheduleDataModeStore.getState();

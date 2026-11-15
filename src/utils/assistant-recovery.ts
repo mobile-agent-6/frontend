@@ -1,4 +1,4 @@
-import { parseDevelopmentServerConfig } from "@/services/api/config";
+import { createDevelopmentTarget, createPiCandidate } from "@/services/api/config";
 import type {
   AssistantRecoveryCleanupEvidence,
   AssistantRecoveryCleanupFacts,
@@ -12,9 +12,14 @@ import {
 
 // 현재 설정과 같은 origin 기반 식별값이다. DB 초기화·서버 세대를 구분하는 증거는 아니다.
 export function isAssistantRecoveryServerId(value: unknown): value is string {
-  if (typeof value !== "string" || !value.startsWith("development:")) return false;
-  const parsed = parseDevelopmentServerConfig(value.slice("development:".length));
-  return parsed.status === "ready" && parsed.config.serverId === value;
+  if (typeof value !== "string") return false;
+  const match = /^(mock:)?(development|pi):(.+)$/.exec(value);
+  if (!match) return false;
+  const transport = match[1] ? "mock" : "http";
+  const pi = /^http:\/\/([^/]+):8000$/.exec(match[3]);
+  const target = match[2] === "development" ? createDevelopmentTarget(match[3], transport)
+    : pi ? createPiCandidate(pi[1], transport) : null;
+  return target?.serverId === value;
 }
 
 export function isAssistantRecoveryTimestamp(value: unknown): value is number {

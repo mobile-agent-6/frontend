@@ -6,6 +6,9 @@ import { ThemedText } from "@/components/ui/themed-text";
 import { Spacing } from "@/constants/theme";
 import { useTheme } from "@/hooks/use-theme";
 
+const BADGE_LINE_HEIGHT = 18;
+export const SETTINGS_CONNECTION_BADGE_HEIGHT = BADGE_LINE_HEIGHT + Spacing.one * 2;
+
 type SettingsConnectionBadgeProps = {
   isTimeMismatch: boolean;
 };
@@ -75,6 +78,7 @@ export function SettingsConnectionFeedback({
 }
 
 type SettingsConnectionStatusProps = {
+  differenceMs?: number;
   piTime: number;
   phoneTime: number;
   isTimeMismatch: boolean;
@@ -92,6 +96,7 @@ function formatMockTime(timestamp: number) {
 
 
 export function SettingsConnectionStatus({
+  differenceMs,
   piTime,
   phoneTime,
   isTimeMismatch,
@@ -139,12 +144,15 @@ export function SettingsConnectionStatus({
           </ThemedText>
         </View>
       </View>
-      {isTimeMismatch && (
+      {differenceMs !== undefined && <ThemedText type="small" themeColor="textSecondary">
+        시각 차이: {(differenceMs / 1000).toFixed(3)}초
+      </ThemedText>}
+      {(isTimeMismatch || canSync) && (
         <View
           style={[styles.syncNotice, { backgroundColor: theme.primaryMuted }]}
         >
           <ThemedText type="small" style={{ color: theme.primary }}>
-            Pi와 휴대폰 시간이 일치하지 않습니다.
+            시간 차이를 확인한 뒤 동의하면 Pi 시간을 맞춥니다.
           </ThemedText>
           <Button
             label="Pi 시간 맞추기"
@@ -188,7 +196,7 @@ const styles = StyleSheet.create({
   },
   badgeText: {
     fontSize: 12,
-    lineHeight: 18,
+    lineHeight: BADGE_LINE_HEIGHT,
     fontWeight: "500",
     flexShrink: 1,
   },

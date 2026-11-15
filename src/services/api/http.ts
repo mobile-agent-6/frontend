@@ -1,7 +1,7 @@
 import { fetch as expoFetch } from "expo/fetch";
 
 import { getDevelopmentServerConfig } from "@/services/api/config";
-import { isScheduleRequestAllowed } from "@/stores/scheduleDataModeStore";
+import { getBusinessTransport, isScheduleRequestAllowed, scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
 
 export type ValidationErrorItem = {
   location: "body" | "query" | "header" | "path";
@@ -44,6 +44,7 @@ export type HttpResult<T> =
   | { ok: false; error: HttpError; attempts: number };
 
 export type ScheduleHttpRequest = {
+  scope?: ScheduleRequestScope;
   method?: "GET" | "POST" | "PATCH" | "DELETE";
   // /api/v1을 제외한 경로와 별도의 query를 받는다.
   path: string;
@@ -56,6 +57,13 @@ export type ScheduleHttpRequest = {
 };
 
 const SCHEDULE_TIMEOUT_MS = 10_000;
+
+export type ScheduleRequestScope = Readonly<{
+  config: Readonly<Extract<ReturnType<typeof getDevelopmentServerConfig>, { status: "ready" }>["config"]>;
+  generation: number;
+  mode: "mock" | "server";
+  send: typeof fetch;
+}>;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -85,6 +93,17 @@ export function createScheduleHttpClient({
   fetchImpl?: typeof fetch;
   readConfig?: typeof getDevelopmentServerConfig;
 } = {}) {
+  function captureScope(): ScheduleRequestScope | undefined {
+    const value = readConfig(), state = scheduleDataModeStore.getState();
+    return value.status === "ready" ? Object.freeze({ config: Object.freeze({ ...value.config }),
+      generation: state.generation, mode: state.mode, send: fetchImpl ?? getBusinessTransport()?.fetchImpl ?? expoFetch }) : undefined;
+  }
+  function isScopeCurrent(scope: ScheduleRequestScope) {
+    const value = readConfig(), state = scheduleDataModeStore.getState();
+    return state.generation === scope.generation && state.mode === scope.mode && value.status === "ready" &&
+      value.config.serverId === scope.config.serverId && value.config.baseUrl === scope.config.baseUrl &&
+      value.config.apiBaseUrl === scope.config.apiBaseUrl;
+  }
   async function request(options: ScheduleHttpRequest): Promise<HttpResult<unknown>> {
     const method = options.method ?? "GET";
     const path = options.path;
@@ -102,13 +121,20 @@ export function createScheduleHttpClient({
         kind: "configuration", configurationStatus: initial.status, requestState: "not-sent",
       } };
     }
-    const config = { ...initial.config };
+    const scope = options.scope ?? captureScope();
+    if (!scope || !isScopeCurrent(scope)) return { ok: false, attempts: 0,
+      error: { kind: "aborted", requestState: "not-sent" } };
+    const config = scope.config;
+    const authority = scheduleDataModeStore.getState();
+    const generation = authority.generation;
+    const send = options.scope ? scope.send : fetchImpl ?? getBusinessTransport()?.fetchImpl ?? (method === "GET" ? fetch : expoFetch);
     if (options.expectedServerId !== undefined && options.expectedServerId !== config.serverId) {
       return { ok: false, attempts: 0, error: { kind: "aborted", requestState: "not-sent" } };
     }
     const isCurrentServer = () => {
       const current = readConfig();
-      return current.status === "ready" && current.config.serverId === config.serverId &&
+      return isScopeCurrent(scope) && scheduleDataModeStore.getState().generation === generation &&
+        current.status === "ready" && current.config.serverId === config.serverId &&
         current.config.apiBaseUrl === config.apiBaseUrl;
     };
     let headers: Headers;
@@ -166,7 +192,6 @@ export function createScheduleHttpClient({
       const receive = async (): Promise<HttpResult<unknown>> => {
         try {
           // RN의 기본 whatwg-fetch는 redirect 옵션을 무시한다. 쓰기는 Expo native fetch로 차단한다.
-          const send = fetchImpl ?? (method === "GET" ? fetch : expoFetch);
           const response = await send(url, { method, headers: new Headers(headers), body, signal: controller.signal,
             // 쓰기 요청의 redirect로 허용되지 않은 endpoint에 재전송되는 것을 방지한다.
             redirect: method === "GET" ? "follow" : "error" });
@@ -236,7 +261,7 @@ export function createScheduleHttpClient({
     const current = readConfig();
     return current.status === "ready" ? current.config.serverId : null;
   }
-  return { request, getServerId };
+  return { request, getServerId, captureScope, isScopeCurrent };
 }
 
 export type ScheduleHttpClient = ReturnType<typeof createScheduleHttpClient>;

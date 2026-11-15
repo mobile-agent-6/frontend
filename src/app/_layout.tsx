@@ -11,6 +11,7 @@ import { useEffect, useRef } from "react";
 import { Platform, useColorScheme } from "react-native";
 
 import { assistantLifecycle } from "@/services/api/assistant-lifecycle";
+import { initializeSavedConnection } from "@/services/connection-initialization";
 
 export default function RootLayout() {
   const colorScheme = useColorScheme();
@@ -18,6 +19,8 @@ export default function RootLayout() {
   const pathname = usePathname();
   const router = useRouter();
   const hasHandledInitialRoute = useRef(false);
+
+  useEffect(() => { void initializeSavedConnection(); }, []);
 
   useEffect(() => assistantLifecycle.attach(), []);
 

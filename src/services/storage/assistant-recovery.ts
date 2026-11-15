@@ -114,8 +114,10 @@ export function createAssistantRecoveryStorage(storage: AssistantRecoveryStorage
     });
   }
 
-  function recordResponse(input: AssistantRecoveryReference, response: AssistantRecoveryResponse): Promise<AssistantRecoveryMetadata> {
+  function recordResponse(input: AssistantRecoveryReference, response: AssistantRecoveryResponse,
+    options?: { expectedFirstPostAttemptAt?: number }): Promise<AssistantRecoveryMetadata> {
     const snapshot = { ...input };
+    const expectedFirst = options?.expectedFirstPostAttemptAt;
     // DTO 전문을 큐·영속 영역에 보관하지 않고 메타데이터만 먼저 도출한다.
     const seed: AssistantRecoveryMetadata = { ...snapshot, firstPostAttemptAt: 0, lastPostAttemptAt: 0, acceptConfirmed: false };
     const observed = applyAssistantRecoveryResponse(seed, response);
@@ -125,6 +127,7 @@ export function createAssistantRecoveryStorage(storage: AssistantRecoveryStorage
       const entries = await readEntries();
       const index = entries.findIndex((entry) => matches(entry, ref));
       if (index < 0) throw new AssistantRecoveryStorageError("not-found");
+      if (expectedFirst !== undefined && entries[index].firstPostAttemptAt !== expectedFirst) throw new AssistantRecoveryStorageError("conflict");
       // 최신 저장 상태로 늦은 응답·conversation 충돌을 재판정한다.
       const saved = mergeAssistantRecoveryMetadata(entries[index], observed);
       if (!saved) throw new AssistantRecoveryStorageError("conflict");

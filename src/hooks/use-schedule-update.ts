@@ -1,3 +1,4 @@
+import { useScheduleOwner } from "@/hooks/use-schedule-owner";
 import { useEffect, useRef, useState } from "react";
 import { useStore } from "zustand";
 
@@ -11,6 +12,7 @@ import type { ScheduleListQuery } from "@/utils/schedule-query";
 
 /** 일반 수정 전용 흐름. 완료 토글·삭제·낙관적 변경은 실행하지 않는다. */
 export function useScheduleUpdate(scheduleId: string | undefined, serverId: string | null) {
+  const ownsScreen = useScheduleOwner();
   const shared = useStore(serverScheduleStore.store);
   const mutation = serverId && scheduleId ? shared.servers[serverId]?.mutations[scheduleId] : undefined;
   const sharedBlocked = mutation?.phase === "pending" || mutation?.phase === "uncertain";
@@ -28,7 +30,7 @@ export function useScheduleUpdate(scheduleId: string | undefined, serverId: stri
   }, []);
 
   async function save(original: Schedule, updates: Partial<Schedule>): Promise<boolean> {
-    if (!mounted.current || locked.current || confirmed.current || uncertain.current) return false;
+    if (!ownsScreen() || !mounted.current || locked.current || confirmed.current || uncertain.current) return false;
     if (scheduleDataModeStore.getState().mode !== "server" || !scheduleId || original.id !== scheduleId || !serverId || scheduleHttpClient.getServerId() !== serverId) {
       setError("수정 대상과 서버 설정을 다시 확인해 주세요."); return false;
     }
@@ -46,7 +48,7 @@ export function useScheduleUpdate(scheduleId: string | undefined, serverId: stri
     const lease = serverScheduleStore.beginMutation(serverId, scheduleId, "edit");
     if (!lease) { setError("같은 일정의 변경 결과를 먼저 확인해 주세요."); return false; }
     const generation = scheduleDataModeStore.getState().generation;
-    const currentScreen = () => mounted.current && generation === scheduleDataModeStore.getState().generation &&
+    const currentScreen = () => ownsScreen() && mounted.current && generation === scheduleDataModeStore.getState().generation &&
       scheduleHttpClient.getServerId() === serverId;
     locked.current = true; setBusy(true); setError(null);
     controller.current = lease.controller;
@@ -60,7 +62,7 @@ export function useScheduleUpdate(scheduleId: string | undefined, serverId: stri
           return false;
         }
         confirmed.current = true;
-        if (mounted.current) { setSaved(true); setNeedsCheck(true); }
+        if (ownsScreen() && mounted.current) { setSaved(true); setNeedsCheck(true); }
         if (!serverScheduleStore.applyScheduleResult(serverId, result.response.data)) return false;
         const refresh = await serverScheduleStore.refreshLists(serverId);
         failedQueries.current = refresh.failedQueries;
@@ -84,13 +86,13 @@ export function useScheduleUpdate(scheduleId: string | undefined, serverId: stri
         ? "일정은 수정되었지만 목록을 갱신하지 못했어요. GET 조회만 다시 시도해 주세요."
         : "수정 결과를 확인하지 못했어요. 서버 상태를 먼저 확인해 주세요."); }
       return false;
-    } finally { lease.finish(uncertain.current); locked.current = false; if (mounted.current) setBusy(false); }
+    } finally { lease.finish(uncertain.current); locked.current = false; if (ownsScreen() && mounted.current) setBusy(false); }
   }
 
   async function retryGet(): Promise<boolean> {
-    if (!mounted.current || locked.current || !scheduleId || !serverId || scheduleHttpClient.getServerId() !== serverId) return false;
+    if (!ownsScreen() || !mounted.current || locked.current || !scheduleId || !serverId || scheduleHttpClient.getServerId() !== serverId) return false;
     const generation = scheduleDataModeStore.getState().generation;
-    const currentScreen = () => mounted.current && generation === scheduleDataModeStore.getState().generation && scheduleHttpClient.getServerId() === serverId;
+    const currentScreen = () => ownsScreen() && mounted.current && generation === scheduleDataModeStore.getState().generation && scheduleHttpClient.getServerId() === serverId;
     locked.current = true; setBusy(true);
     try {
       if (confirmed.current) {
@@ -113,7 +115,7 @@ export function useScheduleUpdate(scheduleId: string | undefined, serverId: stri
     } catch {
       if (currentScreen()) setError("서버 상태를 조회하지 못했어요. GET 조회만 다시 시도해 주세요.");
       return false;
-    } finally { locked.current = false; if (mounted.current) setBusy(false); }
+    } finally { locked.current = false; if (ownsScreen() && mounted.current) setBusy(false); }
   }
   return { save, retryGet, busy, saved, needsCheck, blocked: saved || needsCheck || sharedBlocked, error };
 }
