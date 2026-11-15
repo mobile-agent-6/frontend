@@ -1,3 +1,4 @@
+import { useScheduleOwner } from "@/hooks/use-schedule-owner";
 import { useEffect, useRef } from "react";
 import { useStore } from "zustand";
 
@@ -7,6 +8,7 @@ import { serverScheduleStore } from "@/stores/serverScheduleStore";
 
 /** 삭제 결과·잠금은 공유 Store에 남기고 화면 수명은 취소와 navigation만 제어한다. */
 export function useScheduleDeletion(id: string | undefined, serverId: string | null) {
+  const ownsScreen = useScheduleOwner();
   const state = useStore(serverScheduleStore.store);
   const mutation = serverId && id ? state.servers[serverId]?.mutations[id] : undefined;
   const deletion = mutation?.kind === "delete" ? mutation : undefined;
@@ -17,7 +19,7 @@ export function useScheduleDeletion(id: string | undefined, serverId: string | n
     return () => { mounted.current = false; lifetime.abort(); };
   }, []);
   async function run(check: boolean) {
-    if (!mounted.current || !id || !serverId || scheduleDataModeStore.getState().mode !== "server" ||
+    if (!ownsScreen() || !mounted.current || !id || !serverId || scheduleDataModeStore.getState().mode !== "server" ||
       scheduleHttpClient.getServerId() !== serverId) return false;
     const request = controller.current;
     if (!request || request.signal.aborted) return false;

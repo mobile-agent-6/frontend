@@ -99,7 +99,7 @@ test("서버 변경 뒤 늦은 카드 단건 GET은 ready 데이터나 현재 �
   h.state.scheduleHandle = async url => new URL(url).pathname.endsWith(`/schedules/${id(200)}`)
     ? new Promise(resolve => { finish = resolve; }) : json({ items: [] });
   await h.sync.observe(ref(), success()); await tick(); h.server(otherOrigin); finish(json(dto())); await tick();
-  assert.equal(h.sync.getSnapshot()[0].detail.phase, "error");
+  assert.deepEqual(h.sync.getSnapshot(), []);
   assert.equal(h.cache.store.getState().serverId, `development:${otherOrigin}`);
 });
 

@@ -170,6 +170,7 @@ export function createScheduleService(
     let uncertain = false;
     let pending: Promise<ScheduleCreationResult> | null = null;
     let terminal: ScheduleCreationResult | null = null;
+    const scope = client.captureScope?.();
 
     async function send(signal?: AbortSignal): Promise<ScheduleCreationResult> {
       // 서버는 성공 기록을 24시간 보관한다. 정확한 성공 시각을 모르는 작업은
@@ -182,7 +183,7 @@ export function createScheduleService(
       if (firstAttemptAt === null && serverId !== null && !signal?.aborted) firstAttemptAt = now();
       const result = mapResponse(await client.request({
         method: "POST", path: "/schedules", headers: { "Idempotency-Key": key }, body: payload, signal,
-        expectedServerId: serverId ?? undefined,
+        expectedServerId: serverId ?? undefined, scope,
       }), readSchedule, 201);
       if (result.attempts > 0) sent = true;
       else if (!sent) { firstAttemptAt = null; serverId = null; }
@@ -214,6 +215,8 @@ export function createScheduleService(
     }
 
     function submit(signal?: AbortSignal): Promise<ScheduleCreationResult> {
+      if (scope && !client.isScopeCurrent(scope)) return Promise.resolve({ outcome: sent && !terminal ? "uncertain" : "not-sent", attempts: 0,
+        requiresReconciliation: sent, error: { kind: "aborted", requestState: "not-sent" } });
       if (terminal) return Promise.resolve(terminal);
       if (pending) return pending;
       pending = send(signal).finally(() => { pending = null; });
@@ -241,11 +244,13 @@ export function createScheduleService(
     let uncertain = false;
     let pending: Promise<ScheduleMutationResult<T, Outcome>> | null = null;
     let terminal: ScheduleMutationResult<T, Outcome> | null = null;
+    const scope = client.captureScope?.();
+    const lockKey = JSON.stringify([scope?.config.serverId ?? client.getServerId(), scope?.generation, scheduleId]);
 
     async function send(signal?: AbortSignal): Promise<ScheduleMutationResult<T, Outcome>> {
       if (serverId === null) serverId = client.getServerId();
       const result = mapResponse(await client.request({
-        method, path, body: payload, signal, expectedServerId: serverId ?? undefined,
+        method, path, body: payload, signal, expectedServerId: serverId ?? undefined, scope,
       }), decode, expectedStatus);
       if (result.attempts > 0) sent = true;
       else if (!sent) serverId = null;
@@ -268,14 +273,16 @@ export function createScheduleService(
     }
 
     function submit(signal?: AbortSignal): Promise<ScheduleMutationResult<T, Outcome>> {
+      if (scope && !client.isScopeCurrent(scope)) return Promise.resolve({ outcome: sent && !terminal ? "uncertain" : "not-sent", attempts: 0,
+        requiresReconciliation: sent, error: { kind: "aborted", requestState: "not-sent" } });
       if (terminal) return Promise.resolve(terminal);
       if (pending) return pending;
-      if (pendingScheduleIds.has(scheduleId)) return Promise.resolve({
+      if (pendingScheduleIds.has(lockKey)) return Promise.resolve({
         outcome: "not-sent", attempts: 0, requiresReconciliation: false,
         error: { kind: "operation", reason: "schedule-busy" },
       });
-      pendingScheduleIds.add(scheduleId);
-      pending = send(signal).finally(() => { pendingScheduleIds.delete(scheduleId); pending = null; });
+      pendingScheduleIds.add(lockKey);
+      pending = send(signal).finally(() => { pendingScheduleIds.delete(lockKey); pending = null; });
       return pending;
     }
     // 결과 불확실 시 다음 조작 허용 여부는 호출자가 GET 확인 후 판단한다. 별도 작업을 자동 시작하지 않는다.

@@ -45,7 +45,7 @@ type Lifecycle = { getState: () => string | null; subscribe: (listener: (state: 
 type Budget = { first: number; wall: number; monotonic: number; elapsed: number };
 const budgets = new Map<string, Budget>();
 const anchors = new Map<string, { wall: number; monotonic: number }>();
-const initializing = new Set<string>();
+const initializing = new Map<string, { generation: number; token: symbol }>();
 const keyOf = (ref: AssistantRecoveryReference) => JSON.stringify([ref.serverId, ref.requestId.toLowerCase()]);
 const validReference = (ref: AssistantRecoveryReference) => isAssistantRecoveryServerId(ref.serverId) && isAssistantUuidV4(ref.requestId);
 
@@ -100,14 +100,14 @@ export function createAssistantOrchestrator({
     initialAnchor?: { wall: number; monotonic: number }): AssistantRequestTask {
     const ref = freeze({ serverId: reference?.serverId, requestId: reference?.requestId });
     if (!validReference(ref)) return idleTask(stopped(ref, "invalid-request"));
-    if (action === "start" && initializing.has(ref.serverId)) return idleTask(stopped(ref, "initializing"));
+    if (action === "start" && initializing.get(ref.serverId)?.generation === mode.getState().generation) return idleTask(stopped(ref, "initializing"));
     const key = keyOf(ref);
     let anchor: { wall: number; monotonic: number };
     try {
       anchor = anchors.get(key) ?? initialAnchor ?? { wall: clock.now(), monotonic: clock.monotonicNow() };
       if (![anchor.wall, anchor.monotonic].every(Number.isFinite)) return idleTask(stopped(ref, "clock"));
     } catch { return idleTask(stopped(ref, "clock")); }
-    const lease = acquireAssistantRequestLease(ref);
+    const lease = acquireAssistantRequestLease(ref, mode.getState().generation);
     if (!lease) return idleTask(stopped(ref, "busy"));
     const token = lease.token;
     const { signal, onUpdate } = options;
@@ -177,12 +177,13 @@ export function createAssistantOrchestrator({
       return true;
     }
     function observe(result: AssistantRequestRecoveryResult) {
+      if (check()) return;
       lastRecovery = result;
       if (result.kind === "confirmed") {
         lastResponse = immutableResponse(result.response);
         // 결과 수신 경계를 공유해 화면 완료·복구·수동 GET에서 같은 성공을 한 번만 동기화한다.
         // 후속 Schedule GET의 실패는 이미 확인된 Assistant 결과를 바꾸지 않는다.
-        void scheduleSync.observe(ref, lastResponse.data);
+        void scheduleSync.observe(ref, lastResponse.data, { generation });
         emit({ phase: "status", reference: ref, response: lastResponse, via: result.via });
       }
     }
@@ -289,13 +290,13 @@ export function createAssistantOrchestrator({
     if (options.signal?.aborted) return { kind: "needs-attention", reason: "aborted" };
     const changed = context(ref, generation);
     if (changed) return { kind: "needs-attention", reason: changed };
-    if (initializing.has(serverId)) return { kind: "needs-attention", reason: "busy" };
+    if (initializing.get(serverId)?.generation === generation) return { kind: "needs-attention", reason: "busy" };
     let initialAnchor: { wall: number; monotonic: number };
     try {
       initialAnchor = { wall: clock.now(), monotonic: clock.monotonicNow() };
       if (![initialAnchor.wall, initialAnchor.monotonic].every(Number.isFinite)) return { kind: "needs-attention", reason: "clock" };
     } catch { return { kind: "needs-attention", reason: "clock" }; }
-    initializing.add(serverId);
+    const initializationToken = Symbol(); initializing.set(serverId, { generation, token: initializationToken });
     const started: AssistantRequestTask[] = [];
     let initialized = false;
     try {
@@ -322,7 +323,7 @@ export function createAssistantOrchestrator({
       return { kind: "needs-attention", reason: "storage", storageCode: error instanceof AssistantRecoveryStorageError ? error.code : "unknown" };
     } finally {
       if (!initialized) started.forEach(task => task.cancel());
-      initializing.delete(serverId);
+      if (initializing.get(serverId)?.token === initializationToken) initializing.delete(serverId);
     }
   }
   // 실제 UI가 결과 표시를 확인했을 때만 호출한다. 반환·callback만으로는 정리하지 않는다.

@@ -1,3 +1,4 @@
+import { useScheduleOwner } from "@/hooks/use-schedule-owner";
 import { useEffect, useRef, useState } from "react";
 
 import { scheduleHttpClient } from "@/services/api/http";
@@ -12,6 +13,7 @@ export const SCHEDULE_CREATION_READ_ONLY_MESSAGE = "현재 읽기 전용 모드�
 
 /** 폼 수명 동안 key·payload를 보존한다. 앱 종료 후 복구나 서버 결과 추정은 하지 않는다. */
 export function useScheduleCreation() {
+  const ownsScreen = useScheduleOwner();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [created, setCreated] = useState(false);
@@ -30,7 +32,7 @@ export function useScheduleCreation() {
   }, []);
 
   async function save(input: { title: string; date: string; time: string; category: ScheduleCategory }): Promise<boolean> {
-    if (locked.current || saved.current || !mounted.current) return false;
+    if (!ownsScreen() || locked.current || saved.current || !mounted.current) return false;
     if (!isScheduleRequestAllowed("POST", "/schedules")) { setError(SCHEDULE_CREATION_READ_ONLY_MESSAGE); return false; }
     let payload;
     try { payload = { title: input.title.trim(), scheduledAt: uiDateTimeToScheduledAt(input.date, input.time), category: toApiCategory(input.category) }; }
@@ -52,14 +54,15 @@ export function useScheduleCreation() {
     const generation = scheduleDataModeStore.getState().generation;
     locked.current = true; setBusy(true); setError(null);
     controller.current = new AbortController();
-    const currentScreen = () => mounted.current && generation === scheduleDataModeStore.getState().generation;
+    const currentScreen = () => ownsScreen() && mounted.current && generation === scheduleDataModeStore.getState().generation;
     try {
       serverScheduleStore.syncServer();
       serverScheduleStore.invalidate();
       const result = await currentOperation.submit(controller.current.signal);
       if ("response" in result) {
+        if (!currentScreen()) return false;
         saved.current = true;
-        if (mounted.current) { setCreated(true); setNeedsCheck(true); }
+        if (ownsScreen() && mounted.current) { setCreated(true); setNeedsCheck(true); }
         const refresh = await serverScheduleStore.refreshLists(result.response.serverId);
         failedQueries.current = refresh.failedQueries;
         if (!currentScreen()) return false;
@@ -91,26 +94,26 @@ export function useScheduleCreation() {
       return false;
     } finally {
       locked.current = false;
-      if (mounted.current) setBusy(false);
+      if (ownsScreen() && mounted.current) setBusy(false);
     }
   }
 
   async function retryGet(): Promise<boolean> {
-    if (locked.current || !operation.current?.serverId) return false;
+    if (!ownsScreen() || locked.current || !operation.current?.serverId) return false;
     locked.current = true; setBusy(true);
     const generation = scheduleDataModeStore.getState().generation;
     try {
       const refresh = await serverScheduleStore.refreshLists(operation.current.serverId, saved.current ? failedQueries.current : undefined);
       failedQueries.current = refresh.failedQueries;
-      if (!mounted.current || generation !== scheduleDataModeStore.getState().generation) return false;
+      if (!ownsScreen() || !mounted.current || generation !== scheduleDataModeStore.getState().generation) return false;
       setError(!refresh.ok ? "목록을 갱신하지 못했어요. GET 조회만 다시 시도해 주세요."
         : saved.current ? null : "목록을 갱신했어요. 등록 여부를 목록에서 확인해 주세요. 조회만으로 이전 요청의 결과를 확정하지는 않습니다.");
       if (refresh.ok && saved.current) setNeedsCheck(false);
       return refresh.ok && saved.current && scheduleHttpClient.getServerId() === operation.current.serverId;
     } catch {
-      if (mounted.current) setError("목록을 갱신하지 못했어요. GET 조회만 다시 시도해 주세요.");
+      if (ownsScreen() && mounted.current) setError("목록을 갱신하지 못했어요. GET 조회만 다시 시도해 주세요.");
       return false;
-    } finally { locked.current = false; if (mounted.current) setBusy(false); }
+    } finally { locked.current = false; if (ownsScreen() && mounted.current) setBusy(false); }
   }
   return { save, retryGet, busy, error, created, needsCheck };
 }

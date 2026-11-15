@@ -1,3 +1,4 @@
+import { captureScheduleOwner, createScheduleRoute, discardScheduleRoute } from "@/utils/schedule-ownership";
 import { SymbolView } from "expo-symbols";
 import { useRouter } from "expo-router";
 import { useMemo, useState } from "react";
@@ -27,6 +28,7 @@ export default function ScheduleListScreen() {
   const theme = useTheme();
   const colorScheme = useColorScheme();
   const router = useRouter();
+  const owner = captureScheduleOwner();
   const insets = useSafeAreaInsets();
   const openSchedule = useScheduleEditNavigation();
   const [selectedCategory, setSelectedCategory] =
@@ -139,7 +141,11 @@ export default function ScheduleListScreen() {
       <Pressable
         accessibilityLabel="새 일정 추가"
         accessibilityRole="button"
-        onPress={() => router.push("/schedule/create")}
+        onPress={() => {
+          const route = createScheduleRoute(null, owner);
+          try { if (route) router.push(route); }
+          catch (error) { discardScheduleRoute(route?.params.connectionKey); throw error; }
+        }}
         style={({ pressed }) => [
           styles.addButton,
           { backgroundColor: theme.primary },

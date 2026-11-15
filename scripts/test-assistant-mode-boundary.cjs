@@ -213,7 +213,7 @@ test("질문 대기 중 모드 변경은 과거 pending을 제거하고 복귀 �
   try {
     h.send("내일 팀 회의 추가해 줘"); h.fire(); h.switchMode("server"); h.switchMode("mock");
     h.send("오후 3시"); h.fire(); assert.equal(h.mock.getState().schedules.length, 10);
-    assert.ok(messages(h).some((m) => m.text === "몇 시로 할까요?"));
+    assert.equal(messages(h).some((m) => m.text === "몇 시로 할까요?"), false);
   } finally { h.close(); }
 });
 test("모드 변경 전 후보·확인 callback은 서버 및 Mock 복귀 후 실행 불가", () => {
@@ -224,7 +224,7 @@ test("모드 변경 전 후보·확인 callback은 서버 및 Mock 복귀 후 �
       h.switchMode("server");
       callbacks.onCandidateSelection(interaction.id, id(1)); callbacks.onDeleteConfirmation(interaction.id, true); h.render();
       assert.equal(messages(h).find((m) => m.id === interaction.id), undefined);
-      h.switchMode("mock"); assert.equal(messages(h).find((m) => m.id === interaction.id).interaction.resolved, true);
+      h.switchMode("mock"); assert.equal(messages(h).find((m) => m.id === interaction.id), undefined);
       callbacks.onDeleteConfirmation(interaction.id, true); h.render();
       assert.equal(h.mock.getState().schedules.length, 10); assert.equal(h.find("MessageInput").disabled, false);
     } finally { h.close(); }

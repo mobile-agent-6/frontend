@@ -29,8 +29,8 @@ type SessionRequest = {
 };
 
 // 같은 JS runtime의 factory·호출자가 같은 서버/논리 ID의 작업을 중복 실행하지 않게 공유한다.
-const inFlight = new Set<string>();
-const leases = new Map<string, symbol>();
+const inFlight = new Map<string, { generation: number; token: symbol }>();
+const leases = new Map<string, { generation: number; token: symbol }>();
 const sessions = new Map<string, SessionRequest>();
 const RETRANSMIT_WINDOW_MS = 120_000;
 const keyOf = (ref: AssistantRecoveryReference) => JSON.stringify([ref.serverId, ref.requestId.toLowerCase()]);
@@ -42,17 +42,17 @@ function validReference(ref: AssistantRecoveryReference) {
 }
 
 // polling 전체를 예약하되 내부의 단일 POST/GET 잠금은 그대로 사용한다.
-export function acquireAssistantRequestLease(ref: AssistantRecoveryReference) {
+export function acquireAssistantRequestLease(ref: AssistantRecoveryReference, generation = scheduleDataModeStore.getState().generation) {
   if (!validReference(ref)) return null;
   const key = keyOf(ref);
-  if (inFlight.has(key) || leases.has(key)) return null;
+  if (inFlight.get(key)?.generation === generation || leases.get(key)?.generation === generation) return null;
   const token = Symbol();
-  leases.set(key, token);
-  return { token, release: () => { if (leases.get(key) === token) leases.delete(key); } };
+  leases.set(key, { generation, token });
+  return { token, release: () => { if (leases.get(key)?.token === token) leases.delete(key); } };
 }
 
 type RecoveryOptions = { signal?: AbortSignal; lease?: symbol; allowResend?: boolean; canRetransmit?: () => boolean };
-const isBusy = (key: string, lease?: symbol) => inFlight.has(key) || (leases.has(key) && leases.get(key) !== lease);
+const isBusy = (key: string, generation: number, lease?: symbol) => inFlight.get(key)?.generation === generation || (leases.get(key)?.generation === generation && leases.get(key)?.token !== lease);
 
 export function createAssistantRequestRecovery({
   http = assistantHttpClient,
@@ -114,19 +114,21 @@ export function createAssistantRequestRecovery({
       snapshot = parsed;
     } catch { return unresolved(ref, "invalid-request"); }
     const key = keyOf(ref);
-    if (isBusy(key, options.lease)) return unresolved(ref, "busy");
+    if (isBusy(key, readMode().generation, options.lease)) return unresolved(ref, "busy");
     if (sessions.has(key)) return unresolved(ref, "existing-request");
     const generation = readMode().generation;
     const blocked = boundary(ref, generation, signal);
     if (blocked) return unresolved(ref, blocked);
-    inFlight.add(key);
+    const workToken = Symbol(); inFlight.set(key, { generation, token: workToken });
     try {
       if (await recovery.read(ref)) return unresolved(ref, "existing-request");
+      const changed = boundary(ref, generation, signal);
+      if (changed) return unresolved(ref, changed);
       const session: SessionRequest = { body, generation, confirmed: false, unconfirmed: false, retryUsed: false, aborted: false };
       sessions.set(key, session);
       const startedAt = now();
       let guardReason: AssistantRequestRecoveryReason | null = null;
-      const response = await http.postAssistantRequest(snapshot, { expectedServerId: ref.serverId, signal, beforeSend: saved => {
+      const response = await http.postAssistantRequest(snapshot, { expectedServerId: ref.serverId, signal, expectedGeneration: generation, beforeSend: saved => {
         guardReason = boundary(ref, generation, signal);
         if (!guardReason && (saved.acceptConfirmed || http.hasAcceptanceEvidence(ref))) guardReason = "accept-confirmed";
         if (!guardReason && (!matches(saved, ref) ||
@@ -143,7 +145,7 @@ export function createAssistantRequestRecovery({
       return unresolved(ref, guardReason ?? (signal?.aborted ? "aborted" : response.error.kind === "storage" ? "storage" : "post-unconfirmed"), { postResult: response });
     } catch (error) {
       return unresolved(ref, "storage", { storageCode: error instanceof AssistantRecoveryStorageError ? error.code : "unknown" });
-    } finally { inFlight.delete(key); }
+    } finally { if (inFlight.get(key)?.token === workToken) inFlight.delete(key); }
   }
 
   async function recoverAssistantRequest(reference: AssistantRecoveryReference,
@@ -152,7 +154,7 @@ export function createAssistantRequestRecovery({
     const signal = options.signal;
     if (!validReference(ref)) return unresolved(ref, "invalid-request");
     const key = keyOf(ref), session = sessions.get(key);
-    if (isBusy(key, options.lease)) return unresolved(ref, "busy");
+    if (isBusy(key, readMode().generation, options.lease)) return unresolved(ref, "busy");
     // GET-only 재개는 현재 모드 세대를 사용하되 원래 body 재전송의 세대 검사는 완화하지 않는다.
     const generation = options.allowResend === false ? readMode().generation : session?.generation ?? readMode().generation;
     const blocked = boundary(ref, generation, signal);
@@ -160,10 +162,10 @@ export function createAssistantRequestRecovery({
       if (blocked === "aborted" && session) { session.aborted = true; session.body = null; }
       return unresolved(ref, blocked);
     }
-    inFlight.add(key);
+    const workToken = Symbol(); inFlight.set(key, { generation, token: workToken });
     let getResult: HttpResult | undefined;
     try {
-      getResult = await http.getAssistantRequest(ref, { signal });
+      getResult = await http.getAssistantRequest(ref, { signal, expectedGeneration: generation });
       observe(session, getResult, signal);
       const changed = boundary(ref, generation, signal);
       if (changed) return unresolved(ref, changed, { getResult });
@@ -184,7 +186,7 @@ export function createAssistantRequestRecovery({
       if (metadata?.lastPostAttemptAt !== session.lastPostAttemptAt) return unresolved(ref, "metadata-mismatch", { getResult });
       let guardReason: AssistantRequestRecoveryReason | null = null;
       const postResult = await http.postAssistantRequest(JSON.parse(session.body), {
-        expectedServerId: ref.serverId, signal, beforeSend: saved => {
+        expectedServerId: ref.serverId, signal, expectedGeneration: generation, beforeSend: saved => {
           guardReason = boundary(ref, generation, signal) ?? eligible(session, saved, ref) ??
             (options.canRetransmit?.() === false ? "deadline" : null);
           if (guardReason === "aborted") { session.aborted = true; session.body = null; }
@@ -202,7 +204,7 @@ export function createAssistantRequestRecovery({
         { getResult, postResult, retransmitted: session.retryUsed });
     } catch (error) {
       return unresolved(ref, "storage", { getResult, storageCode: error instanceof AssistantRecoveryStorageError ? error.code : "unknown" });
-    } finally { inFlight.delete(key); }
+    } finally { if (inFlight.get(key)?.token === workToken) inFlight.delete(key); }
   }
   const queryAssistantRequest = (ref: AssistantRecoveryReference, options: Omit<RecoveryOptions, "allowResend" | "canRetransmit"> = {}) =>
     recoverAssistantRequest(ref, { ...options, allowResend: false });

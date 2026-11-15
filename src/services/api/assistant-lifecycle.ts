@@ -17,6 +17,7 @@ export type AssistantLifecycleEntry = Readonly<{
   latestResult?: AssistantExecutionResult;
 }>;
 export type AssistantLifecycleSnapshot = Readonly<{
+  generation?: number;
   // 로컬 복구 실행 상태이며 일정 변경 성공이나 uncertain 해소를 뜻하지 않는다.
   phase: "idle" | "recovering" | "observing" | "settled" | "paused" | "unavailable" | "needs-attention" | "stopped";
   serverId: string | null;
@@ -60,9 +61,10 @@ export function createAssistantLifecycle({
   let controller: AbortController | null = null;
   let unsubscribeApp: (() => void) | undefined, unsubscribeMode: (() => void) | undefined;
   let tail: Promise<void> = Promise.resolve();
+  let tailGeneration: number | undefined;
 
   function publish(update: Omit<AssistantLifecycleSnapshot, "results" | "initialCheck">) {
-    snapshot = freeze({ ...update, initialCheck, results: [...entries.values()] });
+    snapshot = freeze({ ...update, generation: mode.getState().generation, initialCheck, results: [...entries.values()] });
     for (const subscriber of [...subscribers]) {
       // 화면 구독자 예외로 앱 초기화·다른 구독자·요청 제어를 중단하지 않는다.
       try { subscriber(); } catch {}
@@ -100,7 +102,8 @@ export function createAssistantLifecycle({
       entries.set(key, copy({ ...previous, reference: result.reference, latestResult: result,
         lastResponse: result.kind === "needs-attention" ? result.lastResponse ?? previous?.lastResponse : result.response }));
     }
-    const previous = tail;
+    const previous = tailGeneration === scope.generation ? tail : Promise.resolve();
+    tailGeneration = scope.generation;
     tail = (async () => {
       await previous;
       if (!valid()) return;

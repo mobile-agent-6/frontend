@@ -225,6 +225,79 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
   };
 }
 
+for (const kind of ["need_more_info", "candidate_selection", "confirmation"]) test(`2-C A→B→A: ${kind} 과거 callback·채팅·초안 격리`, async () => {
+  const h = harness(); try {
+    h.state.handle = async (url, init) => init.method === "POST" ? json(status(JSON.parse(init.body).requestId), 202) : json(done(url.split("/").pop(), kind));
+    h.send("A의 비공개 요청"); await h.settle();
+    h.edit("A 초안"); const input = h.find("MessageInput"), conversation = h.find("ConversationList");
+    const previous = h.messages().at(-1), count = h.state.calls.length;
+    for (const target of ["https://b.example.invalid", origin]) {
+      h.state.config = h.source("src/services/api/config.ts").parseDevelopmentServerConfig(target);
+      h.mode.scheduleDataModeStore.getState().resetConnectionAuthority(); h.render();
+      h.publishSnapshot({ phase: "settled", initialCheck: "checked", serverId: h.state.config.config.serverId, results: [] });
+      assert.equal(h.messages().some(message => message.text === "A의 비공개 요청"), false);
+      assert.equal(h.find("MessageInput").value, "");
+      input.onChangeText("오래된 초안"); input.onSend();
+      conversation.onApiCandidateSelection(previous.id, "opaque/1"); conversation.onApiConfirmation(previous.id, true);
+      conversation.onApiConfirmation(previous.id, false); await h.settle();
+      assert.equal(h.state.calls.length, count); assert.equal(h.find("MessageInput").value, "");
+    }
+  } finally { h.close(); }
+});
+
+test("2-C 단순 탭 이탈은 같은 서버의 채팅·초안 소유권 유지", async () => {
+  const h = harness(); try {
+    h.send("일정 조회"); await h.settle(); h.edit("탭 이동 초안");
+    const before = h.messages(); h.blurResults(); h.render();
+    assert.deepEqual(h.messages(), before); assert.equal(h.find("MessageInput").value, "탭 이동 초안");
+  } finally { h.close(); }
+});
+
+for (const phase of ["permission", "prepare", "recording", "inspection"]) test(`2-D 실제 음성 Hook: ${phase} 중 A→B→A 권한 재설정·자원 정리`, async () => {
+  const h = harness({ initialMode: "mock" }), gate = deferred();
+  try {
+    const voice = h.state.voice;
+    if (phase === "permission") voice.deps.permission = () => gate.promise;
+    if (phase === "prepare") {
+      const create = voice.deps.create;
+      voice.deps.create = (...args) => { const recorder = create(...args), prepare = recorder.prepare;
+        recorder.prepare = async () => { await gate.promise; await prepare(); }; return recorder; };
+    }
+    if (phase === "inspection") { const inspect = voice.deps.files.inspect;
+      voice.deps.files.inspect = async (...args) => { await gate.promise; return inspect(...args); }; }
+    h.find("MessageInput").onStartVoice(); await h.settle();
+    if (phase === "inspection") { h.find("MessageInput").onStopVoice(); await h.settle(); }
+    h.state.config = h.source("src/services/api/config.ts").parseDevelopmentServerConfig("https://b.example.invalid");
+    h.mode.scheduleDataModeStore.getState().resetConnectionAuthority(); h.render();
+    h.state.config = h.source("src/services/api/config.ts").parseDevelopmentServerConfig(origin);
+    h.mode.scheduleDataModeStore.getState().resetConnectionAuthority(); h.render();
+    gate.resolve({ granted: true, canAskAgain: true }); await h.settle();
+    assert.equal(h.find("VoiceInputStatus").input.source, "text");
+    const starts = voice.state.starts; h.app("active"); await h.settle(); assert.equal(voice.state.starts, starts);
+    if (["permission", "prepare"].includes(phase)) assert.equal(starts, 0);
+    assert.equal(voice.state.files.size, 0); assert.equal(h.state.calls.length, 0);
+    // Existing text and manual schedule paths remain usable after cleanup.
+    h.send("일정 보여줘"); await h.advance(700); assert.equal(h.state.mockRuns, 1);
+  } finally { gate.resolve({ granted: true }); h.close(); await h.settle(); }
+});
+
+for (const preparing of [false, true]) test(`2-D 실제 재생 Hook: 연결 세대 왕복·지연 준비=${preparing}`, async () => {
+  const h = harness({ initialMode: "mock" }), gate = deferred();
+  try {
+    if (preparing) h.state.playback.deps.configure = () => gate.promise;
+    const pending = h.state.playbackHook.play({ kind: "asset", asset: 42 }); await h.settle();
+    h.state.config = h.source("src/services/api/config.ts").parseDevelopmentServerConfig("https://b.example.invalid");
+    h.mode.scheduleDataModeStore.getState().resetConnectionAuthority(); h.render();
+    h.state.config = h.source("src/services/api/config.ts").parseDevelopmentServerConfig(origin);
+    h.mode.scheduleDataModeStore.getState().resetConnectionAuthority(); h.render();
+    gate.resolve(); await pending; await h.settle();
+    assert.equal(h.state.playback.state.creates, preparing ? 0 : 1);
+    if (!preparing) assert.equal(h.state.playback.state.releases, 1);
+    const starts = h.state.playback.state.starts; h.app("active"); await h.settle();
+    assert.equal(h.state.playback.state.starts, starts); assert.equal(h.state.calls.length, 0);
+  } finally { gate.resolve(); h.close(); await h.settle(); }
+});
+
 test("첫 서버 text: UUID v4·conversationId 생략·원문·UserMessage·기존 bubble", async () => {
   const h = harness(); try {
     h.send("  일정 조회해 줘  "); assert.equal(h.find("ConversationList").isProcessing, true); await h.settle();
@@ -638,7 +711,7 @@ test("Mock에서 복구 결과 숨김·서버 복귀 구독 표시·Mock 후보 
     assert.deepEqual(h.messages(), []); h.send("재고 일정 삭제해 줘"); await h.advance(700); const mockId = h.messages().at(-1).id;
     h.publishSnapshot(snapshotOf([recovered("confirmation")])); assert.equal(h.messages().some(m => m.apiExecution), false);
     h.switchMode("server"); h.publishSnapshot(snapshotOf([recovered("confirmation")])); assert.equal(h.messages().some(m => m.id === mockId), false); assert.equal(h.messages().filter(m => m.apiExecution).length, 1);
-    h.switchMode("mock"); assert.equal(h.messages().some(m => m.apiExecution), false); assert.ok(h.messages().some(m => m.id === mockId)); assert.equal(h.state.calls.length, 0);
+    h.switchMode("mock"); assert.equal(h.messages().some(m => m.apiExecution), false); assert.equal(h.messages().some(m => m.id === mockId), false); assert.equal(h.state.calls.length, 0);
   } finally { h.close(); }
 });
 
@@ -2312,7 +2385,8 @@ test("7-C 삭제 대기 중 서버 왕복 뒤 이전 working UI를 남기지 않
     h.state.beforeRead = () => gate.promise; clickCleanup(h, ref.requestId, "result"); await h.settle();
     const config = h.source("src/services/api/config.ts"); h.state.config = config.parseDevelopmentServerConfig("https://other.example.invalid"); h.render();
     h.state.beforeRead = null; gate.resolve(); await readyCleanup(h);
-    h.state.config = config.parseDevelopmentServerConfig(origin); h.render(); await readyCleanup(h);
+    h.state.config = config.parseDevelopmentServerConfig(origin); h.render();
+    h.publishSnapshot(snapshotOf([recovered("failure", ref.requestId)])); await readyCleanup(h);
     assert.ok(await h.storage.read(ref)); assert.equal(cleanupButton(h, ref.requestId, "result").props.disabled, false);
     clickCleanup(h, ref.requestId, "result"); await readyCleanup(h); assert.equal(await h.storage.read(ref), null);
   } finally { gate.resolve(); h.state.beforeRead = null; h.close(); }
@@ -2838,7 +2912,7 @@ for (const change of ["server", "mock"]) test(`8-B 실제 GET retry 도중 ${cha
     else h.switchMode("mock");
     gate.resolve(json({ items: [scheduleDto8b()] })); await h.settle();
     assert.equal(nodes(h.renderConversation().rows, "View").some(node => node.props.testID === "assistant-schedule-sync-status"), false);
-    assert.equal(h.state.calls.length, calls); assert.equal(h.state.lateUpdates, 0); assert.equal(h.sync.getSnapshot()[0].phase, "interrupted");
+    assert.equal(h.state.calls.length, calls); assert.equal(h.state.lateUpdates, 0); assert.deepEqual(h.sync.getSnapshot(), []);
     assert.equal(h.state.mockRuns, 0); assert.equal(postedBodies(h).length, 1);
   } finally { gate.resolve(json({ items: [] })); h.close(); }
 });

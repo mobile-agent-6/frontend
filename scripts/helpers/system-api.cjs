@@ -35,6 +35,8 @@ function harness(initialEnv = {}) {
       module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022,
     }, fileName: relative }).outputText;
     const resolve = name => {
+      if (name === "react-native") return { AppState: { currentState: "active", addEventListener: () => ({ remove() {} }) } };
+      if (name === "expo-crypto") return { randomUUID: require("node:crypto").randomUUID };
       if (name === "expo/fetch") return { fetch: denied };
       if (name === "zustand/vanilla") return require(name);
       if (name === "@react-native-async-storage/async-storage") return storage;

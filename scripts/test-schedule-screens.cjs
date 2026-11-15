@@ -103,7 +103,7 @@ function harness(initialMode, { readOnly = false, assistantSyncUi = false, assis
             return () => { subscription.cleanup?.(); owner.focusEffects.delete(subscription); };
           }, [effect]);
         },
-        useLocalSearchParams: () => ({ id: (current.root ?? current).routeId }),
+        useLocalSearchParams: () => ({ id: (current.root ?? current).routeId, connectionKey: (current.root ?? current).connectionKey }),
         useRouter: () => router };
       if (name === "expo-symbols") return { SymbolView: "SymbolView" };
       if (name === "expo-crypto") return { randomUUID: require("node:crypto").randomUUID };
@@ -185,8 +185,9 @@ function harness(initialMode, { readOnly = false, assistantSyncUi = false, assis
     return [...(tree.type === type ? [tree.props] : []), ...nodes(tree.props?.children, type),
       ...nodes(tree.props?.ListEmptyComponent, type), ...nodes(tree.props?.ListHeaderComponent, type)];
   }
-  function mount(kind, routeId) {
-    const s = { slots: [], effects: [], children: new Map(), dirty: true, routeId, focused: true, focusEffects: new Set(),
+  function mount(kind, routeId, routeKey) {
+    const connectionKey = routeKey === undefined && ["detail", "create"].includes(kind) ? source("src/utils/schedule-ownership.ts").createScheduleRoute(kind === "detail" ? routeId : null)?.params.connectionKey : routeKey;
+    const s = { connectionKey, slots: [], effects: [], children: new Map(), dirty: true, routeId, focused: true, focusEffects: new Set(),
       Screen: kind === "notice" ? () => ({ type: source("src/components/schedule-list/schedule-error-notice.tsx").ScheduleErrorNotice, props: routeId })
         : source(kind === "detail" ? "src/app/schedule/[id].tsx" : kind === "create" ? "src/app/schedule/create.tsx" : kind === "layout" ? "src/app/_layout.tsx" : `src/app/(tabs)/${kind}.tsx`).default };
     screens.push(s); flush();
@@ -201,7 +202,8 @@ function harness(initialMode, { readOnly = false, assistantSyncUi = false, assis
         }
         flush();
       },
-      route(id) { s.routeId = id; s.dirty = true; flush(); },
+      route(id) { s.routeId = id; s.connectionKey = source("src/utils/schedule-ownership.ts").createScheduleRoute(id)?.params.connectionKey; s.dirty = true; flush(); },
+      routeKey: () => s.connectionKey,
       close() { s.closed = true; s.slots.forEach((slot) => slot?.cleanup?.());
         s.children.forEach((child) => child.slots.forEach((slot) => slot?.cleanup?.())); } };
   }
@@ -223,6 +225,78 @@ function harness(initialMode, { readOnly = false, assistantSyncUi = false, assis
 }
 const dto = (id, category = "INVENTORY", completed = false) => ({ id, title: id, category, completed,
   scheduledAt: "2026-11-07T03:00:00Z", createdAt: "2026-11-01T00:00:00Z", updatedAt: "2026-11-01T00:00:00Z" });
+
+function resetAuthority(h) {
+  h.source("src/stores/scheduleDataModeStore.ts").scheduleDataModeStore.getState().resetConnectionAuthority(); h.flush();
+}
+for (const kind of ["index", "calendar"]) test(`2-B ${kind} 상세 진입 키 발급·오래된 진입 및 완료 callback 차단`, async () => {
+  const h = harness("mock"); try {
+    const screen = h.mount(kind);
+    if (kind === "calendar") {
+      screen.one("MonthCalendar").onSelectDate({ dateString: h.mock.getState().schedules[0].date }); h.flush();
+    }
+    const card = kind === "index" ? listCard(screen) : screen.one("ScheduleCard");
+    const before = h.mock.getState().schedules;
+    card.onPress();
+    const route = h.navigations[0];
+    assert.equal(route.pathname, "/schedule/[id]"); assert.equal(route.params.id, card.schedule.id);
+    const detail = h.mount("detail", route.params.id, route.params.connectionKey);
+    assert.ok(detail.one("TextInput"));
+    resetAuthority(h); screen.focus(false); screen.focus(true);
+    card.onPress(); card.onToggleCompleted(); await h.settle();
+    assert.equal(h.navigations.length, 1); assert.equal(h.calls.length, 0);
+    assert.strictEqual(h.mock.getState().schedules, before);
+  } finally { h.close(); }
+});
+for (const mode of ["mock", "server"]) for (const back of [false, true]) test(`2-B 추가 form 이전 callback 차단: ${mode}, 복귀=${back}`, async () => {
+  const h = harness(mode); try {
+    const screen = h.mount("create"); fillCreation(h, screen);
+    const save = createButton(screen).onPress, key = screen.routeKey(), before = h.mock.getState().schedules;
+    resetAuthority(h); if (back) resetAuthority(h);
+    await save(); await h.settle();
+    const reopened = h.mount("create", undefined, key); await h.settle();
+    assert.equal(reopened.one("TextInput"), undefined);
+    assert.equal(h.calls.length, 0); assert.deepEqual(h.navigations, []);
+    assert.strictEqual(h.mock.getState().schedules, before);
+  } finally { h.close(); }
+});
+
+for (const back of [false, true]) test(`2-B 실제 상세·수정·삭제 모달 callback, 동일 ID A/B 및 remount, 복귀=${back}`, async () => {
+  const h = harness("server"); try {
+    const screen = await editableDetail(h); editTitle(h, screen);
+    const save = saveButton(screen).onPress;
+    deleteButton(screen).onPress(); h.flush();
+    const confirm = screen.one("ConfirmationModal").onConfirm, key = screen.routeKey();
+    const count = h.calls.length;
+    h.config("https://b.example.invalid"); resetAuthority(h);
+    if (back) { h.config("https://example.invalid"); resetAuthority(h); }
+    await save(); await confirm(); await h.settle();
+    screen.focus(false); screen.focus(true);
+    const reopened = h.mount("detail", "target", key); await h.settle();
+    assert.equal(screen.one("TextInput"), undefined); assert.equal(reopened.one("TextInput"), undefined);
+    assert.equal(h.calls.length, count); assert.deepEqual(h.navigations, []);
+  } finally { h.close(); }
+});
+
+for (const key of [null, "unissued-key"]) for (const kind of ["detail", "create"]) test(`2-B 소유권 없는 route 차단: ${kind}, ${key}`, async () => {
+  const h = harness("server"); try {
+    const screen = h.mount(kind, "target", key); await h.settle();
+    assert.equal(h.calls.length, 0); assert.equal(screen.one("TextInput"), undefined);
+    assert.ok(states(screen).includes("error")); assert.deepEqual(h.navigations, []);
+  } finally { h.close(); }
+});
+
+test("2-B 추가 POST 지연 완료 후 세대 변경: navigation·새 form 상태 변경 없음", async () => {
+  const h = harness("server"); try {
+    const first = h.mount("create"); fillCreation(h, first); createButton(first).onPress(); await h.settle();
+    assert.equal(h.calls[0].method, "POST"); resetAuthority(h);
+    const next = h.mount("create"); fillCreation(h, next, "새 세대 입력");
+    h.detail(0, dto("old-created"), 201); await h.settle();
+    assert.equal(next.one("TextInput").value, "새 세대 입력");
+    assert.equal(h.calls.length, 1); assert.deepEqual(h.navigations, []);
+    assert.equal(first.one("TextInput"), undefined);
+  } finally { h.close(); }
+});
 const states = (screen) => screen.all("ScheduleListState").map((s) => s.state);
 
 const noticeCards = (screen) => screen.all("View").filter((p) => p.accessibilityLiveRegion === "polite" && flatStyle(p.style).width === "100%");
@@ -379,7 +453,7 @@ test("목록 부분 오류는 단일 스크롤 헤더·안전 하단 여백을 �
       list.one("ScheduleListState").onRetry(); await h.settle(); assert.equal(h.calls[2].method, "GET");
       h.respond(2, [dto("target")]); await h.settle();
       assert.equal(listFeedback(list), undefined); assert.equal(flatStyle(list.one("FlatList").contentContainerStyle).paddingBottom, 96);
-      fab().onPress(); h.flush(); assert.deepEqual(h.navigations, ["/schedule/create"]);
+      fab().onPress(); h.flush(); assert.equal(h.navigations[0].pathname, "/schedule/create"); assert.ok(h.navigations[0].params.connectionKey);
       assert.ok(h.calls.every((call) => call.method === "GET"));
     } finally { h.close(); }
   }
@@ -854,8 +928,8 @@ test("상세 서버 변경·Mock 복귀 시 이전 응답·입력 차단", async
     h.mode("server"); const screen = h.mount("detail", mockId); await h.settle(); h.detail(0, dto(mockId)); await h.settle();
     screen.one("TextInput").onChangeText("다른 서버 입력"); h.flush();
     h.config("https://other.example.invalid"); await h.settle(); assert.equal(screen.one("TextInput"), undefined);
-    h.mode("mock"); await h.settle(); assert.equal(h.calls[1].signal.aborted, true);
-    h.detail(1, dto(mockId)); await h.settle(); assert.equal(screen.one("TextInput").value, "A구역 재고 실사");
+    h.mode("mock"); await h.settle(); assert.equal(h.calls.length, 1);
+    assert.equal(screen.one("TextInput"), undefined); assert.ok(states(screen).includes("error"));
   } finally { h.close(); }
 });
 test("서버 상세의 Mock 저장·삭제·가짜 성공/navigation은 UI와 handler 양쪽에서 차단", async () => {
@@ -889,7 +963,7 @@ test("상세 설정 오류·잘못된 route와 응답 ID 불일치를 성공으�
   const h = harness("mock"); try {
     h.config(undefined); h.mode("server"); const screen = h.mount("detail", "target"); await h.settle();
     assert.ok(states(screen).includes("error")); assert.equal(h.calls.length, 0);
-    h.config("https://example.invalid"); await h.settle(); h.detail(0, dto("wrong")); await h.settle();
+    h.config("https://example.invalid"); await h.settle(); assert.equal(h.calls.length, 0); screen.route("target"); await h.settle(); h.detail(0, dto("wrong")); await h.settle();
     assert.equal(screen.one("TextInput"), undefined); assert.ok(states(screen).includes("error"));
     screen.route(["target", "other"]); await h.settle(); assert.equal(h.calls.length, 1); assert.ok(states(screen).includes("error"));
   } finally { h.close(); }
@@ -1374,7 +1448,8 @@ test("PATCH 중 route ID·모드·서버 변경·unmount는 이전 응답과 nav
       if (change === "unmount") screen.close();
       await h.settle(); assert.equal(h.calls[1].signal.aborted, true);
       h.detail(1, { ...dto("target"), title: "늦은 수정" }); await h.settle(); assert.deepEqual(h.navigations, []);
-      if (change === "route" || change === "server") { h.detail(2, dto(change === "route" ? "other" : "target")); await h.settle(); }
+      if (change === "route") { h.detail(2, dto("other")); await h.settle(); }
+      if (change === "server") assert.equal(h.calls.length, 2);
     } finally { h.close(); }
   }
 });
@@ -1880,7 +1955,8 @@ test("I DELETE 중 route·모드·서버·unmount 변경은 이전 응답과 nav
       await h.settle(); assert.equal(h.calls[1].signal.aborted, true); noContent(h, 1); await h.settle();
       assert.deepEqual(h.navigations, []);
       assert.ok(Object.values(h.server.store.getState().servers).every((c) => !c.deletedIds.target));
-      if (change === "route" || change === "server") { h.detail(2, dto(change === "route" ? "other" : "target")); await h.settle(); }
+      if (change === "route") { h.detail(2, dto("other")); await h.settle(); }
+      if (change === "server") assert.equal(h.calls.length, 2);
     } finally { h.close(); }
   }
 });
@@ -1953,7 +2029,8 @@ test("I 삭제 복구 GET 도중 route·모드·서버 변경은 이전 404와 n
       if (change === "server") h.config("https://other.example.invalid");
       await h.settle(); h.detail(2, notFoundProblem(), 404, "application/problem+json"); await h.settle();
       assert.deepEqual(h.navigations, []); assert.ok(Object.values(h.server.store.getState().servers).every((c) => !c.deletedIds.target));
-      if (change === "route" || change === "server") { h.detail(3, dto(change === "route" ? "other" : "target")); await h.settle(); }
+      if (change === "route") { h.detail(3, dto("other")); await h.settle(); }
+      if (change === "server") assert.equal(h.calls.length, 3);
       assert.equal(deleteCalls(h).length, 1);
     } finally { h.close(); }
   }
@@ -2554,7 +2631,8 @@ test("UI route·서버·모드 변경 시 이전 폼 노출 없이 native Header
       else h.respond(index, []);
     }
     await h.settle();
-    assert.ok(editHeader(screen)); assert.equal(screen.one("TextInput").value, "현재 서버 데이터");
+    assert.ok(editHeader(screen)); assert.equal(screen.one("TextInput"), undefined);
+    assert.ok(states(screen).includes("error"));
     h.mode("mock"); screen.route(mockId); await h.settle();
     assert.ok(editHeader(screen)); assert.equal(screen.one("ActivityIndicator"), undefined);
     assert.equal(screen.one("TextInput").value, h.mock.getState().schedules.find((schedule) => schedule.id === mockId).title);

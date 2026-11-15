@@ -1,3 +1,4 @@
+import { useScheduleOwner } from "@/hooks/use-schedule-owner";
 import { DateTimePicker } from "@expo/ui/community/datetime-picker";
 import * as Crypto from "expo-crypto";
 import { useRouter } from "expo-router";
@@ -36,6 +37,7 @@ import {
 } from "@/utils/schedule-date-time";
 
 export function ScheduleCreateForm() {
+  const ownsScreen = useScheduleOwner();
   const theme = useTheme();
   const colorScheme = useColorScheme();
   const router = useRouter();
@@ -96,13 +98,14 @@ export function ScheduleCreateForm() {
   };
 
   const handleSave = async () => {
+    if (!ownsScreen()) return;
     if (!isMockScheduleMode()) {
       if (readOnly) { setFormError(SCHEDULE_CREATION_READ_ONLY_MESSAGE); return; }
       if (date === null || time === null || category === null) { setFormError("필수 항목을 모두 입력해 주세요."); return; }
       const generation = scheduleDataModeStore.getState().generation;
       setFormError(null);
       if (await creation.save({ title, date, time, category }) &&
-        generation === scheduleDataModeStore.getState().generation && !isMockScheduleMode()) {
+        ownsScreen() && generation === scheduleDataModeStore.getState().generation && !isMockScheduleMode()) {
         try { router.back(); } catch { setFormError("일정은 저장되었습니다. 뒤로가기로 이전 화면으로 돌아가 주세요."); }
       }
       return;
@@ -145,15 +148,16 @@ export function ScheduleCreateForm() {
     // 화면 이동에 오류가 나더라도 이 화면을 벗어날 때까지 저장 잠금을 유지한다.
     // 이미 저장한 일정을 저장 실패로 간주해 다시 등록하지 않도록 한다.
     try {
-      if (isMockScheduleMode(generation)) router.back();
+      if (ownsScreen() && isMockScheduleMode(generation)) router.back();
     } catch {
       setFormError("일정은 저장되었습니다. 뒤로가기로 이전 화면으로 돌아가 주세요.");
     }
   };
 
   const handleGetRetry = async () => {
+    if (!ownsScreen()) return;
     const generation = scheduleDataModeStore.getState().generation;
-    if (await creation.retryGet() && generation === scheduleDataModeStore.getState().generation && !isMockScheduleMode()) {
+    if (await creation.retryGet() && ownsScreen() && generation === scheduleDataModeStore.getState().generation && !isMockScheduleMode()) {
       try { router.back(); } catch { setFormError("일정은 저장되었습니다. 뒤로가기로 이전 화면으로 돌아가 주세요."); }
     }
   };
