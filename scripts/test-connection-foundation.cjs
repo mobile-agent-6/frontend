@@ -1,6 +1,6 @@
 const assert = require("node:assert/strict");
 const { test } = require("node:test");
-const { harness, jsonStep, trace } = require("./helpers/system-api.cjs");
+const { harness, jsonStep, problemStep, trace } = require("./helpers/system-api.cjs");
 
 function assistantIntegration(routes, withSchedule = false) {
   const h = harness({ EXPO_PUBLIC_SCHEDULE_DATA_MODE: "server" });
@@ -258,6 +258,41 @@ test("통합: 이전 PATCH rollback/finally는 복귀 세대의 새 mutation 잠
   assert.equal(h.cache.store.getState().servers[id].entities[scheduleId].title, "A fresh");
   assert.equal(h.cache.store.getState().servers[id].mutations[scheduleId].phase, "uncertain");
   assert.equal(h.transport.getRequests().filter(r => r.method === "PATCH").length, 1);
+  h.assertNoNetwork();
+});
+
+test("통합: 확정 거절 수신 후 지연된 이전 PATCH rollback은 A 복귀 GET 결과를 변경하지 않는다", async () => {
+  const a = "https://a.example.invalid", b = "https://b.example.invalid";
+  const h = scheduleIntegration([
+    { method: "GET", url: detailUrl(a), steps: [jsonStep(scheduleFixture("A")), jsonStep(scheduleFixture("A fresh", true))] },
+    { method: "PATCH", url: detailUrl(a), steps: [problemStep(400, "INVALID_REQUEST")] },
+  ]);
+  let release, received;
+  const gate = new Promise(resolve => { release = resolve; });
+  const responseReceived = new Promise(resolve => { received = resolve; });
+  const cache = h.load("src/stores/serverScheduleStore.ts").createServerScheduleStore({
+    readServerId: h.client.getServerId, list: h.service.listSchedules, get: h.service.getSchedule,
+    prepareUpdate(id, payload) {
+      const prepared = h.service.prepareScheduleUpdate(id, payload);
+      assert.equal(prepared.ok, true);
+      return { ...prepared, operation: { ...prepared.operation, async submit(signal) {
+        const result = await prepared.operation.submit(signal);
+        assert.equal(result.outcome, "rejected");
+        assert.equal(result.requiresReconciliation, false);
+        received(); await gate; return result;
+      } } };
+    },
+  });
+  await cache.acquireDetail(scheduleId).promise;
+  const id = h.client.getServerId(), old = cache.toggleCompleted(id, scheduleId);
+  await responseReceived;
+  h.change(b); cache.syncServer(); h.change(a); cache.syncServer();
+  await cache.acquireDetail(scheduleId).promise;
+  assert.equal(cache.store.getState().servers[id].entities[scheduleId].completed, true);
+  release(); await old;
+  assert.equal(cache.store.getState().servers[id].entities[scheduleId].completed, true);
+  assert.equal(cache.store.getState().servers[id].mutations[scheduleId].phase, "uncertain");
+  assert.equal(h.transport.getRequests().filter(request => request.method === "PATCH").length, 1);
   h.assertNoNetwork();
 });
 

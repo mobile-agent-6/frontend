@@ -429,7 +429,7 @@ export default function AssistantScreen() {
       pendingMockRef.current = null;
       invalidateActiveInteraction();
       finishOperation();
-      if (notify) reportError("데이터 모드가 변경되어 이전 요청을 중단했어요.");
+      if (notify) reportError("서버 연결이 변경되어 이전 대화가 초기화되었어요.");
     },
     [finishOperation, invalidateActiveInteraction, reportError],
   );

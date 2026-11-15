@@ -1,3 +1,4 @@
+/* global __dirname: readonly */
 const assert = require("node:assert/strict");
 const { test } = require("node:test");
 const { harness, settle, jsonStep, problemStep, sync } = require("./helpers/system-api.cjs");
@@ -199,6 +200,50 @@ test("production profile cannot initialize fixture or authorize business request
   c.input(A); const request = c.check(); await h.advance(1000); await request;
   assert.equal(c.store.getState().phase, "error");
   assert.equal(h.config.getDevelopmentServerConfig().status, "missing"); assert.equal(h.liveCalls, 0);
+});
+
+test("production Pi without saved settings keeps business blocked and performs no automatic HTTP", async () => {
+  const h = harness({ NODE_ENV: "production", EXPO_PUBLIC_SERVER_TARGET: "pi", EXPO_PUBLIC_SCHEDULE_DATA_MODE: "server" });
+  await h.load("src/services/connection-initialization.ts").initializeSavedConnection();
+  const state = h.load("src/stores/scheduleDataModeStore.ts").getConnectionSnapshot();
+  assert.equal(state.active, false);
+  assert.equal(state.businessAccess, "blocked");
+  assert.equal(state.target, null);
+  assert.equal(h.config.getDevelopmentServerConfig().status, "missing");
+  assert.equal(h.load("src/services/settings-runtime.ts").settingsConnection.store.getState().phase, "idle");
+  assert.equal(h.storageCalls.some(([method]) => method === "set"), false);
+  assert.equal(h.liveCalls, 0);
+});
+
+for (const platform of ["ios", "android", "web"]) test(`production ${platform} transform excludes development profile dependency while preserving Pi HTTP path`, () => {
+  const fs = require("node:fs"), path = require("node:path");
+  const babel = require("@babel/core");
+  const { constantFoldingPlugin } = require("@expo/metro/metro-transform-plugins");
+  const root = path.resolve(__dirname, ".."), filename = path.join(root, "src/services/settings-runtime.ts");
+  function dependencies(dev) {
+    const transformed = babel.transformSync(fs.readFileSync(filename, "utf8"), {
+      filename, babelrc: false, configFile: false, ast: true, code: false,
+      envName: dev ? "development" : "production",
+      caller: { name: "metro", bundler: "metro", platform, isDev: dev, isServer: false, projectRoot: root },
+      presets: [require.resolve("babel-preset-expo")],
+    });
+    const folded = babel.transformFromAstSync(transformed.ast, "", {
+      filename, babelrc: false, configFile: false, ast: true, code: false,
+      plugins: [constantFoldingPlugin],
+    });
+    const required = [];
+    babel.traverse(folded.ast, { CallExpression({ node }) {
+      if (node.callee.type === "Identifier" && node.callee.name === "require" && node.arguments[0]?.type === "StringLiteral") {
+        required.push(node.arguments[0].value);
+      }
+    } });
+    return { required, code: babel.transformFromAstSync(folded.ast, "", { configFile: false, babelrc: false }).code };
+  }
+  const production = dependencies(false), development = dependencies(true);
+  assert.equal(production.required.includes("@/development/connection-profile"), false);
+  assert.equal(development.required.includes("@/development/connection-profile"), true);
+  assert.match(production.code, /createHttpTransport/);
+  assert.match(production.code, /createVerifiedSettingsStorage/);
 });
 
 test("explicit Mock data plus Pi target never restores HTTP settings or activates business access", async () => {

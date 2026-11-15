@@ -13,19 +13,20 @@ function blockedProfile() {
 }
 function build() {
   if (selected || local) {
-    if (typeof __DEV__ === "undefined" || !__DEV__ || process.env.NODE_ENV === "production") {
-      return blockedProfile();
+    // Metro removes dependencies inside this literal development branch in production.
+    // An early return alone blocks execution but still includes the later require's payload.
+    if (__DEV__) {
+      if (process.env.NODE_ENV === "production") return blockedProfile();
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const profileModule = require("@/development/connection-profile") as typeof import("@/development/connection-profile");
+      const name = selected ?? "local";
+      if (!(profileModule.connectionProfiles as readonly string[]).includes(name)) return blockedProfile();
+      const { transport, clock } = profileModule.createConnectionProfile(name as import("@/development/connection-profile").ConnectionProfile);
+      const adapter = name === "save-error" ? { ...AsyncStorage, setItem: async () => { throw new Error("fixture-write-failure"); } } : AsyncStorage;
+      return createSettingsConnection({ transport, clock, storage: createVerifiedSettingsStorage(`mock:${name}`, adapter),
+        business: () => !mockData && getServerTargetSource() === "pi" });
     }
-    // Production bundle exclusion is checked by export inspection in stage 4, not inferred from __DEV__ alone.
-    // Keep fixture initialization behind the explicit development boundary.
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const profileModule = require("@/development/connection-profile") as typeof import("@/development/connection-profile");
-    const name = selected ?? "local";
-    if (!(profileModule.connectionProfiles as readonly string[]).includes(name)) return blockedProfile();
-    const { transport, clock } = profileModule.createConnectionProfile(name as import("@/development/connection-profile").ConnectionProfile);
-    const adapter = name === "save-error" ? { ...AsyncStorage, setItem: async () => { throw new Error("fixture-write-failure"); } } : AsyncStorage;
-    return createSettingsConnection({ transport, clock, storage: createVerifiedSettingsStorage(`mock:${name}`, adapter),
-      business: () => !mockData && getServerTargetSource() === "pi" });
+    return blockedProfile();
   }
   return createSettingsConnection({ transport: createHttpTransport(), storage: createVerifiedSettingsStorage("pi") });
 }

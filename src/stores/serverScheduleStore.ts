@@ -524,6 +524,9 @@ export function createServerScheduleStore({
     setMutation(serverId, id, { kind: "completion", phase: "pending", completed });
     try {
       const result = await prepared.operation.submit(lease.controller.signal);
+      // A definite rejection may settle before a connection switch but reach this await later.
+      // Its rollback has no authority over data freshly read in the returning generation.
+      if (!owns(serverId, generation)) return;
       if ("response" in result && result.response.serverId === serverId && result.response.data.id === id && current()) {
         confirmed = true;
         applyScheduleResult(serverId, result.response.data);
