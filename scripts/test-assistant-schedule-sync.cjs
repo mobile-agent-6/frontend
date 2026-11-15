@@ -271,3 +271,111 @@ test("8-B 기존 Schedule GET 재시도가 성공하면 이전 동기화 실패 
   const retry = owner.retry(); await tick(); h.reply(2, [dto(200, { title: "기존 GET 경로의 최신 결과" })]); await retry; await tick();
   assert.equal(h.sync.getSnapshot()[0].phase, "synchronized"); assert.equal(h.calls.length, 3); owner.release();
 });
+
+// Issue #35: synthetic DTOs, real HTTP/parser/store/sync; no captured production bodies.
+for (const kind of ["completion", "assistant"]) {
+  for (const scenario of ["ordered", "reversed", "recovery", ...(kind === "completion" ? ["old-data"] : ["single-detail-first", "single-list-first"])]) {
+    test(`35 ${kind} ${scenario}`, async t => {
+      const h = harness({ withDetails: true }), owners = [], pending = new Set();
+      const narrow = { from: "2026-10-31T15:00:00.000Z", to: "2026-11-30T15:00:00.000Z" };
+      const wide = { from: "2026-09-30T15:00:00.000Z", to: "2026-12-31T15:00:00.000Z" };
+      const queries = scenario.startsWith("single") ? [narrow] : [narrow, wide];
+      const before = dto(200, { title: kind === "completion" ? "상품 재고 확인" : "입고 수량 대조",
+        category: kind === "completion" ? "INVENTORY" : "INBOUND",
+        scheduledAt: kind === "completion" ? "2026-11-16T02:00:00.000Z" : "2026-11-17T05:00:00.000Z" });
+      const after = { ...before, ...(kind === "completion" ? { completed: true } : { title: "입고 수량 최종 대조" }),
+        updatedAt: "2026-11-15T13:22:42.436904Z" };
+      let current = before;
+      h.state.scheduleHandle = (url, options) => new Promise(resolve => {
+        const call = h.calls.at(-1);
+        call.finish = value => { pending.delete(call); resolve(json(value)); };
+        pending.add(call);
+        assert.equal(new URL(url).origin, origin);
+        assert.ok(["GET", "PATCH"].includes(options.method));
+      });
+      const listCalls = start => h.calls.slice(start).filter(c => new URL(c.url).pathname === "/api/v1/schedules" && c.method === "GET");
+      const settleCall = async (call, value) => { call.finish(value); await tick(); };
+      try {
+        for (const q of queries) {
+          const start = h.calls.length, owner = h.cache.acquire(q); owners.push(owner); await tick();
+          await settleCall(listCalls(start)[0], { items: [{ ...before }] }); await owner.promise;
+          assert.equal(h.entry(q).stale, false);
+        }
+        current = after;
+        const start = h.calls.length;
+        const result = success("update"); result.result.text = "일정을 변경했어요.";
+        const operation = kind === "completion" ? h.cache.toggleCompleted(serverId, id(200)) : h.sync.observe(ref(), result);
+        await tick();
+        if (kind === "completion") {
+          const patch = h.calls.slice(start).find(c => c.method === "PATCH");
+          assert.deepEqual(JSON.parse(patch.body), { completed: true });
+          await settleCall(patch, { ...after });
+        }
+        const reads = listCalls(start);
+        assert.equal(reads.length, queries.length);
+        const ordered = reads.map(call => {
+          const url = new URL(call.url), q = { from: url.searchParams.get("from"), to: url.searchParams.get("to") };
+          return { call, q, sequence: h.entry(q).sequence, key: h.cacheModule.scheduleQueryKey(serverId, q) };
+        }).sort((a, b) => a.sequence - b.sequence);
+        const detail = h.calls.slice(start).find(c => new URL(c.url).pathname.endsWith(`/schedules/${id(200)}`) && c.method === "GET");
+        const initialVersion = h.cacheData().entityVersions[id(200)];
+        if (detail && scenario !== "single-list-first") {
+          await settleCall(detail, { ...after });
+          assert.equal(h.cacheData().entityVersions[id(200)], initialVersion);
+        }
+        const reverse = ["reversed", "recovery", "old-data"].includes(scenario);
+        const applied = reverse ? [...ordered].reverse() : ordered;
+        for (const [index, item] of applied.entries()) {
+          await settleCall(item.call, { items: [{ ...(["old-data", "recovery"].includes(scenario) && index === 1 ? before : after) }] });
+          assert.equal(h.entry(item.q).status, "success"); assert.equal(h.entry(item.q).error, null);
+          assert.equal(h.cacheData().entityVersions[id(200)], Math.max(...applied.slice(0, index + 1).map(v => v.sequence)));
+        }
+        if (detail && scenario === "single-list-first") await settleCall(detail, { ...after });
+        await operation; await tick();
+        assert.equal(h.cacheData().entities[id(200)].title, after.title);
+        assert.equal(h.cacheData().entities[id(200)].completed, after.completed);
+        if (kind === "assistant") {
+          assert.equal(result.result.outcome, "success");
+          assert.equal(h.sync.getSnapshot()[0].detail.phase, "ready");
+          assert.equal(h.sync.getSnapshot()[0].detail.schedule.title, after.title);
+        }
+        const state = () => kind === "completion" ? h.cacheData().mutations[id(200)] : h.sync.getSnapshot()[0];
+        t.diagnostic(JSON.stringify({ kind, scenario, started: ordered.map(({ key, sequence }) => ({ key, sequence })),
+          applied: applied.map(v => v.sequence), entityVersion: h.cacheData().entityVersions[id(200)],
+          queries: queries.map(q => h.entry(q)), result: state() ?? null,
+          methods: h.calls.map(c => c.method) }));
+        if (scenario === "old-data") {
+          assert.equal(h.entry(ordered[0].q).stale, true);
+        } else if (scenario === "recovery") {
+          // Real stale response keeps GET-only recovery exercised after the equality fix.
+          assert.equal(state().phase, "refresh-error");
+          assert.deepEqual(state().failedQueries.map(q => h.cacheModule.scheduleQueryKey(serverId, q)), [ordered[0].key]);
+          assert.equal(h.entry(ordered[1].q).stale, false);
+          const writes = h.calls.filter(c => c.method !== "GET").length, retryStart = h.calls.length;
+          const retry = kind === "completion" ? h.cache.checkCompletion(serverId, id(200)) : h.sync.retry(ref());
+          await tick();
+          const retryCalls = listCalls(retryStart);
+          assert.equal(retryCalls.length, 1); assert.equal(retryCalls[0].url, ordered[0].call.url);
+          for (const call of retryCalls) await settleCall(call, { items: [{ ...after }] });
+          await retry; await tick();
+          assert.equal(h.calls.filter(c => c.method !== "GET").length, writes);
+          assert.ok(queries.every(q => !h.entry(q).stale));
+          assert.equal(h.cacheData().entities[id(200)].completed, after.completed);
+          assert.equal(h.cacheData().entities[id(200)].title, after.title);
+          assert.equal(kind === "completion" ? state() : state().phase, kind === "completion" ? undefined : "synchronized");
+        } else {
+          assert.deepEqual(queries.map(q => h.entry(q).stale), queries.map(() => false), "valid identical GETs must remain fresh");
+          assert.equal(kind === "completion" ? state() : state().phase, kind === "completion" ? undefined : "synchronized");
+        }
+        assert.equal(h.calls.filter(c => c.method === "PATCH").length, kind === "completion" ? 1 : 0);
+        assert.equal(h.calls.filter(c => ["POST", "DELETE"].includes(c.method)).length, 0);
+      } finally {
+        owners.forEach(owner => owner.release());
+        h.mode.getState().setMode("mock");
+        for (const call of [...pending]) call.finish(new URL(call.url).pathname.endsWith("/schedules") ? { items: [{ ...current }] } : { ...current });
+        await tick();
+        assert.equal(pending.size, 0);
+      }
+    });
+  }
+}

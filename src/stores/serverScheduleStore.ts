@@ -4,7 +4,7 @@ import { scheduleHttpClient, type HttpError } from "@/services/api/http";
 import { getSchedule, listSchedules, prepareScheduleDeletion, prepareScheduleUpdate } from "@/services/api/schedules";
 import { isScheduleRequestAllowed, scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
 import type { Schedule } from "@/types/schedule";
-import { parseScheduleApiDateTime } from "@/utils/schedule-mapper";
+import { parseScheduleApiDateTime, toApiCategory, uiDateTimeToScheduledAt } from "@/utils/schedule-mapper";
 import { buildScheduleListQuery, getMainScheduleRange, type ScheduleListQuery } from "@/utils/schedule-query";
 
 export type ScheduleQueryEntry = {
@@ -35,6 +35,22 @@ type ServerCache = {
 type QueryState = { serverId: string | null; generation: number; servers: Record<string, ServerCache> };
 const emptyCache = (): ServerCache => ({ entities: {}, entityVersions: {}, queries: {}, details: {}, mutations: {}, deletedIds: {} });
 
+// Equality is for the mapped UI model, not a server revision (timestamps are not retained).
+function sameSchedule(a: Schedule | undefined, b: Schedule) {
+  return a?.id === b.id && a.title === b.title && a.date === b.date && a.time === b.time &&
+    a.category === b.category && a.completed === b.completed;
+}
+
+function definitelyMatches(item: Schedule, query: ScheduleListQuery) {
+  if (query.category !== undefined && toApiCategory(item.category) !== query.category) return false;
+  if (query.completed !== undefined && item.completed !== query.completed) return false;
+  // The mapper retains only minutes. Infer membership only when the whole minute is in range.
+  const minute = Date.parse(uiDateTimeToScheduledAt(item.date, item.time));
+  const from = parseScheduleApiDateTime(query.from), to = parseScheduleApiDateTime(query.to);
+  return (minute > from.milliseconds || (minute === from.milliseconds && from.microseconds === 0)) &&
+    minute + 60_000 <= to.milliseconds;
+}
+
 // 목록과 단건이 같은 요청 순번·객체 원본을 사용한다. 서버 revision을 추정하지 않는다.
 function mergeEntities(cache: ServerCache, items: Schedule[], sequence: number) {
   const entities: Record<string, Schedule> = Object.assign(Object.create(null), cache.entities);
@@ -42,8 +58,11 @@ function mergeEntities(cache: ServerCache, items: Schedule[], sequence: number) 
   let stale = false;
   for (const item of items) {
     if (Object.hasOwn(cache.deletedIds, item.id)) { stale = true; continue; }
-    if ((entityVersions[item.id] ?? 0) > sequence) { stale = true; continue; }
-    if (entities[item.id] && JSON.stringify(entities[item.id]) !== JSON.stringify(item)) {
+    if ((entityVersions[item.id] ?? 0) > sequence) {
+      if (!sameSchedule(entities[item.id], item)) stale = true;
+      continue; // Confirmation does not replace the newer object or lower its version.
+    }
+    if (entities[item.id] && !sameSchedule(entities[item.id], item)) {
       for (const [key, entry] of Object.entries(queries)) {
         if (entry.ids.includes(item.id)) queries[key] = { ...entry, stale: true };
       }
@@ -199,9 +218,17 @@ export function createServerScheduleStore({
             error: { kind: "aborted", requestState: "response-received" } } } };
         const merged = mergeEntities(cache, result.data, requestSequence);
         const { queries } = merged.cache;
+        const receivedIds = new Set(result.data.map(item => item.id));
+        // Equal entities do not prove membership. Compare both directions against valid
+        // newer query evidence, without inferring deletion or changing another query's IDs.
+        const membershipConflict = Object.values(cache.queries).some(entry =>
+          entry.sequence > requestSequence && entry.status === "success" && !entry.stale &&
+          (entry.ids.some(id => !receivedIds.has(id) && cache.entities[id] &&
+            definitelyMatches(cache.entities[id], query)) ||
+          result.data.some(item => !entry.ids.includes(item.id) && definitelyMatches(item, entry.query))));
         // 한 query에서 빠진 객체를 전역 삭제하지 않는다. 순서와 소속은 query별로 유지한다.
         queries[key] = { ...previous, ids: result.data.filter((item) => !Object.hasOwn(cache.deletedIds, item.id)).map((item) => item.id),
-          hasSuccess: true, status: "success", error: null, stale: merged.stale };
+          hasSuccess: true, status: "success", error: null, stale: merged.stale || membershipConflict };
         return merged.cache;
       });
     }).catch(() => {

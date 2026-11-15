@@ -3549,3 +3549,15 @@ for (const exit of ["blur", "background", "unmount", "mode"]) test(`실제 로�
     assert.equal(h.state.calls.length, 0); assert.equal(h.state.mockRuns, 0);
   } finally { h.close(); await h.settle(); }
 });
+
+test("35 real sync failure does not block the next text request", async () => {
+  const h = harness({ actualScheduleSync: true });
+  try {
+    await liveSync8b(h, async () => json({ items: [{ invalid: true }] }));
+    await h.settle();
+    assert.equal(h.sync.getSnapshot()[0].phase, "refresh-error");
+    const count = postedBodies(h).length;
+    h.send("일정 조회해 줘"); await h.settle();
+    assert.equal(postedBodies(h).length, count + 1);
+  } finally { h.close(); }
+});
