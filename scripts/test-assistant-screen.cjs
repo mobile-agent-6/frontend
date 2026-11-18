@@ -26,12 +26,12 @@ const deferred = () => { let resolve; const promise = new Promise(r => { resolve
 
 // 실제 화면 Hook·HTTP·복구·polling을 실행하고 native·시계·storage·fetch만 프로세스 대역으로 둔다.
 // 실제 단말 렌더링·키보드·네트워크 시험은 아니다.
-function harness({ initialMode = "server", readOnly = false, data = new Map(), initialSnapshot, actualLifecycle = false, snapshotAtSubscribe, notifyOnSubscribe = false,
-  actualScheduleSync = false, actualScheduleDetails = false, initialSyncSnapshot = [], syncSnapshotAtSubscribe } = {}) {
+function harness({ platform = "ios", nativeVoice = false, initialMode = "server", readOnly = false, data = new Map(), initialSnapshot, actualLifecycle = false, snapshotAtSubscribe, notifyOnSubscribe = false,
+  actualScheduleSync = false, actualScheduleDetails = false, initialSyncSnapshot = [], syncSnapshotAtSubscribe, initialBaseUrl = origin } = {}) {
   const cache = new Map(), slots = [], effects = [], timers = new Map(), listeners = new Set();
   const displayStates = new Map();
   const displayFocusCleanups = new Set();
-  const voiceFocusCleanups = new Set();
+  const voiceFocusCleanups = new Set(), voiceFocusFactories = new Set();
   let displayOwner = null, displayCursor = 0;
   let inputUiIndex, statusIndex;
   let cursor = 0, dirty = false, tree, wall = 1000, mono = 0, timerId = 0, closed = false, displaying = false;
@@ -70,7 +70,7 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
   const setTimer = (fn, ms) => { const token = ++timerId; timers.set(token, { fn, at: mono + ms, ms }); return token; };
   const clearTimer = token => timers.delete(token);
   const send = (url, init) => { state.calls.push({ url, init }); return state.handle(url, init); };
-  const adapter = { async getItem(key) { if (state.beforeRead) await state.beforeRead(); if (state.failRead) throw Error("조회 실패"); return data.get(key) ?? null; }, async setItem(key, value) { if (state.failStorage) throw Error("저장 실패"); data.set(key, value); } };
+  const adapter = { async getItem(key) { if (state.beforeRead) await state.beforeRead(); if (state.failRead) throw Error("조회 실패"); return data.get(key) ?? null; }, async setItem(key, value) { if (state.beforeWrite) await state.beforeWrite(value); if (state.failStorage) throw Error("저장 실패"); data.set(key, value); } };
   const syncDouble = { observe: async () => null, getSnapshot: () => state.syncSnapshot,
     retry: async reference => { state.syncRetries.push(reference); return state.syncSnapshot.find(entry => entry.reference.requestId === reference.requestId) ?? null; },
     subscribe(listener) { state.syncListeners.add(listener); state.lastSyncListener = listener;
@@ -78,7 +78,7 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
       return () => { state.syncListeners.delete(listener); state.syncUnsubscribed++; }; } };
   const native = { AppState: { get currentState() { return state.app; }, addEventListener(event, listener) { assert.equal(event, "change"); listeners.add(listener); return { remove: () => listeners.delete(listener) }; } },
     Dimensions: { get: () => ({ width: 400, height: 800 }) },
-    KeyboardAvoidingView: "KeyboardAvoidingView", FlatList: "FlatList", Keyboard: { isVisible: () => false }, Platform: { OS: "ios" }, StyleSheet: { create: s => s }, Text: "Text", View: "View", Pressable: "Pressable" };
+    KeyboardAvoidingView: "KeyboardAvoidingView", FlatList: "FlatList", Keyboard: { isVisible: () => false }, Platform: { OS: platform }, StyleSheet: { create: s => s }, Text: "Text", View: "View", Pressable: "Pressable" };
   function load(file) {
     if (cache.has(file)) return cache.get(file).exports;
     const module = { exports: {} }; cache.set(file, module);
@@ -86,8 +86,8 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
     function resolve(name) {
       if (name === "expo-router") return { useFocusEffect: callback => {
         if (displaying) displayFocusCleanups.add(callback());
-        else react.useEffect(() => { const cleanup = callback(); voiceFocusCleanups.add(cleanup);
-          return () => { voiceFocusCleanups.delete(cleanup); cleanup?.(); }; }, [callback]);
+        else react.useEffect(() => { voiceFocusFactories.add(callback); const cleanup = callback(); voiceFocusCleanups.add(cleanup);
+          return () => { voiceFocusFactories.delete(callback); voiceFocusCleanups.delete(cleanup); cleanup?.(); }; }, [callback]);
       } };
       if (name === "expo-symbols") return { SymbolView: "SymbolView" };
       if (name === "@/hooks/use-local-audio-playback") {
@@ -106,7 +106,7 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
       if (name === "zustand" || name === "zustand/vanilla") return require(name);
       if (name === "expo/fetch") return { fetch: send };
       if (name === "@react-native-async-storage/async-storage") return adapter;
-      if (name === "expo-crypto") return { randomUUID: () => { state.uuidCalls++; state.beforeUuid?.(); if (state.failUuid) throw Error("UUID 실패"); return randomUUID(); } };
+      if (name === "expo-crypto") return { randomUUID: () => { state.uuidCalls++; state.beforeUuid?.(); if (state.failUuid) throw Error("UUID 실패"); return state.uuidValue ?? randomUUID(); } };
       if (name === "@/services/expo-audio-playback") return { createExpoPlaybackDependencies(canPlay) {
         const session = load(path.join(root, "src/services/local-audio-session.ts")).localAudioSession;
         const playback = playbackFixture(deps => { deps.canPlay = canPlay; }, session);
@@ -114,6 +114,11 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
         return playback.deps;
       } };
       if (name === "@/services/expo-voice-recording") return { createExpoVoiceDependencies(canStart) {
+        if (nativeVoice) {
+          const f = require("./helpers/voice-native.cjs").fileAdapter(platform); state.nativeVoice = f;
+          const deps = f.api.createExpoVoiceDependencies(canStart); f.deps=deps; deps.setTimer = setTimer; deps.clearTimer = clearTimer;
+          return deps;
+        }
         const session = load(path.join(root, "src/services/local-audio-session.ts")).localAudioSession, owner = Symbol("screen-recording");
         let reservation;
         const voice = voiceFixture(deps => {
@@ -128,7 +133,7 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
       } };
       if (["@/components/assistant/assistant-message", "@/components/assistant/assistant-schedule-card"].includes(name)) return load(path.join(root, "src", `${name.slice(2)}.tsx`));
       if (name.startsWith("@/components/")) { const component = name.split("/").at(-1).split("-").map(s => s[0].toUpperCase() + s.slice(1)).join(""); return { [component]: component }; }
-      if (name === "@/constants/theme") return { Spacing: { one: 4, two: 8, three: 16 } };
+      if (name === "@/constants/theme") return { Spacing: { one: 4, two: 8, three: 16, five: 32 } };
       if (name === "@/hooks/use-color-scheme") return { useColorScheme: () => "light" };
       if (name === "@/hooks/use-theme") return { useTheme: () => ({ background: "white", primaryForeground: "white" }) };
       assert.ok(name.startsWith("@/"), name); if (!actualScheduleSync) assert.notEqual(name, "@/services/api/http");
@@ -144,7 +149,7 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
     return module.exports;
   }
   const source = file => load(path.join(root, file));
-  const config = source("src/services/api/config.ts"); state.config = config.parseDevelopmentServerConfig(origin);
+  const config = source("src/services/api/config.ts"); state.config = config.parseDevelopmentServerConfig(initialBaseUrl);
   config.getDevelopmentServerConfig = () => state.config;
   if (actualScheduleSync) {
     const scheduleHttp = source("src/services/api/http.ts");
@@ -160,12 +165,12 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
   const originalCleanup = storage.cleanup, originalManualCleanup = storage.removeManually;
   storage.cleanup = (...args) => { state.storageCleanupCalls.push(args); return originalCleanup(...args); };
   storage.removeManually = (...args) => { state.manualCleanupCalls.push(args); return originalManualCleanup(...args); };
-  const delegate = { startRequest: (...args) => { state.starts.push(args); return orchestrator.startRequest(...args); },
+  const delegate = { startVoiceRequest: (...args) => { state.starts.push(args); return orchestrator.startVoiceRequest(...args); }, startRequest: (...args) => { state.starts.push(args); return orchestrator.startRequest(...args); },
     confirmResultDisplayed: (...args) => orchestrator.confirmResultDisplayed(...args),
     queryRequestOnce: (...args) => orchestrator.queryRequestOnce(...args) }; api.assistantOrchestrator = delegate;
   const mode = source("src/stores/scheduleDataModeStore.ts"), mock = source("src/stores/scheduleStore.ts").useScheduleStore;
   const lifecycleModule = source("src/services/api/assistant-lifecycle.ts");
-  const realLifecycle = lifecycleModule.createAssistantLifecycle({ http, orchestrator: { initializeRecovery: options => { state.initializations++; return orchestrator.initializeRecovery(options); } } });
+  const realLifecycle = lifecycleModule.createAssistantLifecycle({ http, orchestrator: { resumeRequest: orchestrator.resumeRequest, initializeRecovery: options => { state.initializations++; return orchestrator.initializeRecovery(options); } } });
   const lifecycle = actualLifecycle ? realLifecycle : { getSnapshot: () => state.snapshot, subscribe(listener) {
     state.recoveryListeners.add(listener); state.lastRecoveryListener = listener;
     if (snapshotAtSubscribe) state.snapshot = snapshotAtSubscribe;
@@ -204,7 +209,7 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
       }
       return { ...node, props: { ...node.props, children: expand(node.props?.children) } };
     }
-    return { list, components, rows: messages.map(item => expand(list.props.renderItem({ item }))), footer: expand(list.props.ListFooterComponent) };
+    return { list, components, rows: list.props.data.map(item => expand(list.props.renderItem({ item }))), footer: expand(list.props.ListFooterComponent) };
   }
   render();
   return { state, source, storage, data, mock, mode, delegate, lifecycle, sync, render, renderConversation, find, settle, advance, timers, listeners,
@@ -220,7 +225,9 @@ function harness({ initialMode = "server", readOnly = false, data = new Map(), i
     attachLifecycle: () => realLifecycle.attach(),
     app(value) { state.app = value; for (const listener of [...listeners]) listener(value); },
     blurResults() { for (const cleanup of displayFocusCleanups) cleanup?.(); displayFocusCleanups.clear(); },
+    focusVoice() { for (const callback of voiceFocusFactories) voiceFocusCleanups.add(callback()); render(); },
     blurVoice() { for (const cleanup of voiceFocusCleanups) cleanup?.(); voiceFocusCleanups.clear(); render(); },
+    remount() { this.close(); closed=false; slots.length=0; effects.length=0; render(); },
     close() { if (closed) return; closed = true; this.blurResults(); slots.forEach(slot => slot?.cleanup?.()); },
   };
 }
@@ -3418,7 +3425,7 @@ test("음성 UI Mock 후보·삭제 확인은 녹음 fixture 동안 유지·차�
 });
 
 for (const initialMode of ["mock", "server"]) test(`실제 로컬 녹음 화면 ${initialMode}: 권한·시작·정지 연결은 메시지/Assistant 요청/일정 변경 없음`, async () => {
-  const h = harness({ initialMode });
+  const h = harness({ initialMode, platform: "android" });
   try {
     const original = h.mock.getState().schedules;
     assert.equal(h.find("MessageInput").voiceDisabled, false);
@@ -3489,7 +3496,7 @@ test("실제 로컬 녹음 화면: 녹음 결과 후 정상 text 제출은 파�
 });
 
 for (const kind of ["candidate_selection", "confirmation", "uncertain"]) test(`실제 로컬 녹음 화면: ${kind}의 기존 정책을 우회하는 녹음 시작 금지`, async () => {
-  const h = harness();
+  const h = harness({ platform: "android" });
   try {
     h.state.handle = responseWith(results[kind]); h.send("변경"); await h.settle();
     assert.equal(h.find("MessageInput").voiceDisabled, true);
@@ -3559,5 +3566,754 @@ test("35 real sync failure does not block the next text request", async () => {
     const count = postedBodies(h).length;
     h.send("일정 조회해 줘"); await h.settle();
     assert.equal(postedBodies(h).length, count + 1);
+  } finally { h.close(); }
+});
+
+// Phase 11 stage 3, actual hook/controller/Expo file store/owner/API/recovery/screen.
+async function recordVoice(h) {
+  h.find("MessageInput").onStartVoice(); h.render(); await h.settle();
+  assert.equal(h.find("VoiceInputStatus").input.phase, "recording");
+  h.find("MessageInput").onStopVoice(); h.render(); await h.settle();
+}
+const voiceCalls = h => h.state.calls.filter(call => call.url.includes("/voice/requests?"));
+const voiceResponse = (h, result = results.outcome, { replay = false } = {}) => async (url, init) => {
+  const requestId = init.method === "POST" && init.body instanceof Uint8Array ? new URL(url).searchParams.get("requestId") : url.split("/").pop();
+  return init.method === "POST" ? json(replay ? status(requestId, "processing") : { ...status(requestId), transcript: "일정 보여줘", input: {
+    type: "text", text: "일정 보여줘", ...(new URL(url).searchParams.has("questionId") ? { questionId:new URL(url).searchParams.get("questionId") } : {}) } }, replay ? 200 : 202) : json({ ...done(requestId), result });
+};
+
+for (const kind of Object.keys(results)) test(`3 screen voice ${kind}: transcript once, common result UI, file deleted`, async () => {
+  const h = harness({ nativeVoice:true }); h.state.handle = voiceResponse(h, { ...results[kind], ...(results[kind].expiresAt ? { expiresAt:new Date(h.wall+600000).toISOString() } : {}) });
+  try {
+    await recordVoice(h); assert.equal(voiceCalls(h).length,1);
+    assert.equal(h.messages().filter(m=>m.role==="user").length,1); assert.equal(h.messages().find(m=>m.role==="user").text,"일정 보여줘");
+    assert.equal(h.messages().at(-1).apiExecution.response.data.result.kind,kind); assert.equal(h.state.nativeVoice.entries.size,0);
+    assert.ok(h.state.calls.every(c=>!c.url.endsWith("/speech"))); assert.equal(h.state.mockRuns,0); assert.equal(h.find("MessageInput").disabled,false);
+    h.render(); await h.settle(); assert.equal(voiceCalls(h).length,1);assert.equal(h.messages().filter(m=>m.role==="user").length,1);
+  } finally { h.close(); }
+});
+
+test("3 screen replay has no guessed UserMessage; original unavailable notice once",async()=>{
+  const h=harness({nativeVoice:true});h.state.handle=voiceResponse(h,results.outcome,{replay:true});
+  try{await recordVoice(h);assert.equal(h.messages().filter(m=>m.role==="user").length,0);assert.equal(h.messages().filter(m=>m.text.includes("원문은 복구")).length,1);assert.equal(voiceCalls(h).length,1);}finally{h.close();}
+});
+
+for(const kind of ["need_more_info","candidate_selection","confirmation"])test(`3 text→voice ${kind}: pinned question, concurrent buttons/text blocked`,async()=>{
+  const h=harness({nativeVoice:true});h.state.handle=responseWith({...results[kind],...(results[kind].expiresAt?{expiresAt:new Date(h.wall+600000).toISOString()}: {})});
+  try{
+    h.send("변경");await h.settle();const message=h.messages().at(-1),question=message.apiExecution.response.data.result;
+    const old=h.find("ConversationList"),oldSend=h.find("MessageInput").onSend;
+    const gate=deferred();h.state.handle=(url,init)=>voiceCalls(h).length?gate.promise:Promise.reject(Error("unexpected"));
+    await recordVoice(h);assert.equal(voiceCalls(h).length,1);const url=new URL(voiceCalls(h)[0].url);
+    assert.equal(url.searchParams.get("conversationId"),id(100));assert.equal(url.searchParams.get("questionId"),question.questionId);
+    old.onApiConfirmation(message.id,true);old.onApiCandidateSelection(message.id,"opaque/1");oldSend();h.find("MessageInput").onStartVoice();await h.settle();
+    assert.equal(h.state.calls.filter(c=>c.init.method==="POST").length,2);assert.equal(h.find("MessageInput").disabled,true);
+    const requestId=url.searchParams.get("requestId");h.state.handle=async()=>json(done(requestId));gate.resolve(json({...status(requestId),transcript:"네",input:kind==="confirmation"?{type:"confirmation",questionId:question.questionId,approved:true}:kind==="candidate_selection"?{type:"selection",questionId:question.questionId,candidateId:"opaque/1"}:{type:"text",questionId:question.questionId,text:"오후 3시"}},202));await h.settle();
+    assert.equal(h.messages().filter(m=>m.role==="user"&&m.text==="네").length,1);assert.equal(h.messages().at(-1).apiExecution.kind,"completed");
+  }finally{h.close();}
+});
+
+test("3 voice→text need_more_info reuses common follow-up and does not post transcript",async()=>{
+  const h=harness({nativeVoice:true});h.state.handle=voiceResponse(h,results.need_more_info);
+  try{await recordVoice(h);const first=voiceCalls(h)[0];h.state.handle=responseWith(results.outcome);h.send("오후 3시");await h.settle();
+    const texts=h.state.calls.filter(c=>c.init.method==="POST"&&typeof c.init.body==="string");assert.equal(texts.length,1);assert.equal(JSON.parse(texts[0].init.body).input.text,"오후 3시");assert.equal(JSON.parse(texts[0].init.body).input.questionId,results.need_more_info.questionId);assert.equal(voiceCalls(h).length,1);assert.notEqual(first.url,texts[0].url);
+  }finally{h.close();}
+});
+
+for(const exit of ["blur","background","unmount","A-B-A"])test(`3 voice HTTP pending ${exit}: no late result or auto resume`,async()=>{
+  const h=harness({nativeVoice:true}),gate=deferred();h.state.handle=()=>gate.promise;
+  try{await recordVoice(h);assert.equal(voiceCalls(h).length,1);const requestId=new URL(voiceCalls(h)[0].url).searchParams.get("requestId");
+    if(exit==="blur")h.blurVoice();else if(exit==="background")h.app("background");else if(exit==="unmount")h.close();else{h.switchMode("mock");h.switchMode("server");}
+    await h.settle();const length=h.messages().length;gate.resolve(json({...status(requestId),transcript:"늦은 원문",input:{type:"text",text:"늦은 원문"}},202));await h.settle();
+    assert.equal(h.messages().length,length);assert.equal(h.messages().some(m=>m.text==="늦은 원문"),false);assert.equal(h.state.lateUpdates,0);assert.equal(h.state.nativeVoice.entries.size,0);h.app("active");await h.settle();assert.equal(voiceCalls(h).length,1);
+  }finally{h.close();}
+});
+
+for(const boundary of ["save-failure","saved-exit","bytes-read-exit"])test(`3 screen ${boundary}: no Voice POST`,async()=>{
+  const h=harness({nativeVoice:true}),gate=deferred();
+  try{if(boundary==="save-failure")h.state.failStorage=true;
+    h.find("MessageInput").onStartVoice();await h.settle();
+    if(boundary==="bytes-read-exit")h.state.nativeVoice.native.readGate=gate.promise;
+    if(boundary==="saved-exit")h.state.beforeRead=()=>gate.promise;
+    h.find("MessageInput").onStopVoice();await h.settle();
+    if(boundary!=="save-failure"){h.blurVoice();gate.resolve();await h.settle();}
+    assert.equal(voiceCalls(h).length,0);assert.equal(h.state.nativeVoice.entries.size,0);
+  }finally{h.close();}
+});
+
+
+for(const code of ["VOICE_ANSWER_UNCLEAR","SPEECH_NOT_RECOGNIZED","VOICE_BUSY","VOICE_UNAVAILABLE"])test(`3 question ${code}: explicit retry only after confirmed clear rejection`,async()=>{
+  const h=harness({nativeVoice:true});h.state.handle=responseWith({...results.confirmation,expiresAt:new Date(h.wall+600000).toISOString()});
+  try{h.send("변경");await h.settle();const original=h.messages().at(-1);h.state.handle=async(url,init)=>init.method==="POST"?voiceProblemResponse(code==="VOICE_UNAVAILABLE"?503:code==="VOICE_ANSWER_UNCLEAR"||code==="SPEECH_NOT_RECOGNIZED"?422:409,code,new URL(url).searchParams.get("requestId")):voiceProblemResponse(404,"ASSISTANT_REQUEST_NOT_FOUND",url.split("/").pop());
+    await recordVoice(h);if(code==="VOICE_BUSY"||code==="VOICE_UNAVAILABLE")await h.advance(120000);
+    const count=voiceCalls(h).length;assert.ok(count<=2);
+    if(code==="VOICE_ANSWER_UNCLEAR"||code==="SPEECH_NOT_RECOGNIZED"){
+      assert.equal(h.find("MessageInput").voiceDisabled,false);
+      h.state.handle=voiceResponse(h);await recordVoice(h);assert.equal(voiceCalls(h).length,count+1);
+    }else{
+      assert.equal(h.find("MessageInput").voiceDisabled,true);
+      h.find("ConversationList").onApiConfirmation(original.id,true);await h.settle();assert.equal(voiceCalls(h).length,count);
+    }
+  }finally{h.close();}
+});
+
+test("3 owner cleanup handle survives screen recreation and reattempts deletion",async()=>{
+  const h=harness({nativeVoice:true});h.state.handle=voiceResponse(h);
+  try{h.find("MessageInput").onStartVoice();await h.settle();const old=h.state.nativeVoice;old.native.deleteFails=true;
+    h.find("MessageInput").onStopVoice();await h.settle();assert.equal(voiceCalls(h).length,1);assert.equal(old.entries.has(old.managedUri),true);
+    old.native.deleteFails=false;h.remount();await h.settle();assert.equal(old.entries.size,0);assert.equal(voiceCalls(h).length,1);
+  }finally{h.close();}
+});
+
+for(const kind of ["need_more_info","candidate_selection","confirmation"])test(`3 pinned recording ${kind} replaced before stop: no stale POST`,async()=>{
+  const h=harness({nativeVoice:true});h.state.handle=responseWith({...results[kind],...(results[kind].expiresAt?{expiresAt:new Date(h.wall+600000).toISOString()}: {})});
+  try{h.send("요청");await h.settle();h.find("MessageInput").onStartVoice();await h.settle();
+    const original=h.messages().find(m=>m.apiExecution?.kind==="completed").apiExecution.reference.requestId; const changed=recovered(kind,original);changed.response.data.result={...results[kind],questionId:id(998),...(results[kind].expiresAt?{expiresAt:new Date(h.wall+600000).toISOString()}: {})};
+    h.publishSnapshot(snapshotOf([changed]));h.find("MessageInput").onStopVoice();await h.settle();assert.equal(voiceCalls(h).length,0);
+  }finally{h.close();}
+});
+
+function voiceProblemResponse(httpStatus, code, assistantRequestId) {
+  return {status:httpStatus,headers:new Headers({"Content-Type":"application/problem+json","X-Request-ID":id(900)}),text:async()=>JSON.stringify({type:"https://example.invalid/problem",title:"오류",detail:"문구 파싱 금지",instance:"/api/v1/voice/requests",status:httpStatus,code,requestId:id(900),assistantRequestId})};
+}
+
+for(const stage of ["stopping","metadata"])test(`3 question expires during ${stage}: no POST, owner safely disposed`,async()=>{
+  const h=harness({nativeVoice:true}),gate=deferred();h.state.handle=responseWith({...results.confirmation,expiresAt:new Date(h.wall+3000).toISOString()});
+  try{h.send("확인");await h.settle();h.find("MessageInput").onStartVoice();await h.settle();
+    if(stage==="stopping")h.state.nativeVoice.native.stopGate=gate.promise;else h.state.beforeRead=()=>gate.promise;
+    h.find("MessageInput").onStopVoice();await h.settle();await h.advance(3000);gate.resolve();await h.settle();assert.equal(voiceCalls(h).length,0);assert.equal(h.state.nativeVoice.entries.size,0);
+  }finally{h.close();}
+});
+
+
+for(const failure of [false,true])test(`3 voice Schedule sync failure=${failure}: shared GET only, no repeated mutation`,async()=>{
+  const h=harness({nativeVoice:true,actualScheduleSync:true});let reads=0;
+  const assistant=voiceResponse(h,writeOutcome8b());h.state.handle=async(url,init)=>new URL(url).pathname==="/api/v1/schedules"?(reads++,json(failure?{items:[{invalid:true}]}:{items:[{...summary,createdAt:summary.updatedAt}]})):assistant(url,init);
+  try{await recordVoice(h);await h.settle();assert.equal(h.messages().at(-1).apiExecution.kind,"completed");assert.equal(h.sync.getSnapshot()[0].phase,failure?"refresh-error":"synchronized");assert.equal(voiceCalls(h).length,1);assert.ok(reads>0);
+    h.publishSnapshot(snapshotOf([h.messages().at(-1).apiExecution]));await h.settle();assert.equal(voiceCalls(h).length,1);assert.equal(h.state.calls.filter(c=>c.init.method!=="GET").length,1);
+  }finally{h.close();}
+});
+
+
+for(const exit of ["blur","background"])test(`3 interrupted voice follow-up ${exit}: queued old button cannot submit new ID`,async()=>{
+  const h=harness({nativeVoice:true}),gate=deferred();h.state.handle=responseWith({...results.confirmation,expiresAt:new Date(h.wall+600000).toISOString()});
+  try{h.send("수정");await h.settle();const message=h.messages().at(-1),old=h.find("ConversationList");h.state.handle=()=>gate.promise;
+    await recordVoice(h);assert.equal(h.state.calls.filter(c=>c.init.method==="POST").length,2);
+    if(exit==="blur")h.blurVoice();else{h.app("background");h.app("active");}await h.settle();
+    old.onApiConfirmation(message.id,true);await h.settle();assert.equal(h.state.calls.filter(c=>c.init.method==="POST").length,2);
+    const requestId=new URL(voiceCalls(h)[0].url).searchParams.get("requestId");gate.resolve(json({...status(requestId),transcript:"네",input:{type:"confirmation",questionId:results.confirmation.questionId,approved:true}},202));await h.settle();
+  }finally{h.close();}
+});
+
+
+test("3 native permission dialog inactive→active retains explicitly started voice submission",async()=>{
+  const h=harness({nativeVoice:true}),gate=deferred();h.state.handle=voiceResponse(h);
+  try{h.state.nativeVoice.deps.permission=async()=>({granted:false,canAskAgain:true});h.state.nativeVoice.deps.requestPermission=()=>gate.promise;
+    h.find("MessageInput").onStartVoice();await h.settle();h.app("inactive");h.app("active");gate.resolve({granted:true,canAskAgain:true});await h.settle();
+    assert.equal(h.find("VoiceInputStatus").input.phase,"recording");h.find("MessageInput").onStopVoice();await h.settle();assert.equal(voiceCalls(h).length,1);assert.equal(h.state.nativeVoice.entries.size,0);
+  }finally{h.close();}
+});
+
+
+// Focused review: logical submission history, not just the latest HTTP attempt.
+async function historyQuestion(h, kind) {
+  h.state.handle=responseWith({...results[kind],...(results[kind].expiresAt?{expiresAt:new Date(h.wall+600000).toISOString()}: {})});
+  h.send("질문 준비");await h.settle();return h.messages().at(-1);
+}
+function historyNormal(url,init){
+  if(init.method==="POST") {
+    if(typeof init.body==="string")return Promise.resolve(json(status(JSON.parse(init.body).requestId),202));
+    const query=new URL(url).searchParams,idValue=query.get("requestId"),questionId=query.get("questionId");
+    return Promise.resolve(json({...status(idValue),transcript:"명시적 답변",input:{type:"text",text:"명시적 답변",...(questionId?{questionId}: {})}},202));
+  }
+  return Promise.resolve(json(done(url.split("/").pop())));
+}
+function historyAnswer(h,kind,message,props=h.find("ConversationList")){
+  if(kind==="need_more_info")h.send("명시적 새 답변");
+  else if(kind==="candidate_selection")props.onApiCandidateSelection(message.id,"opaque/1");
+  else props.onApiConfirmation(message.id,true);
+}
+for(const kind of ["need_more_info","candidate_selection","confirmation"])test(`review4 prior unconfirmed POST + retry storage not-sent keeps ${kind} protected`,async()=>{
+  const h=harness({nativeVoice:true});try{
+    const old=await historyQuestion(h,kind),captured=h.find("ConversationList");
+    h.state.handle=async(url,init)=>{if(init.method==="POST"){h.state.failStorage=true;throw Error("synthetic loss");}return voiceProblemResponse(404,"ASSISTANT_REQUEST_NOT_FOUND",url.split("/").pop());};
+    await recordVoice(h);assert.equal(voiceCalls(h).length,1);const requestId=new URL(voiceCalls(h)[0].url).searchParams.get("requestId");
+    assert.ok(await h.storage.read({serverId,requestId}));h.state.failStorage=false;h.state.handle=historyNormal;
+    const before=h.state.calls.filter(c=>c.init.method==="POST").length;
+    historyAnswer(h,kind,old,captured);historyAnswer(h,kind,old);h.find("MessageInput").onStartVoice();await h.settle();
+    assert.equal(h.state.calls.filter(c=>c.init.method==="POST").length,before);assert.equal(h.find("MessageInput").voiceDisabled,true);
+  }finally{h.close();}
+});
+for(const kind of ["need_more_info","candidate_selection","confirmation"])for(const fault of ["read","changed","missing"])test(`review4 initial ${fault} sends zero and preserves valid ${kind} answer`,async()=>{
+  const h=harness({nativeVoice:true});try{
+    const old=await historyQuestion(h,kind),f=h.state.nativeVoice;
+    f.native.beforeRead=count=>{if(count!==2)return;if(fault==="read")throw Error("synthetic read");if(fault==="changed")f.entries.get(f.managedUri).bytes[0]=0;else if(fault==="missing")f.entries.delete(f.managedUri);};
+    await recordVoice(h);assert.equal(voiceCalls(h).length,0);f.native.beforeRead=undefined;h.state.handle=historyNormal;
+    const before=h.state.calls.filter(c=>c.init.method==="POST").length;historyAnswer(h,kind,old);await h.settle();
+    assert.equal(h.state.calls.filter(c=>c.init.method==="POST").length,before+1);assert.equal(h.messages().at(-1).apiExecution.kind,"completed");
+  }finally{h.close();}
+});
+test("review4 retry file error says additional send stopped, original result remains unknown",async()=>{
+  const h=harness({nativeVoice:true});try{
+    await historyQuestion(h,"confirmation");h.state.handle=async(url,init)=>{if(init.method==="POST"){h.state.nativeVoice.entries.get(h.state.nativeVoice.managedUri).bytes[0]=0;throw Error("synthetic loss");}return voiceProblemResponse(404,"ASSISTANT_REQUEST_NOT_FOUND",url.split("/").pop());};
+    await recordVoice(h);assert.equal(voiceCalls(h).length,1);assert.ok(h.messages().at(-1).text.includes("원래 요청"));assert.equal(h.messages().at(-1).text.includes("검증하지 못해 전송하지 않았어요"),false);
+  }finally{h.close();}
+});
+for(const kind of ["need_more_info","candidate_selection","confirmation"])test(`review4 follow-up replay does not revive ${kind} on recovery`,async()=>{
+  const h=harness({nativeVoice:true});try{
+    const old=await historyQuestion(h,kind),oldRef=old.apiExecution.reference;h.state.handle=voiceResponse(h,results.outcome,{replay:true});
+    await recordVoice(h);const followup=h.messages().find(m=>m.apiExecution?.kind==="completed"&&m.apiExecution.reference.requestId!==oldRef.requestId).apiExecution;
+    assert.ok(await h.storage.read(oldRef));assert.equal(h.messages().filter(m=>m.role==="user").length,1);
+    h.remount();h.publishSnapshot(snapshotOf([old.apiExecution,followup]));h.state.handle=historyNormal;const count=h.state.calls.filter(c=>c.init.method==="POST").length;
+    historyAnswer(h,kind,old);h.find("MessageInput").onStartVoice();await h.settle();assert.equal(h.state.calls.filter(c=>c.init.method==="POST").length,count);assert.ok(await h.storage.read(oldRef));
+  }finally{h.close();}
+});
+
+
+for(const kind of ["need_more_info","candidate_selection","confirmation"])test(`review4 first metadata failure permits explicit ${kind} reuse`,async()=>{
+  const h=harness({nativeVoice:true});try{const old=await historyQuestion(h,kind);h.state.failStorage=true;await recordVoice(h);assert.equal(voiceCalls(h).length,0);
+    h.state.failStorage=false;h.state.handle=historyNormal;const count=h.state.calls.filter(c=>c.init.method==="POST").length;historyAnswer(h,kind,old);await h.settle();assert.equal(h.state.calls.filter(c=>c.init.method==="POST").length,count+1);
+  }finally{h.close();}
+});
+for(const kind of ["need_more_info","candidate_selection","confirmation"])for(const exit of ["blur","background"])test(`review4 cancel during first save ${kind}/${exit}: no dispatch, valid question reusable`,async()=>{
+  const h=harness({nativeVoice:true}),gate=deferred();try{
+    const old=await historyQuestion(h,kind);let saving=false;h.state.beforeWrite=async()=>{saving=true;await gate.promise;};
+    await recordVoice(h);assert.equal(saving,true);assert.equal(voiceCalls(h).length,0);
+    if(exit==="blur")h.blurVoice();else h.app("background");await h.settle();h.state.beforeWrite=null;gate.resolve();await h.settle();
+    if(exit==="blur")h.focusVoice();else h.app("active");await h.settle();h.state.handle=historyNormal;
+    const count=h.state.calls.filter(c=>c.init.method==="POST").length;historyAnswer(h,kind,old);await h.settle();assert.equal(h.state.calls.filter(c=>c.init.method==="POST").length,count+1);
+  }finally{gate.resolve();h.close();}
+});
+for(const code of ["SPEECH_NOT_RECOGNIZED","VOICE_ANSWER_UNCLEAR","STALE_QUESTION","QUESTION_EXPIRED","CONVERSATION_EXPIRED","CONVERSATION_BUSY","UNRESOLVED_UNCERTAIN"])test(`review4 retry ${code} cannot release first unconfirmed answer`,async()=>{
+  const h=harness({nativeVoice:true});try{const old=await historyQuestion(h,"confirmation"),captured=h.find("ConversationList");let posts=0;
+    h.state.handle=async(url,init)=>init.method==="POST"?(++posts===1?Promise.reject(Error("synthetic loss")):voiceProblemResponse(code.startsWith("SPEECH_")||code.startsWith("VOICE_")?422:409,code,new URL(url).searchParams.get("requestId"))):voiceProblemResponse(404,"ASSISTANT_REQUEST_NOT_FOUND",url.split("/").pop());
+    await recordVoice(h);await h.advance(120000);assert.equal(posts,2);const requestId=new URL(voiceCalls(h)[0].url).searchParams.get("requestId");assert.ok(await h.storage.read({serverId,requestId}));
+    h.state.handle=historyNormal;const count=h.state.calls.filter(c=>c.init.method==="POST").length;historyAnswer(h,"confirmation",old,captured);h.find("MessageInput").onStartVoice();await h.settle();assert.equal(h.state.calls.filter(c=>c.init.method==="POST").length,count);
+  }finally{h.close();}
+});
+test("review4 replay across a fresh runtime retains old metadata but cannot prove old info question active",async()=>{
+  const h=harness({nativeVoice:true});let next;try{
+    const old=await historyQuestion(h,"need_more_info");h.state.handle=voiceResponse(h,results.outcome,{replay:true});await recordVoice(h);
+    const followup=h.messages().find(m=>m.apiExecution?.kind==="completed"&&m.apiExecution.reference.requestId!==old.apiExecution.reference.requestId).apiExecution;
+    next=harness({nativeVoice:true,data:h.data,initialSnapshot:snapshotOf([old.apiExecution,followup])});next.state.handle=historyNormal;
+    next.send("중복 답변");next.find("MessageInput").onStartVoice();await next.settle();assert.equal(next.state.calls.length,0);assert.ok(await next.storage.read(old.apiExecution.reference));
+  }finally{h.close();next?.close();}
+});
+
+
+for(const kind of ["need_more_info","candidate_selection","confirmation"])for(const fault of ["failure","blur","background"])test(`review5 pre-session recovery.read ${kind}/${fault}: zero POST and explicit answer reusable`,async()=>{
+  const h=harness({nativeVoice:true}),gate=deferred();let read,writeCount=0,reached=false;try{
+    const old=await historyQuestion(h,kind);read=h.storage.read;h.state.beforeWrite=()=>{writeCount++;};
+    h.storage.read=async reference=>{reached=true;if(fault==="failure")throw new (h.source("src/services/storage/assistant-recovery.ts").AssistantRecoveryStorageError)("read");await gate.promise;return read(reference);};
+    await recordVoice(h);assert.equal(reached,true);assert.equal(voiceCalls(h).length,0);assert.equal(writeCount,0);
+    if(fault==="blur")h.blurVoice();else if(fault==="background")h.app("background");await h.settle();
+    h.storage.read=read;gate.resolve();await h.settle();if(fault==="blur")h.focusVoice();else if(fault==="background")h.app("active");await h.settle();
+    h.state.handle=historyNormal;const count=h.state.calls.filter(c=>c.init.method==="POST").length;historyAnswer(h,kind,old);await h.settle();assert.equal(h.state.calls.filter(c=>c.init.method==="POST").length,count+1);
+  }finally{if(read)h.storage.read=read;gate.resolve();h.close();}
+});
+async function explicitStaleResponse(requestId,activeRequestId,activeQuestionId){
+  const response=voiceProblemResponse(409,"STALE_QUESTION",requestId),body=JSON.parse(await response.text());
+  return {...response,text:async()=>JSON.stringify({...body,activeQuestionRequestId:activeRequestId,activeQuestionId})};
+}
+for(const kind of ["need_more_info","candidate_selection","confirmation"])test(`review5 unconfirmed voice + explicit STALE IDs ${kind}: GET does not reactivate`,async()=>{
+  const h=harness({nativeVoice:true});try{
+    const old=await historyQuestion(h,kind),oldRef=old.apiExecution.reference;const previousGets=h.state.calls.filter(c=>c.init.method==="GET"&&c.url.endsWith(oldRef.requestId)).length;let posts=0;
+    h.state.handle=async(url,init)=>init.method==="POST"?(++posts===1?Promise.reject(Error("synthetic loss")):explicitStaleResponse(new URL(url).searchParams.get("requestId"),oldRef.requestId,results[kind].questionId)):voiceProblemResponse(404,"ASSISTANT_REQUEST_NOT_FOUND",url.split("/").pop());
+    await recordVoice(h);await h.advance(120000);assert.equal(posts,2);assert.equal(h.state.calls.filter(c=>c.init.method==="GET"&&c.url.endsWith(oldRef.requestId)).length,previousGets);
+    const voiceId=new URL(voiceCalls(h)[0].url).searchParams.get("requestId");assert.ok(await h.storage.read({serverId,requestId:voiceId}));
+    h.state.handle=async()=>json(old.apiExecution.response.data);const checked=await h.delegate.queryRequestOnce(oldRef).completion;assert.equal(checked.kind,"completed");h.publishSnapshot(snapshotOf([checked]));
+    assert.equal(h.state.calls.filter(c=>c.init.method==="GET"&&c.url.endsWith(oldRef.requestId)).length,previousGets+1);
+    const count=h.state.calls.filter(c=>c.init.method==="POST").length;h.state.handle=historyNormal;historyAnswer(h,kind,old);h.find("MessageInput").onStartVoice();await h.settle();assert.equal(h.state.calls.filter(c=>c.init.method==="POST").length,count);assert.equal(h.find("MessageInput").voiceDisabled,true);
+  }finally{h.close();}
+});
+for(const kind of ["need_more_info","candidate_selection","confirmation"])test(`review5 first definite STALE ${kind}: existing active-question recovery remains valid`,async()=>{
+  const h=harness({nativeVoice:true});try{
+    await historyQuestion(h,"confirmation");h.state.handle=async(url,init)=>init.method==="POST"?explicitStaleResponse(new URL(url).searchParams.get("requestId"),id(640),id(340)):json(active7a(kind));
+    await recordVoice(h);assert.equal(voiceCalls(h).length,1);assert.equal(h.state.calls.filter(c=>c.init.method==="GET"&&c.url.endsWith(id(640))).length,1);
+    assert.equal(h.messages().find(m=>m.apiErrorRecovery)?.apiErrorRecovery.status,"restored");
+  }finally{h.close();}
+});
+
+for(const accepted of [false,true])test(`review5 late existing ID accepted=${accepted} overrides current zero-send proof`,async()=>{
+  const h=harness({nativeVoice:true}),gate=deferred();let read;try{
+    const old=await historyQuestion(h,"confirmation"),reference={serverId,requestId:id(730)};await h.storage.saveBeforePost(reference,h.wall);
+    if(accepted)await h.storage.recordResponse(reference,status(reference.requestId,"processing"));const original=await h.storage.read(reference);
+    h.state.uuidValue=reference.requestId;read=h.storage.read;h.storage.read=async ref=>{if(ref.requestId===reference.requestId)await gate.promise;return read(ref);};
+    await recordVoice(h);assert.equal(voiceCalls(h).length,0);h.app("background");await h.settle();h.storage.read=read;gate.resolve();await h.settle();h.app("active");h.state.uuidValue=null;h.state.handle=historyNormal;
+    const count=h.state.calls.filter(c=>c.init.method==="POST").length;historyAnswer(h,"confirmation",old);await h.settle();assert.equal(h.state.calls.filter(c=>c.init.method==="POST").length,count);assert.deepEqual(await h.storage.read(reference),original);
+  }finally{if(read)h.storage.read=read;gate.resolve();h.close();}
+});
+
+for (const check of ["resume", "handoff-ui"]) test("STEP36 accepted tab return " + check, async () => {
+  const h = harness({ actualLifecycle: true, nativeVoice: true });
+  const detach = h.attachLifecycle();
+  try {
+    await h.settle();
+    h.state.handle = (url, init) => init.method === "POST" ? voiceResponse(h)(url, init) : json(status(url.split("/").pop(), "processing"));
+    await recordVoice(h);
+    assert.equal(voiceCalls(h).length, 1);
+    assert.equal(h.messages().filter(m => m.role === "user").length, 1);
+    h.blurVoice();
+    await h.settle();
+    if (check === "handoff-ui") assert.doesNotMatch(textOf(h.renderConversation().footer), /로컬 복구 기록 수동 정리/);
+    h.state.handle = voiceResponse(h, results.need_more_info);
+    h.focusVoice();
+    await h.settle();
+    assert.equal(h.messages().at(-1).apiExecution?.response.data.result.kind, "need_more_info");
+    assert.equal(voiceCalls(h).length, 1);
+  } finally { h.close(); detach(); await h.settle(); }
+});
+
+test("STEP36 message to recovery footer spacing", async () => {
+  const h = harness();
+  try {
+    const control = { reference: recoveryRef(), resultConfirmable: false, expiryConfirmable: false };
+    const view = h.renderConversation([{ id: id(100), role: "user", text: "조회" }], { recoveryControls: [control] });
+    assert.match(textOf(view.footer), /로컬 복구 기록 수동 정리/);
+    assert.equal(nodes(view.footer, "View").some(node => uiStyle(node.props.style).height === 16), true);
+  } finally { h.close(); }
+});
+
+for (const boundary of ["release", "blur-again", "generation", "deadline"]) test("STEP36 pending lease " + boundary, async () => {
+  const h = harness({ actualLifecycle: true, nativeVoice: true });
+  const detach = h.attachLifecycle();
+  let lease;
+  try {
+    await h.settle();
+    const pending = (url, init) => init.method === "POST" ? voiceResponse(h)(url, init) : json(status(url.split("/").pop(), "processing"));
+    h.state.handle = pending;
+    await recordVoice(h);
+    const requestId = new URL(voiceCalls(h)[0].url).searchParams.get("requestId");
+    h.blurVoice(); await h.settle();
+    const ref = { serverId, requestId };
+    const first = (await h.storage.read(ref)).firstPostAttemptAt;
+    lease = h.source("src/services/api/assistant-request-recovery.ts").acquireAssistantRequestLease(ref);
+    assert.ok(lease);
+    const before = h.state.calls.length;
+    h.focusVoice(); h.app("active"); await h.settle();
+    h.send("duplicate"); h.find("MessageInput").onStartVoice(); await h.settle();
+    assert.equal(h.state.calls.length, before);
+    if (boundary === "blur-again") h.blurVoice();
+    if (boundary === "generation") h.switchMode("mock");
+    if (boundary === "deadline") await h.advance(120000);
+    if (boundary !== "deadline") h.state.handle = voiceResponse(h);
+    lease.release(); await h.settle();
+    if (boundary === "generation") { assert.equal(h.state.calls.length, before); return; }
+    if (boundary === "blur-again") {
+      assert.equal(h.state.calls.length, before);
+      h.focusVoice(); await h.settle();
+    }
+    assert.equal(h.state.calls.length, before + 1);
+    assert.equal(h.state.calls.at(-1).init.method, "GET");
+    assert.ok(h.state.calls.at(-1).url.endsWith(requestId));
+    assert.equal(voiceCalls(h).length, 1);
+    if (boundary === "deadline") {
+      await h.advance(4000);
+      assert.equal(h.state.calls.length, before + 1);
+      assert.equal((await h.storage.read(ref)).firstPostAttemptAt, first);
+    } else assert.equal(h.messages().filter(m => m.apiExecution?.response?.data.result?.kind === "outcome").length, 1);
+  } finally { lease?.release(); h.close(); detach(); await h.settle(); }
+});
+
+for (const textPending of [false, true]) test("STEP36 ordinary tab focus " + textPending, async () => {
+  const h = harness({ actualLifecycle: true }), gate = deferred();
+  const detach = h.attachLifecycle();
+  try {
+    await h.settle();
+    if (textPending) {
+      h.state.handle = (url, init) => init.method === "GET" ? gate.promise : json(status(JSON.parse(init.body).requestId), 202);
+      h.send("query"); await h.settle();
+    }
+    const before = h.state.calls.length;
+    h.blurVoice(); h.focusVoice(); await h.settle();
+    assert.equal(h.state.calls.length, before);
+    assert.equal(h.state.initializations, 1);
+    if (textPending) {
+      gate.resolve(json(done(h.state.calls.at(-1).url.split("/").pop()))); await h.settle();
+      assert.equal(h.messages().at(-1).apiExecution.kind, "completed");
+    }
+  } finally { gate.resolve(); h.close(); detach(); await h.settle(); }
+});
+
+for (const [label, rows, progress, phases, error, gaps] of [
+  ["confirming", true, false, ["confirming"], false, 1],
+  ["progress", true, true, [], false, 1],
+  ["empty", false, false, [undefined], false, 0],
+  ["multiple", true, true, [undefined, undefined], true, 4],
+  ["hidden", true, true, ["same"], false, 1],
+  ["storage", false, false, [undefined], true, 1],
+]) test("STEP36 footer " + label, async () => {
+  const h = harness();
+  try {
+    const messages = rows ? [{ id: id(100), serverId, role: "user", text: "query" }] : [];
+    const controls = phases.map((phase, index) => ({ reference: recoveryRef(id(phase === "same" ? 100 : 110 + index)), phase }));
+    const view = h.renderConversation(messages, { recoveryControls: controls, isProcessing: progress, recoveryStorageError: error });
+    assert.equal(nodes(view.footer, "View").filter(node => uiStyle(node.props.style).height === 16).length, gaps);
+    assert.equal(nodes(view.footer, "View").filter(node => uiStyle(node.props.style).marginTop === 16).length, 0);
+    assert.equal(nodes(view.footer, "View").filter(node => uiStyle(node.props.style).height === 32).length, 1);
+  } finally { h.close(); }
+});
+
+test("STEP36 stale manual confirmation after metadata advances", async () => {
+  const ref = recoveryRef(), h = harness({ data: cleanupData(ref) });
+  try {
+    await readyCleanup(h);
+    clickCleanup(h, ref.requestId, "manual"); await readyCleanup(h);
+    const confirm = cleanupButton(h, ref.requestId, "confirm-manual").props.onPress;
+    await h.storage.recordResponse(ref, status(ref.requestId, "processing"));
+    confirm(); await readyCleanup(h);
+    assert.equal((await h.storage.read(ref)).lastStatus, "processing");
+  } finally { h.close(); }
+});
+
+for (const event of ["focus", "app", "combined"]) test("STEP36 interrupted GET storage " + event, async () => {
+  const h = harness({ actualLifecycle: true, nativeVoice: true });
+  const detach = h.attachLifecycle(), gate = deferred();
+  try {
+    await h.settle();
+    h.state.handle = (url, init) => init.method === "POST" ? voiceResponse(h)(url, init) : json(status(url.split("/").pop(), "processing"));
+    await recordVoice(h);
+    const ref = recoveryRef(new URL(voiceCalls(h)[0].url).searchParams.get("requestId"));
+    let waiting = false;
+    h.state.beforeWrite = async () => { waiting = true; await gate.promise; };
+    await h.advance(2000);
+    assert.ok(waiting);
+    const count = h.state.calls.length;
+    if (event !== "app") h.blurVoice();
+    if (event !== "focus") h.app("inactive");
+    if (event !== "app") h.focusVoice();
+    if (event !== "focus") h.app("active");
+    h.app("active"); await h.settle();
+    assert.equal(h.state.calls.length, count);
+    h.state.beforeWrite = null; h.state.handle = voiceResponse(h);
+    gate.resolve(); await h.settle();
+    assert.equal(h.state.calls.length, count + 1);
+    assert.ok(h.state.calls.at(-1).url.endsWith(ref.requestId));
+    assert.equal(voiceCalls(h).length, 1);
+    assert.equal(h.messages().filter(m => m.apiExecution?.response?.data.result?.kind === "outcome").length, 1);
+  } finally { gate.resolve(); h.close(); detach(); await h.settle(); }
+});
+
+test("STEP36 opened confirmation expires when recovery takes ownership", async () => {
+  const ref = recoveryRef(), h = harness({ actualLifecycle: true, data: cleanupData(ref) });
+  h.state.handle = () => error7a("ASSISTANT_REQUEST_NOT_FOUND", 404);
+  const detach = h.attachLifecycle(), gate = deferred();
+  try {
+    await readyCleanup(h);
+    clickCleanup(h, ref.requestId, "manual"); await readyCleanup(h);
+    const old = cleanupButton(h, ref.requestId, "confirm-manual").props.onPress;
+    h.app("inactive"); await h.settle();
+    h.state.handle = () => gate.promise; h.app("active"); await h.settle();
+    old(); await readyCleanup(h);
+    assert.ok(await h.storage.read(ref));
+    assert.equal(h.state.manualCleanupCalls.length, 0);
+    gate.resolve(json(done(ref.requestId))); await readyCleanup(h);
+    assert.equal(h.messages().at(-1).apiExecution.kind, "completed");
+  } finally { gate.resolve(); h.close(); detach(); await h.settle(); }
+});
+
+for (const check of ["GET-only recovery", "recovery notice"]) test(`STEP36-4 first Voice 202 recordResponse pending blur/focus: ${check}`, async () => {
+  const h = harness({ actualLifecycle: true, nativeVoice: true });
+  const detach = h.attachLifecycle(), gate = deferred();
+  const recordResponse = h.storage.recordResponse;
+  const startVoiceRequest = h.delegate.startVoiceRequest;
+  const statusEvents = [];
+  let acceptanceRecord, waiting = false, stored = false;
+  h.storage.recordResponse = async (reference, response, options) => {
+    if (response.status === "accepted") acceptanceRecord = { reference, response };
+    const result = await recordResponse(reference, response, options);
+    stored = true;
+    return result;
+  };
+  h.delegate.startVoiceRequest = (payload, options) => startVoiceRequest(payload, {
+    ...options,
+    onUpdate(event) {
+      if (event.phase === "status") statusEvents.push(event);
+      options.onUpdate?.(event);
+    },
+  });
+  try {
+    await h.settle();
+    h.state.handle = voiceResponse(h, results.need_more_info);
+    h.state.beforeWrite = async () => {
+      if (acceptanceRecord && !stored) { waiting = true; await gate.promise; }
+    };
+    await recordVoice(h);
+    assert.equal(waiting, true, "the first accepted response is awaiting its actual storage write");
+    assert.equal(stored, false);
+    assert.equal(voiceCalls(h).length, 1);
+    const reference = recoveryRef(new URL(voiceCalls(h)[0].url).searchParams.get("requestId"));
+    assert.deepEqual(acceptanceRecord.reference, reference);
+    assert.equal(acceptanceRecord.response.status, "accepted");
+    const http = h.source("src/services/api/assistant.ts").assistantHttpClient;
+    assert.equal(http.hasAcceptanceEvidence(reference), true, "valid 202 has already established shared evidence");
+    assert.equal(statusEvents.length, 0, "screen status delivery has not happened");
+    assert.equal(h.messages().some(message => message.role === "user"), false);
+    assert.equal(h.state.calls.filter(call => call.init.method === "GET").length, 0);
+    const requests = h.source("src/services/api/assistant-request-recovery.ts");
+    assert.equal(requests.acquireAssistantRequestLease(reference), null, "the original request still owns its HTTP work");
+
+    h.blurVoice(); h.focusVoice(); await h.settle();
+    assert.equal(h.state.app, "active");
+    assert.equal(stored, false);
+    assert.equal(h.state.calls.length, 1);
+    h.state.beforeWrite = null;
+    gate.resolve(); await h.settle();
+    assert.equal(stored, true, "original acceptance storage responsibility completed");
+    const metadata = await h.storage.read(reference);
+    assert.equal(metadata.acceptConfirmed, true);
+    assert.equal(metadata.conversationId, acceptanceRecord.response.conversationId.toLowerCase());
+    await h.settle();
+    assert.equal(http.hasAcceptanceEvidence(reference), true);
+    assert.equal(statusEvents.length, 0, "the invalidated screen callback stays suppressed");
+    const released = requests.acquireAssistantRequestLease(reference);
+    assert.ok(released, "previous lease and HTTP work have ended before checking recovery");
+    released.release();
+    assert.equal(voiceCalls(h).length, 1);
+    assert.equal(h.state.nativeVoice.entries.size, 0, "the interrupted request released its native file");
+    assert.equal(h.state.calls.filter(call => call.init.method === "POST" && typeof call.init.body === "string").length, 0);
+    assert.ok(h.messages().filter(message => message.role === "user").length <= 1);
+    const completed = h.messages().filter(message => message.apiExecution?.kind === "completed");
+    assert.ok(completed.length <= 1);
+    assert.equal(h.state.app, "active");
+
+    if (check === "GET-only recovery") {
+      const gets = h.state.calls.filter(call => call.init.method === "GET");
+      assert.equal(gets.length, 1, "focus alone must resume the accepted original ID after storage and lease release");
+      assert.ok(gets[0].url.endsWith(`/assistant/requests/${reference.requestId}`));
+      assert.equal(completed.length, 1);
+      assert.equal(completed[0].apiExecution.response.data.result.kind, "need_more_info");
+      assert.equal(completed[0].apiExecution.response.data.result.questionId, results.need_more_info.questionId);
+    } else {
+      const view = h.renderConversation();
+      assert.doesNotMatch(textOf([view.rows, view.footer]), /이전 요청의 로컬 복구 기록이 남아 있어요\.|로컬 복구 기록 수동 정리/);
+    }
+  } finally {
+    h.state.beforeWrite = null; gate.resolve();
+    h.close(); detach(); await h.settle();
+    h.storage.recordResponse = recordResponse;
+    h.delegate.startVoiceRequest = startVoiceRequest;
+  }
+});
+
+test("STEP36-4 first pre-POST save pending blur/focus: metadata is not acceptance", async () => {
+  const h = harness({ actualLifecycle: true, nativeVoice: true });
+  const detach = h.attachLifecycle(), gate = deferred();
+  let waiting = false;
+  try {
+    await h.settle();
+    h.state.beforeWrite = async () => { waiting = true; await gate.promise; };
+    await recordVoice(h);
+    assert.equal(waiting, true);
+    assert.equal(h.state.starts.length, 1);
+    const reference = recoveryRef(h.state.starts[0][0].requestId);
+    const http = h.source("src/services/api/assistant.ts").assistantHttpClient;
+    assert.equal(http.hasAcceptanceEvidence(reference), false);
+    assert.equal(h.state.calls.length, 0);
+    h.blurVoice(); h.focusVoice(); await h.settle();
+    h.state.beforeWrite = null; gate.resolve(); await h.settle();
+    const metadata = await h.storage.read(reference);
+    assert.ok(metadata, "a saved pre-POST record can exist without acceptance");
+    assert.equal(metadata.acceptConfirmed, false);
+    assert.equal(http.hasAcceptanceEvidence(reference), false);
+    assert.equal(h.state.calls.length, 0);
+    assert.equal(h.state.app, "active");
+    assert.equal(h.messages().some(message => message.role === "user"), false);
+  } finally { h.state.beforeWrite = null; gate.resolve(); h.close(); detach(); await h.settle(); }
+});
+
+for (const boundary of ["completed", "previous-request", "same-id"]) test(`STEP36-4-A execution identity ${boundary}: no stale handoff`, async () => {
+  const h = harness({ actualLifecycle: true, nativeVoice: true });
+  const detach = h.attachLifecycle(), gate = deferred();
+  const deferRecovery = h.lifecycle.deferRecovery;
+  const handoffs = [];
+  h.lifecycle.deferRecovery = (...args) => { handoffs.push(args); return deferRecovery(...args); };
+  try {
+    await h.settle();
+    h.state.handle = voiceResponse(h);
+    await recordVoice(h);
+    const firstId = new URL(voiceCalls(h)[0].url).searchParams.get("requestId");
+    const http = h.source("src/services/api/assistant.ts").assistantHttpClient;
+    assert.equal(http.hasAcceptanceEvidence(recoveryRef(firstId)), true);
+    assert.equal(h.messages().at(-1).apiExecution.kind, "completed");
+    h.blurVoice(); h.focusVoice(); await h.settle();
+    assert.equal(handoffs.length, 0, "completed execution was cleared");
+    if (boundary !== "completed") {
+      if (boundary === "same-id") h.state.uuidValue = firstId;
+      let waiting = false;
+      h.state.beforeWrite = async () => { waiting = true; await gate.promise; };
+      await recordVoice(h);
+      const currentId = h.state.starts.at(-1)[0].requestId;
+      if (boundary === "previous-request") {
+        assert.equal(waiting, true);
+        assert.notEqual(currentId, firstId);
+        assert.equal(http.hasAcceptanceEvidence(recoveryRef(currentId)), false);
+      } else assert.equal(currentId, firstId);
+      h.blurVoice(); h.focusVoice(); await h.settle();
+      assert.equal(handoffs.length, 0, "earlier acceptance cannot grant this execution a handoff");
+      h.state.beforeWrite = null; gate.resolve(); await h.settle();
+    }
+    assert.equal(voiceCalls(h).length, 1);
+    assert.equal(h.state.calls.filter(call => call.init.method === "GET").length, 1);
+  } finally { h.state.beforeWrite = null; gate.resolve(); h.close(); detach(); await h.settle(); }
+});
+
+for (const boundary of ["generation", "server"]) test(`STEP36-4-A first acceptance storage ${boundary}: stale execution cannot hand off`, async () => {
+  const h = harness({ actualLifecycle: true, nativeVoice: true });
+  const detach = h.attachLifecycle(), gate = deferred();
+  const recordResponse = h.storage.recordResponse, deferRecovery = h.lifecycle.deferRecovery;
+  let accepting = false, waiting = false;
+  const handoffs = [];
+  h.storage.recordResponse = (...args) => { accepting = true; return recordResponse(...args); };
+  h.lifecycle.deferRecovery = (...args) => { handoffs.push(args); return deferRecovery(...args); };
+  try {
+    await h.settle();
+    h.state.handle = voiceResponse(h);
+    h.state.beforeWrite = async () => { if (accepting) { waiting = true; await gate.promise; } };
+    await recordVoice(h);
+    assert.equal(waiting, true);
+    const reference = recoveryRef(new URL(voiceCalls(h)[0].url).searchParams.get("requestId"));
+    assert.equal(h.source("src/services/api/assistant.ts").assistantHttpClient.hasAcceptanceEvidence(reference), true);
+    if (boundary === "generation") h.switchMode("mock");
+    else h.state.config = h.source("src/services/api/config.ts").parseDevelopmentServerConfig("https://other.example.invalid");
+    h.blurVoice(); h.focusVoice(); await h.settle();
+    h.state.beforeWrite = null; gate.resolve(); await h.settle();
+    assert.equal(handoffs.length, 0);
+    assert.equal(h.state.calls.length, 1);
+    assert.equal(h.messages().some(message => message.role === "user"), false);
+  } finally {
+    h.state.beforeWrite = null; gate.resolve(); h.close(); detach(); await h.settle();
+    h.storage.recordResponse = recordResponse;
+  }
+});
+
+for (const [nextAction, text, covered] of [
+  ["revise_input", "모델 응답이 잘못됐어요. 입력 내용을 수정한 뒤 다시 요청해 주세요.", true],
+  ["retry_later", "모델 처리에 실패했어요. 잠시 후 다시 요청해 주세요.", true],
+  ["none", "서버 오류가 발생했어요. 일정 목록에서 결과를 확인해 주세요.", true],
+  ["revise_input", "모델 응답을 처리하지 못했어요.", false],
+  ["retry_later", "모델 응답을 처리하지 못했어요.", false],
+  ["none", "서버 오류가 발생했어요.", false],
+  ["retry_later", "모델 처리에 실패했어요. 다시 요청해 주세요.", false],
+  ["revise_input", "모델 처리에 실패했어요. 다시 요청해 주세요.", false],
+  ["revise_input", "입력 내용을 수정했지만 모델 처리에 실패했어요.", false],
+  ["retry_later", "모델 처리에 실패했어요. 나중에 다시 요청하지 말아 주세요.", false],
+]) test("UX01 failure advice coverage " + nextAction + "/" + covered + "/" + text, async () => {
+  const h = harness();
+  const result = { kind: "failure", text, code: nextAction === "revise_input" ? "MODEL_OUTPUT_INVALID" : nextAction === "retry_later" ? "MODEL_TIMEOUT" : "INTERNAL_ERROR", nextAction };
+  h.state.handle = responseWith(result);
+  try {
+    h.send("조회"); await h.settle();
+    const rendered = textOf(h.renderConversation().rows);
+    assert.ok(rendered.includes(text));
+    assert.equal(rendered.includes("처리 실패"), !covered);
+    const advice = h.source("src/utils/assistant-errors.ts").assistantFailureAdvice(nextAction);
+    if (!covered) assert.ok(rendered.includes(advice));
+    else assert.equal(nodes(h.renderConversation().rows, "ThemedText").some(node => textOf(node) === advice), false);
+    assert.equal(postedBodies(h).length, 1);
+    assert.equal(h.messages().at(-1).apiExecution.response.data.result.kind, "failure");
+  } finally { h.close(); }
+});
+
+for (const kind of ["outcome", "failure"]) test("UX02 automatic displayed result cleanup is silent " + kind, async () => {
+  const h = harness(); h.state.handle = responseWith(results[kind]);
+  try {
+    h.send("조회"); await readyCleanup(h);
+    const message = h.messages().at(-1), execution = message.apiExecution;
+    const removed = await h.find("ConversationList").onResultDisplayed({
+      reference: execution.reference, messageId: message.id,
+      executionToken: JSON.stringify(execution), isCurrent: () => true,
+    });
+    await readyCleanup(h);
+    assert.equal(removed, true);
+    assert.equal(await h.storage.read(execution.reference), null);
+    const view = h.renderConversation();
+    assert.doesNotMatch(textOf([view.rows, view.footer]), /로컬 복구 기록을 정리했어요|이전 요청의 로컬 복구 기록이 남아/);
+    assert.ok(textOf(view.rows).includes(results[kind].text));
+    assert.equal(postedBodies(h).length, 1);
+  } finally { h.close(); }
+});
+
+for (const source of ["request", "recovery"]) test("UX03 single progress notice " + source, async () => {
+  const h = harness({ actualLifecycle: true });
+  let detach;
+  try {
+    if (source === "recovery") await h.storage.saveBeforePost(recoveryRef(), h.wall);
+    h.state.handle = (url, init) => init.method === "POST"
+      ? json(status(JSON.parse(init.body).requestId), 202)
+      : json(status(url.split("/").pop(), "processing"));
+    detach = h.attachLifecycle(); await h.settle();
+    if (source === "request") { h.send("조회"); await h.settle(); }
+    assert.equal(h.find("ConversationList").isProcessing, true);
+    const view = h.renderConversation(), rendered = textOf([view.rows, view.footer]);
+    assert.equal(rendered.split("일정을 확인하고 있어요...").length - 1, 1);
+    assert.doesNotMatch(rendered, /서버에서 요청을 처리하고 있어요/);
+    if (source === "recovery") assert.ok(h.messages().some(m => m.apiExecution?.kind === "observed"));
+  } finally { h.close(); detach?.(); await h.settle(); }
+});
+
+for (const change of ["restore", "same", "verify", "different"]) test("UX04 connection notice " + change, async () => {
+  const h = harness({ initialBaseUrl: change === "restore" ? null : origin });
+  try {
+    if (change !== "restore") { h.state.handle = responseWith(results.outcome); h.send("조회"); await h.settle(); }
+    const previousGeneration = h.mode.scheduleDataModeStore.getState().generation;
+    const config = h.source("src/services/api/config.ts");
+    h.state.config = config.parseDevelopmentServerConfig(change === "different" ? "https://other.example.invalid" : origin);
+    if (change !== "verify") h.mode.scheduleDataModeStore.getState().resetConnectionAuthority();
+    h.render(); await h.settle();
+    const notices = h.messages().filter(m => m.text === "서버 연결이 변경되어 이전 대화가 초기화되었어요.");
+    assert.equal(notices.length, change === "different" ? 1 : 0);
+    if (change !== "verify") {
+      assert.ok(h.mode.scheduleDataModeStore.getState().generation > previousGeneration);
+      assert.equal(h.messages().some(m => m.role === "user"), false);
+    }
+    h.render(); await h.settle();
+    assert.equal(h.messages().filter(m => m.text === "서버 연결이 변경되어 이전 대화가 초기화되었어요.").length, notices.length);
+  } finally { h.close(); }
+});
+
+test("UX02 accepted follow-up automatic cleanup is silent", async () => {
+  const h = harness();
+  try {
+    h.state.handle = responseWith(results.need_more_info); h.send("등록"); await readyCleanup(h);
+    const old = h.messages().at(-1).apiExecution.reference;
+    h.state.handle = responseWith(results.outcome); h.send("오후 3시"); await readyCleanup(h);
+    assert.equal(await h.storage.read(old), null);
+    assert.doesNotMatch(textOf(h.renderConversation().footer), /로컬 복구 기록을 정리했어요|이전 요청의 로컬 복구 기록이 남아/);
+    assert.equal(postedBodies(h).length, 2);
+  } finally { h.close(); }
+});
+
+for (const different of [false, true]) test("UX04 disconnected server restoration " + different, async () => {
+  const h = harness();
+  try {
+    assert.equal(h.messages().some(m => m.text === "서버 연결이 변경되어 이전 대화가 초기화되었어요."), false);
+    const config = h.source("src/services/api/config.ts"), mode = h.mode.scheduleDataModeStore;
+    h.state.config = config.parseDevelopmentServerConfig(null);
+    mode.getState().resetConnectionAuthority(); h.render(); await h.settle();
+    h.state.config = config.parseDevelopmentServerConfig(different ? "https://other.example.invalid" : origin);
+    mode.getState().resetConnectionAuthority(); h.render(); await h.settle();
+    assert.equal(h.messages().filter(m => m.text === "서버 연결이 변경되어 이전 대화가 초기화되었어요.").length, different ? 1 : 0);
+    assert.equal(h.state.calls.length, 0);
+  } finally { h.close(); }
+});
+
+for (const [label, text, covered] of [
+  ["Pi response", "입력을 이해하지 못했어요. 내용을 확인해 다시 말씀해 주세요.", true],
+  ["missing reason", "내용을 확인해 다시 말씀해 주세요.", false],
+  ["missing action", "입력을 이해하지 못했어요.", false],
+  ["negative action", "입력을 이해하지 못했어요. 내용을 확인해 다시 말씀하지 말아 주세요.", false],
+]) test(`STEP36-8 revise_input ${label}: required advice coverage`, async () => {
+  const h = harness();
+  const result = { kind: "failure", code: "MODEL_OUTPUT_INVALID", nextAction: "revise_input", text };
+  h.state.handle = responseWith(result);
+  try {
+    h.send("조회"); await h.settle();
+    const rendered = textOf(h.renderConversation().rows);
+    assert.equal(rendered.split(text).length - 1, 1, "server text is displayed once verbatim");
+    assert.equal(rendered.includes("처리 실패"), !covered);
+    assert.equal(rendered.includes("입력 내용을 수정한 뒤 다시 요청해 주세요."), !covered);
+    assert.deepEqual(h.messages().at(-1).apiExecution.response.data.result, result);
+    assert.equal(postedBodies(h).length, 1);
   } finally { h.close(); }
 });

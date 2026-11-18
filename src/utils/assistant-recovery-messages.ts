@@ -35,8 +35,11 @@ export function upsertAssistantExecutionMessage(messages: ConversationMessage[],
   const error = getAssistantExecutionError(execution);
   const text = execution.kind === "completed" ? execution.response.data.result.text
     : execution.kind === "observed" ? "서버에서 요청을 처리하고 있어요."
+    : execution.reason === "file" ? execution.voiceTransmission?.state === "not-sent"
+      ? "녹음 파일을 읽거나 검증하지 못해 전송하지 않았어요. 다시 녹음해 주세요."
+      : "녹음 파일을 읽거나 검증하지 못해 추가 전송하지 않았어요. 원래 요청의 결과 확인이 필요해요."
     : execution.reason === "deadline" ? "자동 확인 시간이 끝났어요. 요청 결과는 아직 확인이 필요해요."
-    : history ? history.response.data.result.text : error ? assistantHttpErrorNotice(error)
+    : history ? history.response.data.result.text : error ? assistantHttpErrorNotice(error, execution.inputSource === "voice")
     : "요청 결과를 확인하지 못했어요. 원래 요청의 확인이 필요해요.";
   const next: ConversationMessage = { ...(previous?.role === "assistant" && previous.apiErrorRecovery ? { apiErrorRecovery: previous.apiErrorRecovery } : {}),
     id: previous?.id ?? (source === "request" ? `assistant-${execution.reference.requestId}` : `assistant-recovery-${JSON.stringify([

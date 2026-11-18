@@ -27,6 +27,7 @@ export type AssistantRecoveryResponse = AssistantRequestAcceptedResponse | Assis
 // next-input-accepted는 새 입력 POST의 200/202 확인이며 GET 응답이 아니다.
 // 해당 DTO는 메모리에서만 검증하고 저장하지 않는다.
 export type AssistantRecoveryCleanupEvidence =
+  | { type: "voice-rejected"; requestId: string; firstPostAttemptAt: number; lastPostAttemptAt: number; httpStatus: number; code: string }
   | { type: "result-displayed" }
   | { type: "question-inactive-confirmed"; reason: "answered" | "cancelled" | "expired" | "not_active" }
   | { type: "next-input-accepted"; httpStatus: 200 | 202;

@@ -26,7 +26,7 @@ const settle=async()=>{for(let n=0;n<300;n++)await Promise.resolve();};
 async function until(predicate){for(let n=0;n<500&&!predicate();n++)await Promise.resolve();assert.ok(predicate(),"예상 비동기 지점 도달");}
 
 // 실제 API·복구·저장 계층을 로드하고 native AppState·fetch·storage·timer만 대체한다.
-function harness({data=new Map()}={}){
+function harness({data=new Map(),readOnly=false}={}){
   const cache=new Map(),timers=new Map(),appListeners=new Set();let wall=1000,mono=0,timerId=0,writes=0;
   const state={calls:[],events:[],app:"active",config:null,failRead:false,failWriteAt:0,beforeRead:null,beforeWrite:null,cleanup:0,
     handle:async(url,init)=>init.method==="POST"?json({...status(),requestId:JSON.parse(init.body).requestId},202):json(completed("outcome",parseInt(url.split("/").pop().slice(0,8),16)))};
@@ -46,7 +46,7 @@ function harness({data=new Map()}={}){
     const module={exports:{}};cache.set(file,module);
     const code=ts.transpileModule(fs.readFileSync(file,"utf8"),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022},fileName:file}).outputText;
     new Function("require","module","exports","fetch","setTimeout","clearTimeout","performance","process",code)(load,module,module.exports,
-      ()=>{throw Error("실제 네트워크 금지");},setTimer,clearTimer,{now:()=>mono},{env:{EXPO_PUBLIC_DEV_SERVER_BASE_URL:origin}});
+      ()=>{throw Error("실제 네트워크 금지");},setTimer,clearTimer,{now:()=>mono},{env:{EXPO_PUBLIC_DEV_SERVER_BASE_URL:origin,EXPO_PUBLIC_SCHEDULE_READ_ONLY:String(readOnly)}});
     return module.exports;
   }
   const config=load("@/services/api/config");state.config=config.parseDevelopmentServerConfig(origin);
@@ -63,7 +63,7 @@ function harness({data=new Map()}={}){
       wall+=next-mono;mono=next;for(const[token,timer]of[...timers])if(timer.at<=mono){timers.delete(token);timer.fn();}await settle();}
     wall+=target-mono;mono=target;await settle();
   }
-  return{state,data,storage,http,requests,recoveryApi,mode,service,create,config,timers,appListeners,advance,
+  return{load,setTimer,clearTimer,state,data,storage,http,requests,recoveryApi,mode,service,create,config,timers,appListeners,advance,
     get wall(){return wall;},set wall(value){wall=value;},get mono(){return mono;},
     app(value){state.app=value;for(const listener of [...appListeners])listener(value);},
     start:(input=request(),options={})=>service.startRequest(input,{expectedServerId:serverId,onUpdate:event=>state.events.push(event),...options}),
@@ -324,4 +324,260 @@ test("초기 복구 목록 읽기 중 시계가 돌아가도 이미 경과한 �
   const h=harness();await h.seed(0);h.wall=119000;const gate=deferred();h.state.beforeRead=()=>gate.promise;h.state.handle=async()=>json(status());
   const pending=h.service.initializeRecovery();await h.advance(2000);h.wall-=100000;gate.resolve();const initialized=await pending;
   assert.equal((await initialized.requests[0].task.completion).reason,"deadline");assert.deepEqual(h.methods(),["GET"]);
+});
+
+
+// Stage 3: real recorder controller + Expo file store + owner + Voice API + common recovery/orchestrator.
+async function voiceJob(h, { n = 1, question, canSend = () => true } = {}) {
+  const { fileAdapter } = require("./helpers/voice-native.cjs");
+  const { voiceSource, wavBytes } = require("./helpers/local-voice.cjs");
+  const f = fileAdapter(), deps = f.api.createExpoVoiceDependencies(() => true);
+  deps.setTimer = h.setTimer; deps.clearTimer = h.clearTimer;
+  const recorder = voiceSource("src/services/local-voice-recording.ts").createLocalVoiceRecording(deps);
+  recorder.focus(true); await recorder.start(); await recorder.stop();
+  const owner = recorder.handoff(recorder.getSnapshot().file);
+  assert.ok(owner); assert.equal(recorder.handoff(recorder.getSnapshot().file), null);
+  const api = h.load("@/services/api/voice").createVoiceHttpClient({ assistant: h.http });
+  const payload = h.load("@/services/assistant-voice-payload").createAssistantVoicePayload(owner,
+    { requestId: id(n), ...(question ?? {}) }, canSend, api);
+  return { f, recorder, owner, payload, bytes: wavBytes(),
+    start: () => h.service.startVoiceRequest(payload, { expectedServerId: serverId, onUpdate: event => h.state.events.push(event) }) };
+}
+const voiceAccepted = (n = 1, input = { type: "text", text: "일정 보여줘" }) => ({ ...status("accepted", n), transcript: "일정 보여줘", input });
+
+for (const kind of Object.keys(results)) test(`3 voice owner→raw API→common mapper ${kind}`, async () => {
+  const h = harness(), v = await voiceJob(h);
+  h.state.handle = async (url, init) => {
+    assert.ok(await h.storage.read(ref()));
+    return init.method === "POST" ? json(voiceAccepted(), 202) : json(completed(kind));
+  };
+  assert.equal((await v.start().completion).kind, "completed"); await settle();
+  assert.deepEqual(h.methods(), ["POST", "GET"]);
+  const post = h.state.calls[0]; assert.equal(post.url, `${origin}/api/v1/voice/requests?requestId=${id(1)}`);
+  assert.deepEqual(post.init.body, v.bytes); assert.equal(post.init.headers["Content-Type"], "audio/wav"); assert.equal(post.init.redirect, "error");
+  assert.ok(h.state.calls.every(call => !call.url.endsWith("/assistant/requests") && !call.url.endsWith("/speech")));
+  assert.equal(h.state.events.filter(e => e.acceptance).length, 1);
+  assert.deepEqual(h.state.events.at(-1).response.data.result, results[kind]);
+  assert.equal(v.owner.getState().deleted, true); assert.equal(v.f.entries.size, 0);
+  const persisted = JSON.stringify([...h.data.values()]); assert.ok(!persisted.includes("transcript")); assert.ok(!persisted.includes("PCM"));
+});
+
+for (const type of ["text", "selection", "confirmation"]) test(`3 voice follow-up ${type}: correlated query and structured acceptance`, async () => {
+  const h = harness(), v = await voiceJob(h, { question: { conversationId: id(100), questionId: id(300) } });
+  const input = type === "text" ? { type, questionId: id(300), text: "내일" } : type === "selection" ? { type, questionId: id(300), candidateId: "opaque/1" } : { type, questionId: id(300), approved: false };
+  h.state.handle = async (url, init) => init.method === "POST" ? json(voiceAccepted(1, input), 202) : json(completed());
+  assert.equal((await v.start().completion).kind, "completed");
+  assert.equal(h.state.calls[0].url, `${origin}/api/v1/voice/requests?requestId=${id(1)}&conversationId=${id(100)}&questionId=${id(300)}`);
+  assert.deepEqual(h.state.events.find(e => e.acceptance).acceptance.input, input);
+});
+
+for (const failure of ["network", "timeout", "malformed"]) test(`3 voice ${failure} → exact404 → one identical WAV resend → GET-only`, async () => {
+  const h = harness(), v = await voiceJob(h); let posts = 0, gets = 0;
+  h.state.handle = async (url, init) => {
+    if (init.method === "POST") { posts++; if (posts === 1) { if (failure === "network") throw Error("synthetic"); if (failure === "timeout") return new Promise(() => {}); return json({}, 202); } return json(voiceAccepted(), 202); }
+    gets++; return gets === 1 ? problem() : json(completed());
+  };
+  const task = v.start(); await settle(); if (failure === "timeout") await h.advance(35000);
+  assert.equal((await task.completion).kind, "completed");
+  assert.deepEqual(h.methods(), ["POST", "GET", "POST", "GET"]);
+  assert.equal(h.state.calls[0].url, h.state.calls[2].url); assert.deepEqual(h.state.calls[0].init.body, h.state.calls[2].init.body);
+  assert.equal((await h.storage.read(ref())).firstPostAttemptAt, 1000);
+  assert.equal(v.owner.getState().deleted, true);
+});
+
+test("3 VOICE_BUSY waits after response 2s then GET-first, no immediate POST", async () => {
+  const h = harness(), v = await voiceJob(h); let posts = 0;
+  h.state.handle = async (url, init) => init.method === "POST" && ++posts === 1 ? problem(409, "VOICE_BUSY") : init.method === "POST" ? json(voiceAccepted(), 202) : posts === 1 ? problem() : json(completed());
+  const task = v.start(); await settle(); assert.deepEqual(h.methods(), ["POST"]);
+  await h.advance(1999); assert.equal(h.state.calls.length, 1); await h.advance(1);
+  assert.equal((await task.completion).kind, "completed"); assert.deepEqual(h.methods(), ["POST", "GET", "POST", "GET"]); assert.equal(h.state.calls[1].at, 2000);
+});
+
+for (const failure of ["network", "timeout", "partial", "replay"]) test(`3 ${failure}: observed acceptance prevents additional POST`, async () => {
+  const h = harness(), v = await voiceJob(h);
+  h.state.handle = async (url, init) => {
+    if (init.method === "GET") return json(completed());
+    if (failure === "network") throw Error("synthetic");
+    if (failure === "timeout") return new Promise(() => {});
+    return failure === "replay" ? json(status("processing")) : json({ ...status(), transcript: 1 }, 202);
+  };
+  const task = v.start(); await settle(); if (failure === "timeout") await h.advance(35000);
+  assert.equal((await task.completion).kind, "completed"); assert.deepEqual(h.methods(), ["POST", "GET"]);
+  assert.equal(h.state.events.filter(e => e.acceptance).length, 0); assert.equal(v.owner.getState().deleted, true);
+});
+
+for (const error of ["plain404", "ROUTE_NOT_FOUND", "VOICE_UNAVAILABLE", "REQUEST_ID_CONFLICT", "general500"]) test(`3 ${error}: GET-only, original metadata retained`, async () => {
+  const h = harness(), v = await voiceJob(h);
+  h.state.handle = async (url, init) => init.method === "POST" ? (error === "VOICE_UNAVAILABLE" ? problem(503, error) : error === "REQUEST_ID_CONFLICT" ? problem(409, error) : error === "general500" ? problem(500,"INTERNAL_ERROR") : Promise.reject(Error("synthetic"))) :
+    error === "plain404" ? { ...json({},404), headers:new Headers({"Content-Type":"application/json"}) } : problem(404,"ROUTE_NOT_FOUND");
+  const task = v.start(); await settle(); await h.advance(120000);
+  assert.equal((await task.completion).reason, "deadline"); assert.equal(h.methods().filter(x => x === "POST").length, 1);
+  assert.ok(await h.storage.read(ref())); assert.equal(h.state.cleanup, 0); assert.equal(v.owner.getState().deleted,true);
+});
+
+test("3 resend response lost: never third POST; first deadline unchanged", async () => {
+  const h=harness(),v=await voiceJob(h); h.state.handle=async(url,init)=>init.method==="POST"?Promise.reject(Error("synthetic")):problem();
+  const task=v.start();await settle();assert.equal(h.methods().filter(x=>x==="POST").length,2);
+  await h.advance(120000);assert.equal((await task.completion).reason,"deadline");assert.equal(h.methods().filter(x=>x==="POST").length,2);
+  assert.equal((await h.storage.read(ref())).firstPostAttemptAt,1000);assert.equal(v.owner.getState().deleted,true);
+});
+
+for(const failure of ["before-save","saved-abort","authority","read","changed","missing"]) test(`3 preflight ${failure}: POST zero, owner responsibility settles`, async()=>{
+  const h=harness(),v=await voiceJob(h);const gate=deferred();let valid=true;
+  if(failure==="before-save")h.state.failWriteAt=1;
+  if(failure==="saved-abort")h.state.beforeWrite=()=>gate.promise;
+  if(failure==="authority") { v.payload=h.load("@/services/assistant-voice-payload").createAssistantVoicePayload(v.owner,{requestId:id(1)},()=>valid,h.load("@/services/api/voice").createVoiceHttpClient({assistant:h.http})); valid=false; }
+  if(failure==="read")v.f.native.readFails=true;
+  if(failure==="changed")v.f.entries.get(v.f.managedUri).bytes[0]=0;
+  if(failure==="missing")v.f.entries.delete(v.f.managedUri);
+  const task=h.service.startVoiceRequest(v.payload,{expectedServerId:serverId});await settle();
+  if(failure==="saved-abort"){task.cancel();gate.resolve();}
+  await task.completion;await settle();assert.equal(h.state.calls.length,0);assert.equal(v.owner.getState().activeUses,0);
+  assert.equal(v.owner.getState().deleted,true);
+});
+
+for(const exit of ["background","A-B-A","abort"]) test(`3 ${exit} during HTTP body: no late UI; live use released and retry discarded`,async()=>{
+  const h=harness(),v=await voiceJob(h),gate=deferred();h.state.handle=async()=>({...json(voiceAccepted(),202),text:()=>gate.promise});
+  const task=v.start();await until(()=>h.state.calls.length===1);await settle();
+  assert.equal(v.owner.getState().activeUses,1);v.recorder.discard();assert.equal(v.f.entries.has(v.f.managedUri),true);
+  if(exit==="background")h.app("background");else if(exit==="abort")task.cancel();else{h.mode.getState().setMode("mock");h.mode.getState().setMode("server");}
+  assert.equal((await task.completion).kind,"needs-attention");const updates=h.state.events.length;gate.resolve(JSON.stringify(voiceAccepted()));await settle();
+  assert.equal(h.state.events.length,updates);assert.equal(v.owner.getState().deleted,true);assert.equal(h.methods().filter(x=>x==="POST").length,1);
+});
+
+test("3 cleanup fails after success: runtime handle retries across next lifecycle",async()=>{
+  const h=harness(),v=await voiceJob(h);v.f.native.deleteFails=true;h.state.handle=async(url,init)=>init.method==="POST"?json(voiceAccepted(),202):json(completed());
+  assert.equal((await v.start().completion).kind,"completed");await settle();assert.equal(v.owner.getState().cleanupFailed,true);assert.equal(v.owner.getState().deleted,false);
+  v.f.native.deleteFails=false;await h.load("@/services/assistant-voice-payload").retryVoiceFileCleanup();assert.equal(v.owner.getState().deleted,true);assert.equal(v.f.entries.size,0);
+});
+
+for(const [statusCode,code] of [[422,"SPEECH_NOT_RECOGNIZED"],[422,"VOICE_ANSWER_UNCLEAR"],[422,"AUDIO_UNSUPPORTED"],[413,"REQUEST_BODY_TOO_LARGE"],[400,"MALFORMED_REQUEST"],[409,"STALE_QUESTION"],[409,"QUESTION_EXPIRED"],[409,"CONVERSATION_BUSY"],[409,"UNRESOLVED_UNCERTAIN"]]) test(`3 correlated first rejection ${code}: narrow serialized cleanup`,async()=>{
+  const h=harness(),v=await voiceJob(h);h.state.handle=async()=>problem(statusCode,code);
+  const result=await v.start().completion;assert.equal(result.kind,"needs-attention");assert.equal(result.recoveryResult.definitiveRejection,true);assert.equal(await h.storage.read(ref()),null);
+  assert.deepEqual(h.methods(),["POST"]);assert.equal(v.owner.getState().deleted,true);
+});
+
+for(const variant of ["missing-logical-id","wrong-status","acceptance-race","cleanup-write-fails"]) test(`3 rejection ${variant}: never grants cleanup authority`,async()=>{
+  const h=harness(),v=await voiceJob(h);h.state.handle=async(url,init)=>{
+    if(init.method==="GET")return json(completed());
+    if(variant==="acceptance-race")h.http.exchange.noteAcceptance(ref());
+    if(variant==="cleanup-write-fails")h.state.failWriteAt=2;
+    return problem(variant==="wrong-status"?400:422,"SPEECH_NOT_RECOGNIZED",variant==="missing-logical-id"?{assistantRequestId:undefined}:{});
+  };
+  const result=await v.start().completion;assert.notEqual(result.recoveryResult?.definitiveRejection,true);assert.ok(await h.storage.read(ref()));assert.equal(h.methods().filter(x=>x==="POST").length,1);
+});
+
+test("3 GET acceptance persisted update fails: memory evidence still forbids resend",async()=>{
+  const h=harness(),v=await voiceJob(h);h.state.failWriteAt=2;h.state.handle=async(url,init)=>init.method==="POST"?json(voiceAccepted(),202):json(completed());
+  assert.equal((await v.start().completion).kind,"completed");assert.equal(h.http.hasAcceptanceEvidence(ref()),true);assert.equal(h.methods().filter(x=>x==="POST").length,1);
+});
+
+
+for(const elapsed of [119999,120000,120001])test(`3 exact retry deadline ${elapsed} ms`,async()=>{
+  const h=harness(),v=await voiceJob(h),gate=deferred();let posts=0;
+  h.state.handle=async(url,init)=>{if(init.method==="POST"){posts++;if(posts===1)throw Error("synthetic");return json(voiceAccepted(),202);}return posts===1?gate.promise:json(completed());};
+  const task=v.start();await until(()=>h.state.calls.length===2);h.wall=1000+elapsed;gate.resolve(problem());await settle();
+  if(elapsed<120000){assert.equal((await task.completion).kind,"completed");assert.equal(posts,2);}else{assert.equal((await task.completion).reason,"deadline");assert.equal(posts,1);}assert.equal(v.owner.getState().deleted,true);
+});
+
+for(const invalidate of ["authority","acceptance","deadline"])test(`3 retry storage barrier ${invalidate}: second POST blocked`,async()=>{
+  const h=harness();let current=true;const v=await voiceJob(h,{canSend:()=>current}),gate=deferred();
+  h.state.handle=async(url,init)=>init.method==="POST"?Promise.reject(Error("synthetic")):problem();
+  h.state.beforeWrite=count=>count===2?gate.promise:Promise.resolve();const task=v.start();await until(()=>h.state.calls.length===2);await settle();
+  if(invalidate==="authority")current=false;else if(invalidate==="acceptance")h.http.exchange.noteAcceptance(ref());else h.wall=121000;
+  gate.resolve();await settle();if(invalidate!=="deadline")await h.advance(120000);
+  assert.equal((await task.completion).kind,"needs-attention");assert.equal(h.methods().filter(x=>x==="POST").length,1);assert.ok(await h.storage.read(ref()));
+});
+
+test("3 retry rejection never erases an earlier unconfirmed attempt",async()=>{
+  const h=harness(),v=await voiceJob(h);let posts=0;
+  h.state.handle=async(url,init)=>init.method==="GET"?problem():++posts===1?Promise.reject(Error("synthetic")):problem(422,"SPEECH_NOT_RECOGNIZED");
+  const task=v.start();await settle();await h.advance(120000);const result=await task.completion;
+  assert.notEqual(result.recoveryResult.definitiveRejection,true);assert.equal(posts,2);assert.ok(await h.storage.read(ref()));
+});
+
+for(const boundary of ["same-client","second-client","different-id"])test(`3 shared admission ${boundary}`,async()=>{
+  const h=harness(),a=await voiceJob(h),b=await voiceJob(h,{n:boundary==="different-id"?2:1}),gate=deferred();
+  h.state.handle=async(url,init)=>init.method==="POST"?gate.promise:json(completed("outcome",parseInt(url.split("/").pop().slice(0,8),16)));
+  const first=a.start();await until(()=>h.state.calls.length===1);
+  const service=boundary==="same-client"?h.service:h.create();const second=service.startVoiceRequest(b.payload,{expectedServerId:serverId});await settle();
+  assert.equal(h.methods().filter(x=>x==="POST").length,boundary==="different-id"?2:1);
+  if(boundary!=="different-id")assert.equal((await second.completion).reason,"busy");
+  gate.resolve(json(voiceAccepted(),202));await first.completion;if(boundary==="different-id"){await h.advance(120000);await second.completion;}
+  await settle();assert.equal(a.owner.getState().deleted,true);assert.equal(b.owner.getState().deleted,true);
+});
+
+for(const mode of ["mock","read-only"])test(`3 transport ${mode}: no business HTTP`,async()=>{
+  const h=harness({readOnly:mode==="read-only"}),v=await voiceJob(h);if(mode==="mock")h.mode.getState().setMode("mock");
+  await v.start().completion;assert.equal(h.state.calls.length,0);assert.equal(v.owner.getState().deleted,true);
+});
+
+
+test("3 voice accepted/processing/completed uses response-relative 2s shared polling",async()=>{
+  const h=harness(),v=await voiceJob(h);let gets=0;h.state.handle=async(url,init)=>init.method==="POST"?json(voiceAccepted(),202):json(++gets===1?status():gets===2?status("processing"):completed());
+  const task=v.start();assert.equal((await task.initial).kind,"observed");await h.advance(1999);assert.equal(gets,1);await h.advance(1);assert.equal(gets,2);await h.advance(2000);assert.equal((await task.completion).kind,"completed");assert.deepEqual(h.state.calls.filter(c=>c.init.method==="GET").map(c=>c.at),[0,2000,4000]);assert.equal(h.state.events.filter(e=>e.acceptance).length,1);
+});
+
+
+for(const firstGet of ["network","timeout"])test(`3 uncertain first GET ${firstGet} then exact404 still permits one eligible resend`,async()=>{
+  const h=harness(),v=await voiceJob(h);let posts=0,gets=0;
+  h.state.handle=async(url,init)=>{if(init.method==="POST"){if(++posts===1)throw Error("synthetic");return json(voiceAccepted(),202);}if(++gets===1){if(firstGet==="network")throw Error("synthetic");return new Promise(()=>{});}return gets===2?problem():json(completed());};
+  const task=v.start();try{await settle();if(firstGet==="timeout")await h.advance(5000);await h.advance(2000);assert.equal(posts,2);await h.advance(2000);assert.equal((await task.completion).kind,"completed");assert.equal(posts,2);assert.deepEqual(h.state.calls.filter(c=>c.init.method==="POST").map(c=>c.init.body),[v.bytes,v.bytes]);}finally{task.cancel();}
+});
+
+
+test("3 changed original before retry blocks second POST and reports local file failure",async()=>{
+  const h=harness(),v=await voiceJob(h);h.state.handle=async(url,init)=>{if(init.method==="POST"){v.f.entries.get(v.f.managedUri).bytes[0]=0;throw Error("synthetic");}return problem();};
+  const result=await v.start().completion;assert.equal(result.reason,"file");assert.deepEqual(h.methods(),["POST","GET"]);assert.ok(await h.storage.read(ref()));assert.equal(v.owner.getState().deleted,true);
+});
+
+
+for(const state of ["not-sent","unconfirmed","rejected","accepted","missing"])test(`review4 logical ${state} dominates latest not-sent attempt`,async()=>{
+  const h=harness(),context=h.load("@/utils/assistant-text-question").createAssistantTextQuestionContext(serverId,0),token=Symbol();
+  context.beginRequest(id(1));context.observeResponse(completed("confirmation"),"request");const question=context.getConfirmationQuestion(1000);
+  context.beginRequest(id(2),question,undefined,undefined,token);
+  const execution={kind:"needs-attention",reason:"storage",inputSource:"voice",reference:ref(2),...(state==="missing"?{}:{voiceTransmission:{postCount:state==="not-sent"?0:1,state}}),recoveryResult:{kind:"unconfirmed",reference:ref(2),reason:"storage",retransmitted:false,postResult:h.http.exchange.failure({operation:"post",serverId,assistantRequestId:id(2)},"storage")}};
+  context.observeExecution(execution,"request",question);assert.equal(!!context.getConfirmationQuestion(1000),state==="not-sent"||state==="rejected");
+});
+test("review4 dispatch counter is zero through save, one at transport, and acceptance survives GET error",async()=>{
+  const h=harness(),v=await voiceJob(h),save=deferred(),body=deferred();h.state.beforeWrite=count=>count===1?save.promise:Promise.resolve();
+  h.state.handle=async()=>({...json(voiceAccepted(),202),text:()=>body.promise});const task=v.start();await settle();assert.equal(task.getVoiceTransmission().state,"not-sent");assert.equal(task.getVoiceTransmission().postCount,0);
+  save.resolve();await until(()=>h.state.calls.length===1);assert.deepEqual(task.getVoiceTransmission(),{state:"unconfirmed",postCount:1});await h.advance(35000);
+  task.cancel();await task.completion;body.resolve(JSON.stringify(voiceAccepted()));await settle();assert.equal(task.getVoiceTransmission().state,"accepted");assert.equal(task.getVoiceTransmission().postCount,1);assert.equal(v.owner.getState().deleted,true);
+});
+test("review4 old interruption token cannot clear another pending voice question hold",async()=>{
+  const h=harness(),context=h.load("@/utils/assistant-text-question").createAssistantTextQuestionContext(serverId,0),old=Symbol(),current=Symbol();
+  context.beginRequest(id(1));context.observeResponse(completed("confirmation"),"request");const question=context.getConfirmationQuestion(1000);
+  context.beginRequest(id(2),question,undefined,undefined,old);context.beginRequest(id(3),question,undefined,undefined,current);context.setVoiceTransmission(current,()=>({state:"unconfirmed",postCount:1}));context.holdVoiceAnswer(current);
+  context.observeVoiceInterruption({kind:"needs-attention",reason:"aborted",reference:ref(2),voiceTransmission:{state:"not-sent",postCount:0}},old,question);assert.equal(context.getConfirmationQuestion(1000),undefined);
+});
+
+test("review4 logical history getter keeps the original scope after options mutation",async()=>{
+  const h=harness(),v=await voiceJob(h),gate=deferred(),options={expectedServerId:serverId};h.state.beforeWrite=()=>gate.promise;
+  const task=h.service.startVoiceRequest(v.payload,options);try{await settle();options.expectedServerId=`development:${otherOrigin}`;assert.deepEqual(task.getVoiceTransmission(),{state:"not-sent",postCount:0});assert.equal(h.state.calls.length,0);}finally{task.cancel();gate.resolve();await task.completion;}
+});
+
+
+for(const accepted of [false,true])test(`review5 stored same ID accepted=${accepted}: current zero sends cannot replace history`,async()=>{
+  const h=harness(),v=await voiceJob(h);await h.seed();if(accepted)await h.storage.recordResponse(ref(),status("processing"));const previous=await h.storage.read(ref());
+  const result=await v.start().completion;assert.equal(h.state.calls.length,0);assert.deepEqual(await h.storage.read(ref()),previous);
+  if(accepted)assert.deepEqual(result.voiceTransmission,{postCount:0,state:"accepted"});else assert.equal(result.voiceTransmission,undefined);
+});
+for(const phase of ["pending","failed","uppercase"])test(`review5 other owner during ${phase} read cannot borrow no-send evidence`,async()=>{
+  const h=harness(),a=await voiceJob(h),b=await voiceJob(h),gate=deferred();h.state.beforeRead=()=>gate.promise;
+  const task=a.start();await settle();assert.deepEqual(task.getVoiceTransmission(),{postCount:0,state:"not-sent"});
+  if(phase==="failed"){h.state.failRead=true;gate.resolve();await task.completion;h.state.failRead=false;}
+  const payload=phase==="uppercase"?h.load("@/services/assistant-voice-payload").createAssistantVoicePayload(b.owner,{requestId:id(1).toUpperCase()},()=>true,h.load("@/services/api/voice").createVoiceHttpClient({assistant:h.http})):b.payload;
+  const result=await h.requests.startVoiceRequest(payload,{expectedServerId:serverId});assert.equal(result.kind,"unconfirmed");assert.equal(result.voiceTransmission,undefined);assert.equal(h.state.calls.length,0);
+  task.cancel();gate.resolve();await task.completion;await payload.dispose();
+});
+test("review5 shared receipt during first lookup overrides zero current dispatches",async()=>{
+  const h=harness(),v=await voiceJob(h),gate=deferred();h.state.beforeRead=()=>gate.promise;const task=v.start();await settle();
+  assert.equal(task.getVoiceTransmission().state,"not-sent");h.http.exchange.noteAcceptance(ref());assert.deepEqual(task.getVoiceTransmission(),{postCount:0,state:"accepted"});
+  task.cancel();gate.resolve();assert.equal((await task.completion).voiceTransmission.state,"accepted");assert.equal(h.state.calls.length,0);
+});
+test("review5 pre-session A-B-A keeps old payload proof away from new owner",async()=>{
+  const h=harness(),a=await voiceJob(h),b=await voiceJob(h),gate=deferred();h.state.beforeRead=()=>gate.promise;const task=a.start();await settle();
+  h.mode.getState().setMode("mock");h.mode.getState().setMode("server");await task.completion;
+  const next=b.start();assert.equal((await next.completion).voiceTransmission,undefined);assert.equal(next.getVoiceTransmission(),undefined);assert.equal(h.state.calls.length,0);gate.resolve();await settle();assert.equal(h.state.calls.length,0);
 });

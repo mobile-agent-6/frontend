@@ -1,3 +1,4 @@
+import { afterAssistantRelease } from "@/services/api/assistant-request-recovery";
 import { AppState } from "react-native";
 
 import { assistantHttpClient } from "@/services/api/assistant";
@@ -17,6 +18,7 @@ export type AssistantLifecycleEntry = Readonly<{
   latestResult?: AssistantExecutionResult;
 }>;
 export type AssistantLifecycleSnapshot = Readonly<{
+  handoff?: AssistantRecoveryReference;
   generation?: number;
   // 로컬 복구 실행 상태이며 일정 변경 성공이나 uncertain 해소를 뜻하지 않는다.
   phase: "idle" | "recovering" | "observing" | "settled" | "paused" | "unavailable" | "needs-attention" | "stopped";
@@ -47,7 +49,7 @@ export function createAssistantLifecycle({
     },
   },
 }: {
-  orchestrator?: Pick<typeof assistantOrchestrator, "initializeRecovery">;
+  orchestrator?: Pick<typeof assistantOrchestrator, "initializeRecovery"> & Partial<Pick<typeof assistantOrchestrator, "resumeRequest">>;
   http?: Pick<typeof assistantHttpClient, "getServerId">;
   mode?: { getState: () => { mode: "server" | "mock"; generation: number }; subscribe: (listener: () => void) => () => void };
   lifecycle?: { getState: () => string | null; subscribe: (listener: (state: string) => void) => () => void };
@@ -63,8 +65,13 @@ export function createAssistantLifecycle({
   let tail: Promise<void> = Promise.resolve();
   let tailGeneration: number | undefined;
 
+  let handoff: { ref: AssistantRecoveryReference; generation: number } | undefined;
+  let focused = false;
+  let scheduledHandoff: typeof handoff;
+  let focusCycle = false;
+
   function publish(update: Omit<AssistantLifecycleSnapshot, "results" | "initialCheck">) {
-    snapshot = freeze({ ...update, generation: mode.getState().generation, initialCheck, results: [...entries.values()] });
+    snapshot = freeze({ ...update, handoff: handoff?.ref, generation: mode.getState().generation, initialCheck, results: [...entries.values()] });
     for (const subscriber of [...subscribers]) {
       // 화면 구독자 예외로 앱 초기화·다른 구독자·요청 제어를 중단하지 않는다.
       try { subscriber(); } catch {}
@@ -75,8 +82,10 @@ export function createAssistantLifecycle({
     try { return { serverId: http.getServerId(), ...mode.getState() }; }
     catch { return { serverId: null, mode: "server" as const, generation: -1 }; }
   }
-  function scheduleRecovery() {
+  function scheduleRecovery(focusOnly = false) {
     const scope = context();
+    scheduledHandoff = handoff;
+    focusCycle = focusOnly;
     if (!owners.size || !active) return;
     if (!scope.serverId || scope.mode !== "server") {
       initialCheck = "failed";
@@ -84,6 +93,7 @@ export function createAssistantLifecycle({
       return;
     }
     if (snapshot.serverId !== scope.serverId) entries.clear();
+    if (handoff && (handoff.generation !== scope.generation || handoff.ref.serverId !== scope.serverId)) handoff = undefined;
     const serverId = scope.serverId, current = ++epoch, signalController = new AbortController();
     initialCheck = "pending";
     controller = signalController;
@@ -109,15 +119,39 @@ export function createAssistantLifecycle({
       if (!valid()) return;
       let tasks: Extract<AssistantRecoveryInitialization, { kind: "initialized" }>["requests"] = [];
       try {
-        const initialized = await orchestrator.initializeRecovery({ signal: signalController.signal, onUpdate: event => {
+        const reservation = handoff;
+        const onUpdate = (event: AssistantExecutionEvent) => {
           if (!valid() || event.reference.serverId !== serverId) return;
           const key = keyOf(event.reference), previous = entries.get(key);
           entries.set(key, copy({ ...previous, reference: event.reference, phase: event.phase,
             latestResult: undefined, lastResponse: event.phase === "status" ? event.response : previous?.lastResponse }));
           publish({ phase: "observing", serverId });
-        } });
+        };
+        const options = { signal: signalController.signal, onUpdate };
+        if (focusOnly && reservation) {
+          const resume = orchestrator.resumeRequest ?? assistantOrchestrator.resumeRequest;
+          const task = await afterAssistantRelease(reservation.ref, reservation.generation, options.signal,
+            () => valid() ? resume(reservation.ref, options) : undefined);
+          if (!task) return;
+          tasks = [{ reference: reservation.ref, task, initial: await task.initial }];
+          if (!valid()) return;
+          capture(tasks[0].initial);
+          const result = await task.completion;
+          if (!valid()) return;
+          capture(result);
+          handoff = undefined;
+          initialCheck = result.kind === "needs-attention" && (!result.recoveryResult || result.recoveryResult.kind === "unconfirmed" && !result.recoveryResult.getResult) && !result.lastResponse ? "failed" : "checked";
+          publish({ phase: result.kind === "needs-attention" ? "needs-attention" : "settled", serverId });
+          return;
+        }
+        if (reservation) {
+          await afterAssistantRelease(reservation.ref, reservation.generation, options.signal, () => undefined);
+          if (!valid()) return;
+        }
+        const initialized = await orchestrator.initializeRecovery(options);
         if (initialized.kind === "initialized") tasks = initialized.requests;
         if (!valid()) return;
+        if (handoff === reservation) handoff = undefined;
         if (initialized.kind === "needs-attention") {
           initialCheck = "failed";
           publish({ phase: "needs-attention", serverId, initialization: copy(initialized) });
@@ -138,12 +172,15 @@ export function createAssistantLifecycle({
         }));
         if (valid()) publish({ phase: [...entries.values()].some(item => item.latestResult?.kind === "needs-attention") ? "needs-attention" : "settled", serverId });
       } catch {
-        if (valid()) { initialCheck = "failed"; publish({ phase: "needs-attention", serverId, issue: "unexpected" }); }
+        if (valid()) { handoff = undefined; initialCheck = "failed"; publish({ phase: "needs-attention", serverId, issue: "unexpected" }); }
       } finally {
         // 다음 active 복구는 이전 처리의 중단·예약 해제를 기다린다. cancel은 로컬 중단만 수행한다.
         if (!valid()) tasks.forEach(item => item.task.cancel());
         await Promise.allSettled(tasks.map(item => item.task.completion));
-        if (controller === signalController) controller = null;
+        if (controller === signalController) {
+          controller = null;
+          if (active && focused && handoff && handoff !== scheduledHandoff) scheduleRecovery(true);
+        }
       }
     })();
   }
@@ -153,11 +190,12 @@ export function createAssistantLifecycle({
     const next = state === "active";
     if (active === next) return;
     active = next;
+    if (active && handoff && !focused) return;
     if (active) scheduleRecovery();
     else { stopCycle(); publish({ phase: "paused", serverId: snapshot.serverId, initialization: snapshot.initialization }); }
   }
   function detachRuntime() {
-    stopCycle(); active = false; listening = false;
+    handoff = undefined; focusCycle = false; stopCycle(); active = false; listening = false;
     unsubscribeApp?.(); unsubscribeMode?.(); unsubscribeApp = undefined; unsubscribeMode = undefined;
     publish({ phase: "stopped", serverId: snapshot.serverId, initialization: snapshot.initialization });
   }
@@ -170,7 +208,7 @@ export function createAssistantLifecycle({
         unsubscribeApp = lifecycle.subscribe(onAppState);
         unsubscribeMode = mode.subscribe(() => {
           if (!owners.size) return;
-          stopCycle(); entries.clear();
+          handoff = undefined; stopCycle(); entries.clear();
           if (active) scheduleRecovery();
           else publish({ phase: "paused", serverId: context().serverId });
         });
@@ -189,6 +227,21 @@ export function createAssistantLifecycle({
     return detach;
   }
   return {
+    deferRecovery(ref: AssistantRecoveryReference, generation: number) {
+      if (!owners.size || context().generation !== generation || context().serverId !== ref.serverId) return;
+      handoff = { ref: { ...ref }, generation };
+      publish(snapshot);
+    },
+    focus(value: boolean) {
+      focused = value;
+      if (!focused && focusCycle && handoff) {
+        stopCycle();
+        focusCycle = false;
+        publish({ phase: "paused", serverId: context().serverId });
+      } else if (focused && handoff && active && !controller) {
+        scheduleRecovery(true);
+      }
+    },
     attach,
     getSnapshot: () => snapshot,
     subscribe(listener: () => void) { subscribers.add(listener); return () => { subscribers.delete(listener); }; },

@@ -6,6 +6,8 @@ import type { VoicePostResponse, VoiceRequest } from "@/types/voice-api";
 import { isAssistantUuidV4, parseAssistantProblemDetails, parseAssistantRequestAcceptedResponse, parseAssistantRequestStatusResponse } from "@/utils/assistant-validation";
 import { parseVoiceRequestAcceptedResponse, validVoiceRequest, validVoiceProblemStatus } from "@/utils/voice-validation";
 
+// Observation only, after all transmission guards; never a permission callback.
+export type VoicePostOptions = AssistantPostOptions & { onDispatch?: () => void };
 export const VOICE_TIMEOUT_MS = 35_000;
 export const SPEECH_MAX_BYTES = 8_388_608;
 type Client = ReturnType<typeof createAssistantHttpClient>;
@@ -22,7 +24,7 @@ export function createVoiceHttpClient({ assistant = createAssistantHttpClient(),
   const core = assistant.exchange;
   async function exchange<T>(scope: Scope, context: Context, path: string, signal: AbortSignal | undefined,
     body: Uint8Array<ArrayBuffer> | undefined, consume: (response: Response, current: () => void,
-      ownReader: (reader: ReadableStreamDefaultReader<Uint8Array>) => void) => Promise<T>, beforeSend?: () => boolean, onStaleResponse?: (value: T) => Promise<void>): Promise<AssistantHttpResult<T>> {
+      ownReader: (reader: ReadableStreamDefaultReader<Uint8Array>) => void) => Promise<T>, beforeSend?: () => boolean, onStaleResponse?: (value: T) => Promise<void>, onDispatch?: () => void): Promise<AssistantHttpResult<T>> {
     let status: number | undefined, httpRequestId: string | null = null;
     let stopped = false, sent = false;
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
@@ -57,6 +59,7 @@ export function createVoiceHttpClient({ assistant = createAssistantHttpClient(),
         catch { return failure("policy"); }
         current();
         sent = true;
+        try { onDispatch?.(); } catch {} // Observation cannot replace the HTTP result.
         const response = await scope.send(`${scope.apiBaseUrl}${path}`, { method: body ? "POST" : "GET",
           headers: { Accept: body ? "application/json, application/problem+json" : "audio/wav, application/problem+json",
             ...(body ? { "Content-Type": "audio/wav" } : {}) }, body, signal: controller.signal, redirect: "error" });
@@ -102,14 +105,15 @@ export function createVoiceHttpClient({ assistant = createAssistantHttpClient(),
       // Cancellation is best effort; request completion does not guarantee native resource release.
     }
   }
-  function snapshotOptions(options: AssistantPostOptions): AssistantPostOptions | null {
+  function snapshotOptions(options: VoicePostOptions): VoicePostOptions | null {
     if (!options || typeof options !== "object" || typeof options.expectedServerId !== "string") return null;
-    const { expectedServerId, expectedGeneration, signal, beforeSend } = options;
+    const { expectedServerId, expectedGeneration, signal, beforeSend, onDispatch } = options;
     if (signal !== undefined && (!signal || typeof signal.aborted !== "boolean" ||
       typeof signal.addEventListener !== "function" || typeof signal.removeEventListener !== "function")) return null;
+    if (onDispatch !== undefined && typeof onDispatch !== "function") return null;
     if (beforeSend !== undefined && typeof beforeSend !== "function") return null;
     if (expectedGeneration !== undefined && (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0)) return null;
-    return { expectedServerId, expectedGeneration, signal, beforeSend };
+    return { expectedServerId, expectedGeneration, signal, beforeSend, onDispatch };
   }
   function bind(ref: AssistantRecoveryReference, options: AssistantPostOptions, operation: "post" | "get") {
     const context: Context = { operation, serverId: ref?.serverId, assistantRequestId: ref?.requestId };
@@ -121,7 +125,7 @@ export function createVoiceHttpClient({ assistant = createAssistantHttpClient(),
     if (options.signal?.aborted) return core.failure(context, "aborted");
     return { context, scope };
   }
-  async function postVoiceRequest(input: VoiceRequest, options: AssistantPostOptions): Promise<AssistantHttpResult<VoicePostResponse>> {
+  async function postVoiceRequest(input: VoiceRequest, options: VoicePostOptions): Promise<AssistantHttpResult<VoicePostResponse>> {
     const snapshot = snapshotOptions(options);
     if (!validVoiceRequest(input) || !snapshot) return core.failure({ operation: "post" }, "request");
     // Snapshot before await; File.bytes() output is accepted without JSON/base64 conversion.
@@ -166,7 +170,7 @@ export function createVoiceHttpClient({ assistant = createAssistantHttpClient(),
         return activePosts.get(key) === owner && !core.hasAcceptanceEvidence(ref);
       }, async value => {
         try { await core.recovery.recordResponse(ref, value.state, { expectedFirstPostAttemptAt: saved.firstPostAttemptAt }); } catch {}
-      });
+      }, snapshot.onDispatch);
       if (!result.ok) return result;
       const recorded = await core.record({ ...result, data: result.data.state }, ref, scope, context, true, saved.firstPostAttemptAt);
       if (signal?.aborted) return core.failure(context, core.isCurrent(scope) ? "aborted" : "context-changed", {

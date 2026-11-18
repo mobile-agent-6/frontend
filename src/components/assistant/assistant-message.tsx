@@ -292,10 +292,21 @@ function ApiResultDetails({ result, onCandidateSelection, selectedCandidateId, o
         </>
       );
     }
-    case "failure": return <>
-      <ThemedText type="small" themeColor="primaryForeground">처리 실패</ThemedText>
-      <ThemedText type="small" themeColor="primaryForeground">{assistantFailureAdvice(result.nextAction)}</ThemedText>
-    </>;
+    case "failure": {
+      const hasReason = /실패|못했|못해|오류|문제|없|잘못|지원|만료|초과/.test(result.text);
+      const actionPattern = result.nextAction === "revise_input"
+        ? /(입력|내용|표현|날짜|조건|요청)[^.!?\n]{0,48}(수정|바꿔|바꾸|고쳐|구체|명확)[^.!?\n]{0,32}(주세요|보세요|하세요)|다른 표현[^.!?\n]{0,32}(주세요|보세요|하세요)|내용을\s*확인해\s*다시\s*말씀해\s*주세요/
+        : result.nextAction === "retry_later"
+          ? /(나중|잠시 후|잠시 뒤|잠깐 후|잠깐 뒤)[^.!?\n]{0,40}(다시|재시도)[^.!?\n]{0,24}(주세요|보세요|하세요)/
+          : /(결과|상태|일정 목록)[^.!?\n]{0,24}확인[^.!?\n]{0,24}(주세요|보세요|하세요)/;
+      const action = result.text.match(actionPattern)?.[0];
+      const hasAction = action !== undefined && !/하지 마|하지 않|말아|말고/.test(action);
+      if (hasReason && hasAction) return null;
+      return <>
+        <ThemedText type="small" themeColor="primaryForeground">처리 실패</ThemedText>
+        <ThemedText type="small" themeColor="primaryForeground">{assistantFailureAdvice(result.nextAction)}</ThemedText>
+      </>;
+    }
     case "uncertain": return <ThemedText type="small" themeColor="primaryForeground">결과 미확인</ThemedText>;
   }
 }

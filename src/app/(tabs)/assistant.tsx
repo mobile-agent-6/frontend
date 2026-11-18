@@ -1,3 +1,6 @@
+import { createAssistantVoicePayload, disposeVoiceFile, retryVoiceFileCleanup } from "@/services/assistant-voice-payload";
+import type { VoiceRequestFile } from "@/services/voice-request-file";
+import type { VoiceRecordingSubmission } from "@/hooks/use-local-voice-recording";
 import * as Crypto from "expo-crypto";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { KeyboardAvoidingView, Platform, StyleSheet } from "react-native";
@@ -22,6 +25,7 @@ import {
 } from "@/services/api/assistant-lifecycle";
 import {
   assistantOrchestrator,
+  type AssistantExecutionOptions,
   type AssistantExecutionResult,
   type AssistantRequestTask,
 } from "@/services/api/assistant-orchestrator";
@@ -83,6 +87,14 @@ import {
 // processing UI를 보여주기 위한 Mock 지연이며, 실제 API timeout이 아니다.
 const MOCK_PROCESSING_DELAY_MS = 700;
 
+function recoveringRecord(snapshot: AssistantLifecycleSnapshot, key: string) {
+  if (snapshot.handoff && assistantRecoveryKey(snapshot.handoff) === key) return true;
+  return snapshot.phase === "observing" && snapshot.results.some(entry =>
+    assistantRecoveryKey(entry.reference) === key &&
+    entry.latestResult?.kind !== "needs-attention" &&
+    entry.lastResponse?.data.status !== "completed");
+}
+
 function resolveInteraction(message: ConversationMessage, id: string) {
   return message.id === id &&
     message.role === "assistant" &&
@@ -104,15 +116,26 @@ export default function AssistantScreen() {
   const [inputUi, setInputUi] = useState<AssistantInputUi>({ source: "text" });
   const inputUiRef = useRef(inputUi);
   const voiceStartAllowedRef = useRef<() => boolean>(() => false);
+  type VoiceSubmission = { token: symbol; owner: VoiceRequestFile; question?: AssistantTextQuestion & { expiresAt?: string }; isCurrent(): boolean };
+  const voiceSubmissionRef = useRef<(() => VoiceRecordingSubmission | undefined) | undefined>(undefined);
+  const voiceExecutionRef = useRef<{
+    reference: AssistantRecoveryReference;
+    generation: number;
+    version: number;
+    token: symbol;
+    previouslyAccepted: boolean;
+  } | null>(null);
+  const activeVoiceRef = useRef(false);
   const localVoice = useLocalVoiceRecording(() => voiceStartAllowedRef.current(), (input) => {
     inputUiRef.current = input;
     setInputUi(input);
-  });
+  }, () => voiceSubmissionRef.current?.(), value => assistantLifecycle.focus?.(value));
   const voiceInputBusy = isVoiceInputBusy(inputUi) || localVoice.busy;
   const [isBusy, setIsBusy] = useState(false);
   const [questionUi, setQuestionUi] = useState<{
     serverId: string;
     generation: number;
+    voiceAvailable: boolean;
     active?: AssistantCandidateQuestion;
     confirmation?: AssistantConfirmationQuestion;
     selections: Readonly<Record<string, string>>;
@@ -153,12 +176,13 @@ export default function AssistantScreen() {
       {
         reference: AssistantRecoveryReference;
         phase: AssistantRecoveryCleanupPhase;
+        automatic?: boolean;
       }
     >
   >({});
   const cleanupLocksRef = useRef(new Set<string>());
   const manualConfirmationsRef = useRef(
-    new Map<string, { serverId: string | null; generation: number }>(),
+    new Map<string, { serverId: string | null; generation: number; snapshot: typeof recoverySnapshot; metadata: Promise<AssistantRecoveryMetadata | null> }>(),
   );
   const committedMessagesRef = useRef(messages);
   const uncertainRef = useRef<ReturnType<
@@ -174,6 +198,7 @@ export default function AssistantScreen() {
   const operationVersionRef = useRef(0);
   const mountedRef = useRef(true);
   const connectionRef = useRef({ generation: viewGeneration, serverId: viewServerId });
+  const lastServerIdRef = useRef(viewServerId);
   const errorIdRef = useRef(0);
   const pendingInputRef = useRef("");
   const mockTextPendingRef = useRef(false);
@@ -195,6 +220,7 @@ export default function AssistantScreen() {
     (
       reference: AssistantRecoveryReference,
       phase: AssistantRecoveryCleanupPhase,
+      automatic = false,
     ) => {
       if (!mountedRef.current) return;
       setCleanupStates((previous) => ({
@@ -202,6 +228,7 @@ export default function AssistantScreen() {
         [assistantRecoveryKey(reference)]: {
           reference: { ...reference },
           phase,
+          automatic,
         },
       }));
     },
@@ -227,7 +254,7 @@ export default function AssistantScreen() {
           { isCurrent },
         );
         if (isCurrent()) {
-          publishCleanup(reference, result);
+          publishCleanup(reference, result, true);
           setCleanupRevision((value) => value + 1);
         }
       } catch {
@@ -268,6 +295,7 @@ export default function AssistantScreen() {
       const next = {
         serverId: context.serverId,
         generation: context.generation,
+        voiceAvailable: context.getVoiceQuestion(now) !== "unavailable",
         active: context.getCandidateQuestion(now),
         confirmation: context.getConfirmationQuestion(now),
         selections: context.getSelections(),
@@ -407,8 +435,11 @@ export default function AssistantScreen() {
   }, []);
 
   const clearMockOperation = useCallback(
-    (notify: boolean) => {
+    () => {
       if (!mountedRef.current) return;
+      const serverId = assistantHttpClient.getServerId();
+      const serverChanged = serverId !== null && lastServerIdRef.current !== null && serverId !== lastServerIdRef.current;
+      if (serverId !== null) lastServerIdRef.current = serverId;
       connectionRef.current = { generation: scheduleDataModeStore.getState().generation, serverId: assistantHttpClient.getServerId() };
       operationVersionRef.current += 1;
       committedMessagesRef.current = []; setMessages([]);
@@ -417,6 +448,7 @@ export default function AssistantScreen() {
       scheduleSyncRetryLocksRef.current.clear(); setRetryingScheduleSync([]);
       serverTaskRef.current?.cancel();
       serverTaskRef.current = null;
+      voiceExecutionRef.current = null;
       textQuestionRef.current = null;
       setQuestionUi(null);
       uncertainRef.current = null;
@@ -429,20 +461,20 @@ export default function AssistantScreen() {
       pendingMockRef.current = null;
       invalidateActiveInteraction();
       finishOperation();
-      if (notify) reportError("서버 연결이 변경되어 이전 대화가 초기화되었어요.");
+      if (serverChanged) reportError("서버 연결이 변경되어 이전 대화가 초기화되었어요.");
     },
     [finishOperation, invalidateActiveInteraction, reportError],
   );
 
   useLayoutEffect(() => {
-    if (connectionRef.current.generation !== viewGeneration || connectionRef.current.serverId !== viewServerId) clearMockOperation(false);
+    if (connectionRef.current.generation !== viewGeneration || connectionRef.current.serverId !== viewServerId) clearMockOperation();
   }, [viewGeneration, viewServerId, clearMockOperation]);
 
   useEffect(
     () =>
       scheduleDataModeStore.subscribe((current, previous) => {
         if (current.generation !== previous.generation)
-          clearMockOperation(current.mode === "server");
+          clearMockOperation();
       }),
     [clearMockOperation],
   );
@@ -454,6 +486,7 @@ export default function AssistantScreen() {
       operationVersionRef.current += 1;
       serverTaskRef.current?.cancel();
       serverTaskRef.current = null;
+      voiceExecutionRef.current = null;
       sendLockedRef.current = false;
       pendingInputRef.current = "";
       mockTextPendingRef.current = false;
@@ -484,7 +517,7 @@ export default function AssistantScreen() {
       const snapshot = assistantLifecycle.getSnapshot();
       if (snapshot.generation !== undefined && snapshot.generation !== scheduleDataModeStore.getState().generation) return;
       if (connectionRef.current.serverId !== assistantHttpClient.getServerId() ||
-        connectionRef.current.generation !== scheduleDataModeStore.getState().generation) clearMockOperation(false);
+        connectionRef.current.generation !== scheduleDataModeStore.getState().generation) clearMockOperation();
       setRecoverySnapshot(snapshot);
       if (isMockScheduleMode()) return;
       const serverId = assistantHttpClient.getServerId();
@@ -628,7 +661,7 @@ export default function AssistantScreen() {
       )
         return;
       if (!isMockScheduleMode(generation)) {
-        clearMockOperation(true);
+        clearMockOperation();
         return;
       }
       mockTextPendingRef.current = false;
@@ -695,9 +728,11 @@ export default function AssistantScreen() {
   const sendServerInput = async (
     action?:
       | { type: "selection"; messageId: string; candidateId: string }
-      | { type: "confirmation"; messageId: string; approved: boolean },
+      | { type: "confirmation"; messageId: string; approved: boolean }
+      | ({ type: "voice" } & VoiceSubmission),
   ) => {
-    if (!viewCurrent()) return;
+    if (!viewCurrent()) { if (action?.type === "voice") void disposeVoiceFile(action.owner); return; }
+    const voice = action?.type === "voice" ? action : undefined;
     const selection = action?.type === "selection" ? action : undefined;
     const confirmation = action?.type === "confirmation" ? action : undefined;
     if (
@@ -705,8 +740,7 @@ export default function AssistantScreen() {
       isVoiceInputBusy(inputUiRef.current) || localVoice.isBusy() ||
       sendLockedRef.current ||
       status === "processing"
-    )
-      return;
+    ) { if (voice) void disposeVoiceFile(voice.owner); return; }
     sendLockedRef.current = true;
     setIsBusy(true);
     const version = ++operationVersionRef.current;
@@ -714,6 +748,10 @@ export default function AssistantScreen() {
     const text = inputTextRef.current,
       revision = inputRevisionRef.current;
     let completed = false;
+    let voicePayload: ReturnType<typeof createAssistantVoicePayload> | undefined;
+    let voiceExecution: typeof voiceExecutionRef.current = null;
+    let speechNotRecognized = false;
+    if (voice) activeVoiceRef.current = true;
     let acknowledgmentAttempt = false,
       postAccepted = false;
     let clearInputExpiry: (() => void) | undefined;
@@ -738,7 +776,7 @@ export default function AssistantScreen() {
       const canStart = () => {
         const snapshot = assistantLifecycle.getSnapshot();
         if (
-          snapshot.serverId === serverId &&
+          snapshot.serverId === serverId && !snapshot.handoff &&
           snapshot.initialCheck === "checked"
         )
           return true;
@@ -747,6 +785,7 @@ export default function AssistantScreen() {
       };
       if (!canStart()) return;
       const context = getTextQuestionContext(serverId);
+      syncQuestionUi(context);
       const uncertain = getUncertainContext(serverId);
       const acknowledgedId = !action
         ? uncertain.acknowledgmentForNewText()
@@ -808,7 +847,11 @@ export default function AssistantScreen() {
         return active;
       };
       const confirmed = resolveConfirmation();
-      if (selection) {
+      if (voice) {
+        if (!voice.isCurrent()) return;
+        question = voice.question;
+        label = "";
+      } else if (selection) {
         if (!selected) return;
         question = selected.question;
         const candidate = assistantCandidateToDisplay(selected.candidate);
@@ -834,7 +877,7 @@ export default function AssistantScreen() {
         if (typeof latest === "string") return;
         question = latest;
       }
-      const body = parseAssistantRequestCreate({
+      const body = voice ? null : parseAssistantRequestCreate({
         requestId,
         ...(acknowledgedId
           ? { acknowledgedUncertainRequestId: acknowledgedId }
@@ -858,7 +901,7 @@ export default function AssistantScreen() {
                 ...(question ? { questionId: question.questionId } : {}),
               },
       });
-      if (!body || !validateAssistantJsonBodySize(JSON.stringify(body)).ok) {
+      if (!voice && (!body || !validateAssistantJsonBodySize(JSON.stringify(body)).ok)) {
         reportError("메시지 형식이나 크기를 확인해 주세요.");
         return;
       }
@@ -870,7 +913,9 @@ export default function AssistantScreen() {
         acknowledgedId
           ? uncertain.acknowledgmentForNewText() !== acknowledgedId
           : uncertain.isHeld() ||
-            (selection
+            (voice
+              ? !voice.isCurrent()
+              : selection
               ? JSON.stringify(selected?.question) !==
                 JSON.stringify(resolveSelection()?.question)
               : confirmation
@@ -880,10 +925,10 @@ export default function AssistantScreen() {
                   JSON.stringify(context.getQuestion()))
       )
         return;
-      const timedQuestion = selected?.question ?? confirmed;
+      const timedQuestion = voice?.question?.expiresAt ? voice.question : selected?.question ?? confirmed;
       const inputController = action ? new AbortController() : undefined;
       if (inputController && timedQuestion) {
-        const remaining = Date.parse(timedQuestion.expiresAt) - Date.now();
+        const remaining = Date.parse(timedQuestion.expiresAt!) - Date.now();
         if (remaining <= 0) return;
         // 저장 장벽 대기 중 만료되면 기존 HTTP의 AbortSignal 검사로 실제 전송을 막는다. 서버 취소는 아니다.
         const timer = setTimeout(
@@ -902,8 +947,9 @@ export default function AssistantScreen() {
       }
       pendingInputRef.current = label;
       localVoice.discard();
-      setInputUi({ source: "text" });
-      setMessages((current) => [
+      inputUiRef.current = voice ? { source: "voice", phase: "recognizing" } : { source: "text" };
+      setInputUi(inputUiRef.current);
+      if (!voice) setMessages((current) => [
         ...current,
         { id: requestId, role: "user", text: label, serverId },
       ]);
@@ -917,12 +963,13 @@ export default function AssistantScreen() {
         question,
         selection?.candidateId,
         confirmation?.approved,
+        voice?.token ?? false,
       );
       if (acknowledgedId) uncertain.begin(requestId, acknowledgedId);
       syncUncertainUi(uncertain);
       syncQuestionUi(context);
       // 저장 장벽·GET-first·polling·재전송은 기존 orchestration에만 맡긴다.
-      const task = assistantOrchestrator.startRequest(body, {
+      const executionOptions: AssistantExecutionOptions & { expectedServerId: string } = {
         expectedServerId: serverId,
         signal: inputController?.signal,
         onUpdate: (event) => {
@@ -936,11 +983,24 @@ export default function AssistantScreen() {
           if (event.phase === "status") {
             postAccepted = true;
             clearInputExpiry?.();
-            for (const target of assistantAcceptedCleanup(
-              body,
+            if (voice) {
+              // A replay/GET cannot reconstruct STT text; never guess or POST it as text.
+              setMessages(current => {
+                if (current.some(message => message.role === "user" && message.serverId === serverId && message.id === requestId)) return current;
+                const noticeId = `voice-original-unavailable-${requestId}`;
+                if (event.acceptance) return [...current.filter(message => message.id !== noticeId),
+                  { id: requestId, role: "user", serverId, text: event.acceptance.transcript }];
+                return current.some(message => message.id === noticeId) ? current : [...current,
+                  { id: noticeId, role: "assistant", serverId, text: "음성 요청을 확인했어요. 음성 원문은 복구할 수 없어요." }];
+              });
+              inputUiRef.current = { source: "text" }; setInputUi(inputUiRef.current);
+            }
+            for (const target of (!body && !event.acceptance ? [] : assistantAcceptedCleanup(
+              body ?? { requestId, ...(question ? { conversationId: question.conversationId } : {}),
+                input: event.acceptance!.input },
               event,
               question,
-            )) {
+            ))) {
               void cleanupWithEvidence(
                 target.reference,
                 target.evidence,
@@ -969,16 +1029,30 @@ export default function AssistantScreen() {
             syncQuestionUi(context);
           }
         },
-      });
+      };
+      if (voice) voicePayload = createAssistantVoicePayload(voice.owner, { requestId,
+        ...(question ? { conversationId: question.conversationId, questionId: question.questionId } : {}) },
+        () => isCurrent() && voice.isCurrent());
+      if (voice) {
+        const reference = { serverId, requestId };
+        voiceExecution = { reference, generation, version, token: voice.token,
+          previouslyAccepted: assistantHttpClient.hasAcceptanceEvidence(reference) };
+        voiceExecutionRef.current = voiceExecution;
+      }
+      const task = voicePayload ? assistantOrchestrator.startVoiceRequest(voicePayload, executionOptions) :
+        assistantOrchestrator.startRequest(body!, executionOptions);
       if (!isCurrent()) {
         task.cancel();
         return;
       }
+      if (voice) context.setVoiceTransmission(voice.token, task.getVoiceTransmission ?? (() => undefined));
       serverTaskRef.current = task;
       const execution = await task.completion;
       clearInputExpiry?.();
-      if (!isCurrent() || assistantHttpClient.getServerId() !== serverId)
+      if (!isCurrent() || assistantHttpClient.getServerId() !== serverId) {
+        if (voice) context.observeVoiceInterruption(execution, voice.token, question);
         return;
+      }
       context.observeExecution(execution, "request", question);
       if (
         acknowledgedId &&
@@ -1003,8 +1077,10 @@ export default function AssistantScreen() {
           execution,
         );
         const error = getAssistantExecutionError(execution);
+        speechNotRecognized = !!voice && error?.problem?.code === "SPEECH_NOT_RECOGNIZED";
         if (
           question &&
+          (!voice || execution.kind === "needs-attention" && execution.recoveryResult?.kind === "unconfirmed" && execution.recoveryResult.definitiveRejection) &&
           error?.kind === "http" &&
           error.operation === "post" &&
           error.status === 409 &&
@@ -1077,13 +1153,13 @@ export default function AssistantScreen() {
             const restored =
               target.kind === "question" &&
               target.questionId &&
-              body.conversationId &&
+              (body?.conversationId ?? question?.conversationId) &&
               context.restoreActiveQuestion(
                 recovered,
                 {
                   requestId: target.requestId,
                   questionId: target.questionId,
-                  conversationId: body.conversationId,
+                  conversationId: (body?.conversationId ?? question?.conversationId)!,
                 },
                 token,
                 Date.now(),
@@ -1113,6 +1189,11 @@ export default function AssistantScreen() {
       }
     } finally {
       clearInputExpiry?.();
+      if (voice) {
+        if (voicePayload) void voicePayload.dispose();
+        else { void disposeVoiceFile(voice.owner).then(result => { if (result !== "deleted") void retryVoiceFileCleanup(); }); }
+      }
+      if (voiceExecution && voiceExecutionRef.current === voiceExecution) voiceExecutionRef.current = null;
       if (mountedRef.current && operationVersionRef.current === version) {
         // 새로 작성했다가 지운 초안도 이전 요청의 실패 입력으로 덮어쓰지 않는다.
         if (
@@ -1123,10 +1204,62 @@ export default function AssistantScreen() {
         )
           restoreInput(text);
         serverTaskRef.current = null;
+        if (voice) {
+          activeVoiceRef.current = false;
+          const next: AssistantInputUi = speechNotRecognized ? { source: "voice", phase: "stt-error" } : { source: "text" };
+          inputUiRef.current = next; setInputUi(next);
+        }
         finishOperation();
       }
     }
   };
+
+  useEffect(() => { void retryVoiceFileCleanup(); }, []);
+  useLayoutEffect(() => {
+    voiceSubmissionRef.current = () => {
+      if (Platform.OS !== "ios" || scheduleDataModeStore.getState().mode !== "server") return;
+      const serverId = assistantHttpClient.getServerId(), generation = scheduleDataModeStore.getState().generation;
+      if (!serverId || !voiceStartAllowedRef.current()) return;
+      void retryVoiceFileCleanup();
+      const context = getTextQuestionContext(serverId), question = context.getVoiceQuestion(Date.now());
+      if (typeof question === "string") return;
+      let valid = true, handed = false;
+      const token = Symbol("voice-recording-submission");
+      const isCurrent = () => valid && mountedRef.current && assistantHttpClient.getServerId() === serverId &&
+        scheduleDataModeStore.getState().mode === "server" && scheduleDataModeStore.getState().generation === generation &&
+        JSON.stringify(context.getVoiceQuestion(Date.now())) === JSON.stringify(question);
+      return {
+        isCurrent,
+        complete(owner) {
+          if (handed || !isCurrent()) { void disposeVoiceFile(owner); return; }
+          handed = true;
+          void sendServerInput({ type: "voice", token, owner, question, isCurrent });
+        },
+        invalidate(updateUi = true) {
+          valid = false;
+          context.holdVoiceAnswer(token);
+          if (updateUi && mountedRef.current) syncQuestionUi(context);
+          const execution = voiceExecutionRef.current;
+          if (activeVoiceRef.current && (!execution || execution.token === token)) {
+            if (execution && !execution.previouslyAccepted && execution.version === operationVersionRef.current &&
+              (serverTaskRef.current?.getVoiceTransmission?.()?.postCount ?? 0) > 0 &&
+              execution.generation === generation && scheduleDataModeStore.getState().generation === generation &&
+              scheduleDataModeStore.getState().mode === "server" &&
+              execution.reference.serverId === serverId && assistantHttpClient.getServerId() === serverId &&
+              assistantHttpClient.hasAcceptanceEvidence(execution.reference)) {
+              assistantLifecycle.deferRecovery?.(execution.reference, generation);
+            }
+            if (voiceExecutionRef.current === execution) voiceExecutionRef.current = null;
+            serverTaskRef.current?.cancel();
+            operationVersionRef.current++;
+            serverTaskRef.current = null; activeVoiceRef.current = false;
+            sendLockedRef.current = false;
+            if (updateUi && mountedRef.current) { setIsBusy(false); setStatus("idle"); inputUiRef.current = { source: "text" }; setInputUi(inputUiRef.current); }
+          }
+        },
+      };
+    };
+  });
 
   const checkUncertain = async (
     requestId: string,
@@ -1235,10 +1368,16 @@ export default function AssistantScreen() {
       assistantHttpClient.getServerId() === viewServerId &&
       (displayCurrent?.() ?? true);
     if (!inCurrentView() || cleanupLocksRef.current.has(key)) return;
+    const currentSnapshot = assistantLifecycle.getSnapshot();
+    const recoveringTarget = recoveringRecord(currentSnapshot, key);
+    if ((action === "manual" || action === "confirm-manual") && recoveringTarget) return;
     if (action === "manual") {
+      const metadata = assistantRecoveryStorage.read(reference).catch(() => null);
       manualConfirmationsRef.current.set(key, {
         serverId: viewServerId,
         generation,
+        snapshot: currentSnapshot,
+        metadata,
       });
       publishCleanup(reference, "confirming");
       return;
@@ -1269,6 +1408,7 @@ export default function AssistantScreen() {
       control.executionToken !== undefined &&
       JSON.stringify(latestExecution()) === control.executionToken;
     let evidence: AssistantRecoveryCleanupEvidence | undefined;
+    let manualMetadata: Promise<AssistantRecoveryMetadata | null> | undefined;
     if (action === "result") {
       const result = latestExecution();
       const data =
@@ -1295,14 +1435,20 @@ export default function AssistantScreen() {
       if (
         !confirmation ||
         confirmation.serverId !== viewServerId ||
-        confirmation.generation !== generation
+        confirmation.snapshot !== currentSnapshot || confirmation.generation !== generation
       )
         return;
+      manualMetadata = confirmation.metadata;
       manualConfirmationsRef.current.delete(key);
     } else return;
     cleanupLocksRef.current.add(key);
     if (!displayCurrent) publishCleanup(reference, "working");
     try {
+      const expectedMetadata = manualMetadata && await manualMetadata;
+      if (action === "confirm-manual" && !expectedMetadata) {
+        if (inCurrentView()) publishCleanup(reference, "failed");
+        return;
+      }
       const result =
         action === "result"
           ? await assistantOrchestrator.confirmResultDisplayed(reference, {
@@ -1318,10 +1464,10 @@ export default function AssistantScreen() {
             : await assistantRecoveryStorage.removeManually(
                 reference,
                 { confirmed: true },
-                { isCurrent: inCurrentView },
+                { isCurrent: () => inCurrentView() && assistantLifecycle.getSnapshot() === currentSnapshot, expectedMetadata: expectedMetadata ?? undefined },
               );
       if (inCurrentView()) {
-        publishCleanup(reference, result);
+        publishCleanup(reference, result, Boolean(displayCurrent));
         setCleanupRevision((value) => value + 1);
       }
       return result;
@@ -1428,7 +1574,7 @@ export default function AssistantScreen() {
       inputTextRef.current = "";
       setInputText("");
       if (!isMockScheduleMode()) {
-        clearMockOperation(true);
+        clearMockOperation();
         return;
       }
       setInputUi({ source: "text" });
@@ -1578,8 +1724,8 @@ export default function AssistantScreen() {
   const recoveryPending =
     !mockMode &&
     currentServerId !== null &&
-    (!recoveryMatches || recoverySnapshot.initialCheck === "pending") &&
-    ["idle", "recovering", "observing"].includes(recoverySnapshot.phase);
+    (Boolean(recoverySnapshot.handoff) || ((!recoveryMatches || recoverySnapshot.initialCheck === "pending") &&
+    ["idle", "recovering", "observing"].includes(recoverySnapshot.phase)));
   const recoveryProcessing =
     recoveryMatches &&
     ["recovering", "observing"].includes(recoverySnapshot.phase) &&
@@ -1611,7 +1757,8 @@ export default function AssistantScreen() {
     cleanupReferences.set(key, value.reference);
   const recoveryControls: AssistantRecoveryControl[] = mockMode
     ? []
-    : [...cleanupReferences].map(([key, reference]) => {
+    : [...cleanupReferences].filter(([key]) => !recoveringRecord(recoverySnapshot, key) &&
+        !(cleanupStates[key]?.automatic && ["removed", "not-found"].includes(cleanupStates[key].phase))).map(([key, reference]) => {
         const message = visibleMessages.find(
           (message) =>
             message.role === "assistant" &&
@@ -1669,11 +1816,13 @@ export default function AssistantScreen() {
   }, [timedRequestId, timedExpiresAt, syncQuestionUi]);
 
   const voiceStartAllowed = !isBusy && status !== "processing" && !recoveryPending && !recoveryProcessing &&
-    !uncertainView?.held && !activeCandidate && !activeConfirmation &&
+    (Platform.OS !== "ios" || mockMode || questionView?.voiceAvailable !== false) &&
+    !uncertainView?.held && ((!activeCandidate && !activeConfirmation) || Platform.OS === "ios" && !mockMode) &&
     (mockMode || (currentServerId !== null && recoveryMatches && recoverySnapshot.initialCheck === "checked"));
   useLayoutEffect(() => {
-    voiceStartAllowedRef.current = () => mountedRef.current && !sendLockedRef.current && !serverTaskRef.current && voiceStartAllowed;
-  }, [voiceStartAllowed]);
+    voiceStartAllowedRef.current = () => mountedRef.current && !sendLockedRef.current && !serverTaskRef.current && voiceStartAllowed &&
+      (Platform.OS !== "ios" || isMockScheduleMode() || !currentServerId || getTextQuestionContext(currentServerId).getVoiceQuestion(Date.now()) !== "unavailable");
+  }, [voiceStartAllowed, currentServerId, getTextQuestionContext]);
 
   return (
     <ThemedView

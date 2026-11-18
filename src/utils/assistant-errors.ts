@@ -22,7 +22,7 @@ export function getAssistantExecutionError(execution: AssistantExecutionResult):
   if (postResult && !postResult.ok) return postResult.error;
 }
 
-export function assistantHttpErrorNotice(error: AssistantHttpError): string {
+export function assistantHttpErrorNotice(error: AssistantHttpError, voice = false): string {
   if (error.kind !== "http") {
     switch (error.kind) {
       case "timeout": return "응답 대기 시간이 끝났어요. 서버 처리 여부는 아직 확인이 필요해요.";
@@ -39,8 +39,13 @@ export function assistantHttpErrorNotice(error: AssistantHttpError): string {
     }
   }
   switch (error.problem?.code) {
+    case "SPEECH_NOT_RECOGNIZED": return "음성을 알아듣지 못했어요. 다시 말씀해 주세요.";
+    case "VOICE_ANSWER_UNCLEAR": return "질문에 대한 답변을 알아듣지 못했어요. 현재 질문에 다시 답해 주세요.";
+    case "AUDIO_UNSUPPORTED": return "지원하는 WAV 녹음 형식인지 확인해 주세요.";
+    case "VOICE_BUSY": return "음성 서비스가 사용 중이에요. 원래 요청의 상태 확인이 필요해요.";
+    case "VOICE_UNAVAILABLE": return "음성 서비스를 지금 사용할 수 없어요. 원래 요청의 확인이 필요해요.";
     case "MALFORMED_REQUEST": return "요청 형식이 올바르지 않아요. 입력을 확인하고 다시 작성해 주세요.";
-    case "REQUEST_BODY_TOO_LARGE": return "요청 크기는 UTF-8 기준 16 KiB 이하여야 해요. 입력을 줄여 주세요.";
+    case "REQUEST_BODY_TOO_LARGE": return voice ? "녹음 파일은 1 MiB 이하여야 해요. 다시 녹음해 주세요." : "요청 크기는 UTF-8 기준 16 KiB 이하여야 해요. 입력을 줄여 주세요.";
     case "VALIDATION_ERROR": return "입력 값이나 형식이 올바르지 않아요. 입력 내용을 수정해 주세요.";
     case "REQUEST_ID_CONFLICT": return "같은 요청 ID에 다른 내용이 연결돼 있어요. 원래 요청의 상태 확인이 필요해요.";
     case "CONVERSATION_BUSY": return "이미 처리 중인 작업이 있어요. 기존 요청의 상태 확인이 필요해요.";

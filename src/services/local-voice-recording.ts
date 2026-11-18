@@ -220,6 +220,7 @@ export function createLocalVoiceRecording(deps: LocalVoiceDependencies) {
   function cancel(): Promise<void> {
     const active = job;
     if (!active) { discard(); return Promise.resolve(); }
+    if (active.cancelled) return active.stopTask ?? active.startTask ?? Promise.resolve();
     active.cancelled = true;
     active.waitActive?.(false);
     publish({ source: "text" });
@@ -236,6 +237,7 @@ export function createLocalVoiceRecording(deps: LocalVoiceDependencies) {
     },
     start, stop: () => job?.phase === "recording" || job?.phase === "stopping" ? finish(job) : Promise.resolve(), cancel, discard,
     isBusy: () => job !== null,
+    isPermissionDialog: () => job?.permissionDialog === true,
     getSnapshot: () => snapshot,
     subscribe(listener: (value: LocalVoiceSnapshot) => void) { listeners.add(listener); return () => { listeners.delete(listener); }; },
     focus(value: boolean) { focused = value; if (!value) void cancel(); },

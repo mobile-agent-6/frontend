@@ -102,7 +102,9 @@ export function ConversationList({
   onResultDisplayed,
 }: ConversationListProps) {
   const listRef = useRef<FlatList<ConversationMessage>>(null);
-  const messageCount = messages.length;
+  const renderedMessages = messages.filter(message => !(isProcessing && message.role === "assistant" &&
+    message.apiExecution?.kind === "observed" && !message.apiUncertain && !message.apiErrorRecovery));
+  const messageCount = renderedMessages.length;
   const processingMessage = isProcessing ? [...messages].reverse().find(message => message.role === "user") : undefined;
   const previousMessageCountRef = useRef(messageCount);
   const scrollMetricsRef = useRef({ contentHeight: 0, viewportHeight: 0, offsetY: 0 });
@@ -245,10 +247,16 @@ export function ConversationList({
     scheduleScrollToEnd(true);
   }, [messageCount, scheduleScrollToEnd]);
 
+  const footerControls = recoveryControls?.filter(control => !(processingMessage && processingMessage.serverId === control.reference.serverId &&
+            processingMessage.id.toLowerCase() === control.reference.requestId.toLowerCase()) &&
+            !messages.some(message => message.role === "assistant" && message.apiExecution &&
+            assistantRecoveryKey(message.apiExecution.reference) === assistantRecoveryKey(control.reference))) ?? [];
+  const showProgress = isProcessing && showProcessingNotice;
+  const hasFooterContent = showProgress || footerControls.length > 0 || recoveryStorageError;
   return (
     <FlatList
       ref={listRef}
-      data={messages}
+      data={renderedMessages}
       onScroll={({ nativeEvent }) => {
         scrollMetricsRef.current = {
           contentHeight: nativeEvent.contentSize.height,
@@ -297,7 +305,8 @@ export function ConversationList({
       ItemSeparatorComponent={MessageSeparator}
       ListFooterComponent={
         <View>
-          {isProcessing && showProcessingNotice && (
+          {messageCount > 0 && hasFooterContent && <MessageSeparator />}
+          {showProgress && (
             <View style={styles.processing} accessibilityLiveRegion="polite">
               <ThemedText themeColor="textSecondary">
                 일정을 확인하고 있어요...
@@ -305,14 +314,15 @@ export function ConversationList({
             </View>
           )}
           {/* 현재 전송을 처리 중인 기록은 고아 복구 항목이 아니다. 실패 결과와 이전 서버 기록은 별도로 유지한다. */}
-          {recoveryControls?.filter(control => !(processingMessage && processingMessage.serverId === control.reference.serverId &&
-            processingMessage.id.toLowerCase() === control.reference.requestId.toLowerCase()) &&
-            !messages.some(message => message.role === "assistant" && message.apiExecution &&
-            assistantRecoveryKey(message.apiExecution.reference) === assistantRecoveryKey(control.reference))).map(control => (
-            <AssistantMessage key={`recovery-${assistantRecoveryKey(control.reference)}`} text="이전 요청의 로컬 복구 기록이 남아 있어요."
+          {footerControls.map((control, index) => (
+            <View key={assistantRecoveryKey(control.reference)}>
+              {(index > 0 || showProgress) && <MessageSeparator />}
+              <AssistantMessage text="이전 요청의 로컬 복구 기록이 남아 있어요."
               recoveryIssue
               recoveryControl={control} onRecoveryAction={onRecoveryAction ? action => onRecoveryAction(control, action) : undefined} />
+            </View>
           ))}
+          {recoveryStorageError && (showProgress || footerControls.length > 0) && <MessageSeparator />}
           {recoveryStorageError && <AssistantMessage text="로컬 복구 기록을 읽지 못했어요. 기록을 삭제하지 않았으며 저장 상태 확인이 필요해요." />}
           <View style={styles.footer} />
         </View>
@@ -447,7 +457,6 @@ const styles = StyleSheet.create({
     height: Spacing.five,
   },
   processing: {
-    marginTop: Spacing.three,
     alignSelf: "flex-start",
   },
 });
