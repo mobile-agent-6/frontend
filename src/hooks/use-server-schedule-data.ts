@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef } from "react";
 import { useStore } from "zustand";
 
 import { getDevelopmentServerConfig } from "@/services/api/config";
+import { connectionInitialization } from "@/services/connection-initialization";
 import { scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
 import { getScheduleCoverage, normalizeScheduleQuery, scheduleQueryKey, serverScheduleStore } from "@/stores/serverScheduleStore";
 import type { ScheduleDateRange, ScheduleListQuery } from "@/utils/schedule-query";
@@ -14,6 +15,7 @@ function configForGeneration(generation: number) {
 /** 명시적으로 활성화한 소비자만 조회하며 선택 날짜는 기존 성공 coverage를 재사용한다. */
 export function useServerScheduleData(query: ScheduleListQuery, enabled = false, coverageRange?: ScheduleDateRange) {
   const state = useStore(serverScheduleStore.store);
+  const initializing = useStore(connectionInitialization, value => value.pending);
   const generation = useStore(scheduleDataModeStore, value => value.generation);
   const subscription = useRef<{ release: () => void; retry: () => Promise<void> } | null>(null);
   const config = configForGeneration(generation);
@@ -49,7 +51,7 @@ export function useServerScheduleData(query: ScheduleListQuery, enabled = false,
     return mutation?.kind === "completion" && mutation.phase === "pending" && mutation.completed !== undefined
       ? { ...schedule, completed: mutation.completed } : schedule;
   });
-  const localError = enabled && (config.status !== "ready" ? {
+  const localError = enabled && (config.status !== "ready" && !(config.status === "missing" && initializing) ? {
     kind: "configuration" as const, configurationStatus: config.status, requestState: "not-sent" as const,
   } : prepared.invalid ? { kind: "request" as const, requestState: "not-sent" as const } : null);
   const error = localError || entry?.error || null;

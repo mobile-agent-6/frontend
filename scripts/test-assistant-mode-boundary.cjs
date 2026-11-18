@@ -41,6 +41,8 @@ function harness(initialMode = "mock") {
       compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX }, fileName: file,
     }).outputText;
     const resolve = (name) => {
+      // Native TTS is exercised by the real screen/service integration suites.
+      if (name === "@/hooks/use-assistant-speech") return { useAssistantSpeech: () => ({ current: null }) };
       // native 녹음은 별도 controller/Assistant 화면 통합 테스트에서 검증한다.
       if (name === "@/hooks/use-local-voice-recording") return { useLocalVoiceRecording: () => ({
         busy: false, supported: true, isBusy: () => false, start: async () => {}, stop: async () => {}, discard() {},
@@ -283,7 +285,9 @@ test("Mock 변경 후 모드 전환이 발생하면 이전 성공 메시지를 �
     const unsubscribe = h.mock.subscribe(() => h.mode.scheduleDataModeStore.getState().setMode("server"));
     h.send("내일 오후 3시 팀 회의 추가해 줘"); h.fire(); unsubscribe();
     assert.equal(h.mock.getState().schedules.length, 11);
-    assert.equal(messages(h).at(-1).text, "서버 연결이 변경되어 이전 대화가 초기화되었어요.");
+    // UX-04: mode-only invalidation clears chat without announcing a different server.
+    assert.deepEqual(messages(h), []);
+    assert.ok(h.mode.scheduleDataModeStore.getState().generation > 0);
     assert.equal(messages(h).some((m) => m.text === "네, 일정을 추가했어요."), false);
     assert.equal(h.find("MessageInput").disabled, false);
   } finally { h.close(); }

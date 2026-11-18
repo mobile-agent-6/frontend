@@ -161,7 +161,7 @@ export function createAssistantRecoveryStorage(storage: AssistantRecoveryStorage
 
   /** 로컬 정보만 수동 정리한다. 서버 취소·uncertain 해소·재실행 허용이 아니다. */
   function removeManually(input: AssistantRecoveryReference, confirmation: { confirmed: true },
-    options?: { isCurrent?: () => boolean }): Promise<AssistantRecoveryCleanupResult> {
+    options?: { isCurrent?: () => boolean; expectedMetadata?: AssistantRecoveryMetadata }): Promise<AssistantRecoveryCleanupResult> {
     const snapshot = { ...input };
     const confirmed = confirmation?.confirmed === true;
     const isCurrent = options?.isCurrent ?? (() => true);
@@ -170,7 +170,9 @@ export function createAssistantRecoveryStorage(storage: AssistantRecoveryStorage
       const ref = reference(snapshot);
       if (!confirmed) throw new AssistantRecoveryStorageError("invalid-input");
       const entries = await readEntries();
-      if (!entries.some((entry) => matches(entry, ref))) return "not-found";
+      const entry = entries.find(value => matches(value, ref));
+      if (!entry) return "not-found";
+      if (options?.expectedMetadata && JSON.stringify(entry) !== JSON.stringify(options.expectedMetadata)) return "retained";
       if (!isCurrent()) return "retained";
       await writeEntries(entries.filter((entry) => !matches(entry, ref)));
       return "removed";

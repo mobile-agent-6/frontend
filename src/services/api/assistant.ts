@@ -287,7 +287,11 @@ export function createAssistantHttpClient({
   function hasAcceptanceEvidence(ref: AssistantRecoveryReference): boolean {
     return isAssistantUuidV4(ref.requestId) && acceptedRequestKeys.has(acceptanceKey(ref));
   }
-  return { postAssistantRequest, getAssistantRequest, cancelAssistantConversation, getServerId, hasAcceptanceEvidence };
+  // Shared fixed scope and schema-v1 storage boundary; no orchestration or UI activation.
+  const exchange = { bind, isCurrent, failure, record, recovery, now,
+    noteAcceptance: (ref: AssistantRecoveryReference) => acceptedRequestKeys.add(acceptanceKey(ref)),
+    hasAcceptanceEvidence };
+  return { postAssistantRequest, getAssistantRequest, cancelAssistantConversation, getServerId, hasAcceptanceEvidence, exchange };
 }
 
 // import만으로 storage나 서버에 접근하지 않는다.

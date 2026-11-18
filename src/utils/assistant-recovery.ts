@@ -1,3 +1,4 @@
+import { classifyVoiceProblem } from "@/utils/voice-validation";
 import { createDevelopmentTarget, createPiCandidate } from "@/services/api/config";
 import type {
   AssistantRecoveryCleanupEvidence,
@@ -87,6 +88,12 @@ export function applyAssistantRecoveryResponse(metadata: AssistantRecoveryMetada
 export function prepareAssistantRecoveryCleanupEvidence(evidence: AssistantRecoveryCleanupEvidence): AssistantRecoveryCleanupFacts | null {
   if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) return null;
   switch (evidence.type) {
+    case "voice-rejected":
+      return isAssistantUuidV4(evidence.requestId) && isAssistantRecoveryTimestamp(evidence.firstPostAttemptAt) &&
+        evidence.firstPostAttemptAt === evidence.lastPostAttemptAt &&
+        classifyVoiceProblem(evidence.httpStatus, evidence.code) === "rejection-candidate"
+        ? { type: "voice-rejected", requestId: evidence.requestId.toLowerCase(), firstPostAttemptAt: evidence.firstPostAttemptAt,
+          lastPostAttemptAt: evidence.lastPostAttemptAt, httpStatus: evidence.httpStatus, code: evidence.code } : null;
     case "result-displayed": return { type: evidence.type };
     case "question-inactive-confirmed":
       return ["answered", "cancelled", "expired", "not_active"].includes(evidence.reason) ? { type: evidence.type, reason: evidence.reason } : null;
@@ -122,6 +129,11 @@ export function canRemoveAssistantRecovery(
 ): boolean {
   const entry = parseAssistantRecoveryMetadata(metadata);
   if (!entry || entry.serverId !== currentServerId || !evidence || typeof evidence !== "object") return false;
+  if (evidence.type === "voice-rejected") {
+    return !entry.acceptConfirmed && entry.requestId === evidence.requestId && entry.firstPostAttemptAt === entry.lastPostAttemptAt &&
+      classifyVoiceProblem(evidence.httpStatus, evidence.code) === "rejection-candidate" &&
+      entry.firstPostAttemptAt === evidence.firstPostAttemptAt && entry.lastPostAttemptAt === evidence.lastPostAttemptAt;
+  }
   if (evidence.type === "request-expired") {
     return evidence.code === "REQUEST_EXPIRED" &&
       ((evidence.method === "GET" && evidence.httpStatus === 410) || (evidence.method === "POST" && evidence.httpStatus === 409));
