@@ -18,6 +18,7 @@ import { ThemedView } from "@/components/ui/themed-view";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 import { useTheme } from "@/hooks/use-theme";
 import { useLocalVoiceRecording } from "@/hooks/use-local-voice-recording";
+import { useAssistantSpeech } from "@/hooks/use-assistant-speech";
 import { assistantHttpClient } from "@/services/api/assistant";
 import {
   assistantLifecycle,
@@ -104,6 +105,7 @@ function resolveInteraction(message: ConversationMessage, id: string) {
 }
 
 export default function AssistantScreen() {
+  const speech = useAssistantSpeech();
   const viewGeneration = scheduleDataModeStore.getState().generation;
   const viewServerId = assistantHttpClient.getServerId();
   const viewCurrent = () => scheduleDataModeStore.getState().generation === viewGeneration && assistantHttpClient.getServerId() === viewServerId;
@@ -208,10 +210,16 @@ export default function AssistantScreen() {
   const conversationListRef = useRef<ConversationListHandle>(null);
   const processingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // 커밋된 메시지와 클릭 대상을 비교할 뿐, effect 자체로 표시 확인이나 정리를 수행하지 않는다.
+  // 결과 커밋 후 TTS를 예약한다. metadata 표시 확인/정리는 기존 명시적 경계를 유지한다.
   useEffect(() => {
     committedMessagesRef.current = messages;
-  }, [messages]);
+    for (const message of messages) {
+      if (message.role === "assistant" && message.apiExecution?.kind === "completed") {
+        const execution = message.apiExecution;
+        speech.current?.observe(execution.reference, viewGeneration, execution.response.data);
+      }
+    }
+  }, [messages, speech, viewGeneration]);
   useEffect(() => {
     inputUiRef.current = inputUi;
   }, [inputUi]);
@@ -245,7 +253,7 @@ export default function AssistantScreen() {
       const generation = scheduleDataModeStore.getState().generation;
       if (!isCurrent() || cleanupLocksRef.current.has(key)) return;
       cleanupLocksRef.current.add(key);
-      publishCleanup(reference, "working");
+      publishCleanup(reference, "working", true);
       try {
         const result = await assistantRecoveryStorage.cleanup(
           reference,
@@ -742,6 +750,7 @@ export default function AssistantScreen() {
       status === "processing"
     ) { if (voice) void disposeVoiceFile(voice.owner); return; }
     sendLockedRef.current = true;
+    void speech.current?.interrupt();
     setIsBusy(true);
     const version = ++operationVersionRef.current;
     const generation = scheduleDataModeStore.getState().generation;
@@ -750,6 +759,7 @@ export default function AssistantScreen() {
     let completed = false;
     let voicePayload: ReturnType<typeof createAssistantVoicePayload> | undefined;
     let voiceExecution: typeof voiceExecutionRef.current = null;
+    let speechExecution: object | undefined;
     let speechNotRecognized = false;
     if (voice) activeVoiceRef.current = true;
     let acknowledgmentAttempt = false,
@@ -981,6 +991,7 @@ export default function AssistantScreen() {
           )
             return;
           if (event.phase === "status") {
+            speech.current?.accept(event.reference, generation, event.response.data);
             postAccepted = true;
             clearInputExpiry?.();
             if (voice) {
@@ -1039,6 +1050,11 @@ export default function AssistantScreen() {
           previouslyAccepted: assistantHttpClient.hasAcceptanceEvidence(reference) };
         voiceExecutionRef.current = voiceExecution;
       }
+      const speechReference = { serverId, requestId };
+      const priorAcceptance = assistantHttpClient.hasAcceptanceEvidence(speechReference);
+      const transmission = voicePayload?.getTransmission;
+      speechExecution = speech.current?.begin(speechReference, generation, !!voice, question?.conversationId,
+        voice ? () => !priorAcceptance && (transmission?.().postCount ?? 0) > 0 && assistantHttpClient.hasAcceptanceEvidence(speechReference) : undefined);
       const task = voicePayload ? assistantOrchestrator.startVoiceRequest(voicePayload, executionOptions) :
         assistantOrchestrator.startRequest(body!, executionOptions);
       if (!isCurrent()) {
@@ -1189,6 +1205,10 @@ export default function AssistantScreen() {
       }
     } finally {
       clearInputExpiry?.();
+      const sent = voicePayload?.getTransmission();
+      if (speechExecution && voiceExecution && sent && (sent.postCount === 0 || sent.state === "rejected")) {
+        speech.current?.reject(voiceExecution.reference, generation, speechExecution);
+      }
       if (voice) {
         if (voicePayload) void voicePayload.dispose();
         else { void disposeVoiceFile(voice.owner).then(result => { if (result !== "deleted") void retryVoiceFileCleanup(); }); }
@@ -1220,6 +1240,7 @@ export default function AssistantScreen() {
       if (Platform.OS !== "ios" || scheduleDataModeStore.getState().mode !== "server") return;
       const serverId = assistantHttpClient.getServerId(), generation = scheduleDataModeStore.getState().generation;
       if (!serverId || !voiceStartAllowedRef.current()) return;
+      void speech.current?.interrupt();
       void retryVoiceFileCleanup();
       const context = getTextQuestionContext(serverId), question = context.getVoiceQuestion(Date.now());
       if (typeof question === "string") return;
@@ -1442,7 +1463,8 @@ export default function AssistantScreen() {
       manualConfirmationsRef.current.delete(key);
     } else return;
     cleanupLocksRef.current.add(key);
-    if (!displayCurrent) publishCleanup(reference, "working");
+    publishCleanup(reference, "working", Boolean(displayCurrent));
+    let cleanupResult: AssistantRecoveryCleanupPhase | undefined;
     try {
       const expectedMetadata = manualMetadata && await manualMetadata;
       if (action === "confirm-manual" && !expectedMetadata) {
@@ -1466,14 +1488,21 @@ export default function AssistantScreen() {
                 { confirmed: true },
                 { isCurrent: () => inCurrentView() && assistantLifecycle.getSnapshot() === currentSnapshot, expectedMetadata: expectedMetadata ?? undefined },
               );
+      cleanupResult = result;
       if (inCurrentView()) {
         publishCleanup(reference, result, Boolean(displayCurrent));
         setCleanupRevision((value) => value + 1);
       }
       return result;
     } catch {
+      cleanupResult = "failed";
       if (inCurrentView()) publishCleanup(reference, "failed");
     } finally {
+      if (displayCurrent && !inCurrentView() && mountedRef.current && !isMockScheduleMode() &&
+        assistantHttpClient.getServerId() === viewServerId && scheduleDataModeStore.getState().generation === generation) {
+        const done = cleanupResult === "removed" || cleanupResult === "not-found";
+        publishCleanup(reference, cleanupResult ?? "retained", done);
+      }
       cleanupLocksRef.current.delete(key);
     }
   };
@@ -1723,9 +1752,11 @@ export default function AssistantScreen() {
     !mockMode && recoverySnapshot.serverId === currentServerId;
   const recoveryPending =
     !mockMode &&
-    currentServerId !== null &&
+    ((currentServerId === null && recoverySnapshot.serverId === null &&
+      recoverySnapshot.phase === "recovering" && recoverySnapshot.initialCheck === "pending") ||
+    (currentServerId !== null &&
     (Boolean(recoverySnapshot.handoff) || ((!recoveryMatches || recoverySnapshot.initialCheck === "pending") &&
-    ["idle", "recovering", "observing"].includes(recoverySnapshot.phase)));
+    ["idle", "recovering", "observing"].includes(recoverySnapshot.phase)))));
   const recoveryProcessing =
     recoveryMatches &&
     ["recovering", "observing"].includes(recoverySnapshot.phase) &&
@@ -1758,7 +1789,7 @@ export default function AssistantScreen() {
   const recoveryControls: AssistantRecoveryControl[] = mockMode
     ? []
     : [...cleanupReferences].filter(([key]) => !recoveringRecord(recoverySnapshot, key) &&
-        !(cleanupStates[key]?.automatic && ["removed", "not-found"].includes(cleanupStates[key].phase))).map(([key, reference]) => {
+        !(cleanupStates[key]?.automatic && ["working", "removed", "not-found"].includes(cleanupStates[key].phase))).map(([key, reference]) => {
         const message = visibleMessages.find(
           (message) =>
             message.role === "assistant" &&

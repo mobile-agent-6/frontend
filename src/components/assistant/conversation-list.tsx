@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, type ComponentRef, type Ref } from "react";
+import { useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState, type ComponentRef, type Ref } from "react";
 import { AppState, Dimensions, FlatList, Keyboard, StyleSheet, Text, View } from "react-native";
 import { useFocusEffect } from "expo-router";
 
@@ -117,6 +117,7 @@ export function ConversationList({
   const textRefs = useRef(new Map<string, { token: string; node: ComponentRef<typeof Text> }>());
   const displayedCallback = useRef(onResultDisplayed);
   const visibilityRef = useRef<ReturnType<typeof createAssistantResultVisibility> | null>(null);
+  const [pendingDisplay, setPendingDisplay] = useState<ReadonlyMap<string, string>>(new Map());
   const visibleResults = useMemo(() => {
     const results = new Map<string, AssistantVisibleResult>();
     for (const message of messages) if (message.role === "assistant" && message.apiExecution?.kind === "completed" &&
@@ -132,6 +133,15 @@ export function ConversationList({
   useLayoutEffect(() => {
     if (visibilityRef.current === null) visibilityRef.current = createAssistantResultVisibility({
     isActive: () => mountedRef.current && focusedRef.current && AppState.currentState === "active",
+    onPending: (result, pending) => {
+      if (!mountedRef.current) return;
+      setPendingDisplay(previous => {
+        if (pending ? previous.get(result.messageId) === result.executionToken : previous.get(result.messageId) !== result.executionToken) return previous;
+        const next = new Map(previous);
+        if (pending) next.set(result.messageId, result.executionToken); else next.delete(result.messageId);
+        return next;
+      });
+    },
     onDisplayed: result => displayedCallback.current?.({ ...result,
       isCurrent: () => result.isCurrent() && textRefs.current.get(result.messageId)?.token === result.executionToken,
     }) ?? Promise.resolve(false),
@@ -253,6 +263,12 @@ export function ConversationList({
             assistantRecoveryKey(message.apiExecution.reference) === assistantRecoveryKey(control.reference))) ?? [];
   const showProgress = isProcessing && showProcessingNotice;
   const hasFooterContent = showProgress || footerControls.length > 0 || recoveryStorageError;
+  const recoveryControlFor = (item: ConversationMessage) => {
+    if (item.role !== "assistant" || !item.apiExecution) return;
+    const control = recoveryControls?.find(value => assistantRecoveryKey(value.reference) === assistantRecoveryKey(item.apiExecution!.reference));
+    // Suppress only an actually measured automatic attempt. Explicit/manual/error states remain available.
+    return control?.phase === undefined && pendingDisplay.get(item.id) === JSON.stringify(item.apiExecution) ? undefined : control;
+  };
   return (
     <FlatList
       ref={listRef}
@@ -345,8 +361,7 @@ export function ConversationList({
             scheduleSyncEntry={scheduleSyncForMessage(item, scheduleSyncEntries)}
             scheduleSyncRetrying={Boolean(item.apiExecution && retryingScheduleSync?.includes(assistantRecoveryKey(item.apiExecution.reference)))}
             onScheduleSyncRetry={item.apiExecution && onScheduleSyncRetry ? () => onScheduleSyncRetry(item.apiExecution!.reference) : undefined}
-            recoveryControl={item.apiExecution ? recoveryControls?.find(control =>
-              assistantRecoveryKey(control.reference) === assistantRecoveryKey(item.apiExecution!.reference)) : undefined}
+            recoveryControl={recoveryControlFor(item)}
             recoveryIssue={item.apiExecution?.kind === "needs-attention"}
             onRecoveryAction={item.apiExecution && onRecoveryAction ? action => {
               const control = recoveryControls?.find(control => assistantRecoveryKey(control.reference) === assistantRecoveryKey(item.apiExecution!.reference));

@@ -24,17 +24,65 @@ const status = (requestId, value = "accepted") => ({ requestId, conversationId: 
 const done = (requestId, kind = "outcome") => ({ ...status(requestId, "completed"), result: results[kind] });
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
 
+for (const final of ["ready", "missing", "storage", "recovered"]) test(`UX07 real lifecycle: Pi restore pending then ${final}`, async () => {
+  const gate = deferred(); let restores = 0;
+  const h = harness({ actualLifecycle: true, initialBaseUrl: null, serverTarget: "pi", settingsConnection: { restore() { restores++; return gate.promise; } } });
+  assert.equal(h.find("ConversationList").isProcessing, true, "first render waits for Pi authority before root effects");
+  assert.equal(h.find("MessageInput").disabled, true);
+  const startup = h.source("src/services/connection-initialization.ts"), pendingRestore = startup.initializeSavedConnection();
+  if (final === "recovered") {
+    await h.storage.saveBeforePost(recoveryRef(), 1000);
+    h.state.handle = async url => json(done(url.split("/").pop(), "need_more_info"));
+  }
+  const detach = h.attachLifecycle();
+  try {
+    await h.settle();
+    assert.equal(restores, 1);
+    assert.equal(h.lifecycle.getSnapshot().initialCheck, "pending", "restoration is not a failed recovery check");
+    assert.equal(h.lifecycle.getSnapshot().issue, undefined);
+    assert.equal(h.messages().some(m => m.recoveryIssue), false);
+    assert.equal(h.find("ConversationList").isProcessing, true);
+    assert.equal(h.find("MessageInput").disabled, true);
+    h.send("not sent during startup"); await h.settle(); assert.equal(h.state.starts.length, 0); assert.equal(h.state.calls.length, 0);
+    if (final !== "missing") {
+      h.state.config = h.source("src/services/api/config.ts").parseDevelopmentServerConfig(origin);
+      h.state.failRead = final === "storage";
+      h.mode.scheduleDataModeStore.getState().resetConnectionAuthority();
+    }
+    gate.resolve(); await pendingRestore; await h.settle();
+    if (final === "ready" || final === "recovered") {
+      assert.equal(h.lifecycle.getSnapshot().initialCheck, "checked");
+      if (final === "ready") assert.deepEqual(h.messages(), []);
+      else {
+        const messages = h.messages().filter(m => m.apiExecution?.kind === "completed"); assert.equal(messages.length, 1);
+        assert.equal(messages[0].apiExecution.response.data.result.questionId, id(300));
+        assert.equal(h.messages().some(m => m.recoveryIssue), false);
+      }
+      assert.equal(h.find("MessageInput").disabled, false);
+      assert.equal(h.find("ConversationList").isProcessing, false); assert.equal(h.state.initializations, 1);
+    } else {
+      assert.equal(h.lifecycle.getSnapshot().initialCheck, "failed");
+      assert.ok(h.messages().some(m => m.recoveryIssue));
+      if (final === "storage") assert.equal(h.messages().find(m => m.recoveryIssue).recoveryIssue.initialization.reason, "storage");
+      else assert.equal(h.lifecycle.getSnapshot().issue, "server-not-ready");
+    }
+    assert.equal(h.state.calls.length, final === "recovered" ? 1 : 0);
+    assert.ok(h.state.calls.every(c => c.init.method === "GET" && c.url.endsWith(recoveryRef().requestId)));
+  } finally { gate.resolve(); h.close(); detach(); await h.settle(); }
+});
+
 // 실제 화면 Hook·HTTP·복구·polling을 실행하고 native·시계·storage·fetch만 프로세스 대역으로 둔다.
 // 실제 단말 렌더링·키보드·네트워크 시험은 아니다.
 function harness({ platform = "ios", nativeVoice = false, initialMode = "server", readOnly = false, data = new Map(), initialSnapshot, actualLifecycle = false, snapshotAtSubscribe, notifyOnSubscribe = false,
-  actualScheduleSync = false, actualScheduleDetails = false, initialSyncSnapshot = [], syncSnapshotAtSubscribe, initialBaseUrl = origin } = {}) {
+  actualScheduleSync = false, actualScheduleDetails = false, initialSyncSnapshot = [], syncSnapshotAtSubscribe, initialBaseUrl = origin, serverTarget = "development", settingsConnection } = {}) {
   const cache = new Map(), slots = [], effects = [], timers = new Map(), listeners = new Set();
+  const speechFiles = require("./helpers/speech.cjs").speechFiles();
   const displayStates = new Map();
   const displayFocusCleanups = new Set();
   const voiceFocusCleanups = new Set(), voiceFocusFactories = new Set();
   let displayOwner = null, displayCursor = 0;
   let inputUiIndex, statusIndex;
-  let cursor = 0, dirty = false, tree, wall = 1000, mono = 0, timerId = 0, closed = false, displaying = false;
+  let cursor = 0, dirty = false, tree, wall = 1000, mono = 0, timerId = 0, closed = false, displaying = false, displayLayoutEffects = true;
   const state = { app: "active", calls: [], starts: [], uuidCalls: 0, failUuid: false, failStorage: false, throwMessage: false,
     cleanup: 0, storageCleanupCalls: [], manualCleanupCalls: [], lateUpdates: 0, mockRuns: 0, beforeUuid: null, config: null, failRead: false, beforeRead: null,
     recoveryListeners: new Set(), lastRecoveryListener: null, beforeSubscribe: null, initializations: 0, unsubscribed: 0,
@@ -63,13 +111,23 @@ function harness({ platform = "ios", nativeVoice = false, initialMode = "server"
       if (displaying) return { current: initial }; return slots[cursor++] ??= { current: initial }; },
     useCallback(fn, deps) { if (displaying) return fn; const i = cursor++; if (!same(slots[i]?.deps, deps)) slots[i] = { deps, value: fn }; return slots[i].value; },
     useEffect(fn, deps) { if (displaying) return; const i = cursor++; if (!same(slots[i]?.deps, deps)) effects.push(() => { slots[i]?.cleanup?.(); slots[i] = { deps, cleanup: fn() }; }); },
-    useLayoutEffect(fn, deps) { if (displaying) fn(); else react.useEffect(fn, deps); },
+    useLayoutEffect(fn, deps) { if (displaying) { if (displayLayoutEffects) fn(); } else react.useEffect(fn, deps); },
     useMemo(factory) { return factory(); },
     useImperativeHandle() {},
   };
   const setTimer = (fn, ms) => { const token = ++timerId; timers.set(token, { fn, at: mono + ms, ms }); return token; };
   const clearTimer = token => timers.delete(token);
-  const send = (url, init) => { state.calls.push({ url, init }); return state.handle(url, init); };
+  const send = (url, init) => {
+    (state.allCalls ??= []).push({ url, init });
+    if (url.endsWith("/speech")) {
+      assert.equal(init.method, "GET");
+      (state.speechCalls ??= []).push({ url, init });
+      return state.speechHandle?.(url, init) ?? Promise.resolve(new Response(require("./helpers/speech.cjs").speechWav(), {
+        status: 200, headers: { "Content-Type": "audio/wav", "X-Request-ID": id(900) } }));
+    }
+    // Existing counts describe Assistant/Schedule requests; speech has its own explicit ledger.
+    state.calls.push({ url, init }); return state.handle(url, init);
+  };
   const adapter = { async getItem(key) { if (state.beforeRead) await state.beforeRead(); if (state.failRead) throw Error("조회 실패"); return data.get(key) ?? null; }, async setItem(key, value) { if (state.beforeWrite) await state.beforeWrite(value); if (state.failStorage) throw Error("저장 실패"); data.set(key, value); } };
   const syncDouble = { observe: async () => null, getSnapshot: () => state.syncSnapshot,
     retry: async reference => { state.syncRetries.push(reference); return state.syncSnapshot.find(entry => entry.reference.requestId === reference.requestId) ?? null; },
@@ -85,7 +143,7 @@ function harness({ platform = "ios", nativeVoice = false, initialMode = "server"
     const code = ts.transpileModule(fs.readFileSync(file, "utf8"), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX }, fileName: file }).outputText;
     function resolve(name) {
       if (name === "expo-router") return { useFocusEffect: callback => {
-        if (displaying) displayFocusCleanups.add(callback());
+        if (displaying) { if (displayLayoutEffects) displayFocusCleanups.add(callback()); }
         else react.useEffect(() => { voiceFocusFactories.add(callback); const cleanup = callback(); voiceFocusCleanups.add(cleanup);
           return () => { voiceFocusFactories.delete(callback); voiceFocusCleanups.delete(cleanup); cleanup?.(); }; }, [callback]);
       } };
@@ -105,11 +163,17 @@ function harness({ platform = "ios", nativeVoice = false, initialMode = "server"
       if (name === "react-native") return native;
       if (name === "zustand" || name === "zustand/vanilla") return require(name);
       if (name === "expo/fetch") return { fetch: send };
+      if (name === "@/services/settings-runtime" && settingsConnection) return { settingsConnection };
+      if (name === "expo-file-system") return speechFiles.fs;
       if (name === "@react-native-async-storage/async-storage") return adapter;
+      if (name === "expo-crypto" && file.endsWith("speech-file.ts")) return speechFiles.crypto;
       if (name === "expo-crypto") return { randomUUID: () => { state.uuidCalls++; state.beforeUuid?.(); if (state.failUuid) throw Error("UUID 실패"); return state.uuidValue ?? randomUUID(); } };
       if (name === "@/services/expo-audio-playback") return { createExpoPlaybackDependencies(canPlay) {
         const session = load(path.join(root, "src/services/local-audio-session.ts")).localAudioSession;
         const playback = playbackFixture(deps => { deps.canPlay = canPlay; }, session);
+        const validate = playback.deps.validate;
+        playback.deps.validate = async source => source.kind === "file" && speechFiles.entries.has(source.uri) ? undefined : validate(source);
+        if (file.endsWith("use-assistant-speech.ts") || !state.speechPlayback) state.speechPlayback = playback;
         state.playback = playback;
         return playback.deps;
       } };
@@ -139,9 +203,10 @@ function harness({ platform = "ios", nativeVoice = false, initialMode = "server"
       assert.ok(name.startsWith("@/"), name); if (!actualScheduleSync) assert.notEqual(name, "@/services/api/http");
       return load(path.join(root, "src", `${name.slice(2)}.ts`));
     }
-    new Function("require", "module", "exports", "fetch", "setTimeout", "clearTimeout", "performance", "process", "Date", code)(resolve, module, module.exports,
-      () => { throw Error("실제 네트워크 금지"); }, setTimer, clearTimer, { now: () => mono }, { env: { EXPO_PUBLIC_DEV_SERVER_BASE_URL: origin, EXPO_PUBLIC_SCHEDULE_DATA_MODE: initialMode, EXPO_PUBLIC_SCHEDULE_READ_ONLY: String(readOnly) } },
-      ["assistant.tsx", "assistant-text-question.ts", "assistant-message.tsx"].some(name => file.endsWith(name)) ? class extends Date { static now() { return wall; } } : Date);
+    new Function("require", "module", "exports", "fetch", "setTimeout", "clearTimeout", "performance", "process", "Date", "__DEV__", "console", code)(resolve, module, module.exports,
+      () => { throw Error("실제 네트워크 금지"); }, setTimer, clearTimer, { now: () => mono }, { env: { EXPO_PUBLIC_SERVER_TARGET: serverTarget, EXPO_PUBLIC_DEV_SERVER_BASE_URL: origin, EXPO_PUBLIC_SCHEDULE_DATA_MODE: initialMode, EXPO_PUBLIC_SCHEDULE_READ_ONLY: String(readOnly) } },
+      ["assistant.tsx", "assistant-text-question.ts", "assistant-message.tsx"].some(name => file.endsWith(name)) ? class extends Date { static now() { return wall; } } : Date,
+      true, { info(...args) { (state.diagnostics ??= []).push(args); } });
     // 기존 목록 동기화 회귀에서는 카드 조회를 분리하며 신규 통합 사례에서 실제 단건 GET도 실행한다.
     if (file.endsWith(path.join("src", "services", "api", "assistant-schedule-sync.ts")) && !actualScheduleDetails) {
       module.exports.assistantScheduleSync = module.exports.createAssistantScheduleSync();
@@ -186,14 +251,14 @@ function harness({ platform = "ios", nativeVoice = false, initialMode = "server"
   async function settle() { for (let n = 0; n < 350; n++) await Promise.resolve(); if (!closed) render(); }
   async function advance(ms) { const target = mono + ms; let count = 0; while (true) { const next = Math.min(...[...timers.values()].map(t => t.at)); if (next > target) break; if (++count > 500) throw Error("타이머 반복"); wall += next - mono; mono = next;
       for (const [key, timer] of [...timers]) if (timer.at <= mono) { timers.delete(key); timer.fn(); } await settle(); } wall += target - mono; mono = target; await settle(); }
-  function renderConversation(messages = find("ConversationList").messages, props = {}) {
+  function renderConversation(messages = find("ConversationList").messages, props = {}, runLayoutEffects = true) {
     // FlatList의 실제 renderItem과 표시 컴포넌트를 실행한다. 스크롤/native effect는 실행하지 않는다.
-    let list; displaying = true;
+    let list; displaying = true; const previousLayoutEffects = displayLayoutEffects; displayLayoutEffects = runLayoutEffects;
     const previousDisplayOwner = displayOwner, previousDisplayCursor = displayCursor;
     if (!displayStates.has("ConversationList")) displayStates.set("ConversationList", []);
     displayOwner = displayStates.get("ConversationList"); displayCursor = 0;
     try { list = source("src/components/assistant/conversation-list.tsx").ConversationList({ ...find("ConversationList"), ...props, messages }); }
-    finally { displaying = false; displayOwner = previousDisplayOwner; displayCursor = previousDisplayCursor; }
+    finally { displaying = false; displayLayoutEffects = previousLayoutEffects; displayOwner = previousDisplayOwner; displayCursor = previousDisplayCursor; }
     assert.equal(list.type, "FlatList");
     const components = [];
     function expand(node) {
@@ -212,7 +277,7 @@ function harness({ platform = "ios", nativeVoice = false, initialMode = "server"
     return { list, components, rows: list.props.data.map(item => expand(list.props.renderItem({ item }))), footer: expand(list.props.ListFooterComponent) };
   }
   render();
-  return { state, source, storage, data, mock, mode, delegate, lifecycle, sync, render, renderConversation, find, settle, advance, timers, listeners,
+  return { state, source, storage, data, mock, mode, delegate, lifecycle, sync, render, renderConversation, peekConversation: () => renderConversation(undefined, {}, false), find, settle, advance, timers, listeners, speechFiles,
     get wall() { return wall; }, set wall(value) { wall = value; },
     messages: () => find("ConversationList").messages,
     fixtureInputUi(input) { assert.notEqual(inputUiIndex, undefined); slots[inputUiIndex].value = input; render(); },
@@ -541,7 +606,9 @@ for (const [operation, label] of [["create", "등록"], ["update", "수정"], ["
 for (const outcome of ["cancelled", "no_match"]) test(`outcome ${outcome}: 성공과 분리·optional operation 보존`, async () => {
   const result = { kind: "outcome", text: "서버 원문", outcome, schedulesChanged: false, ...(outcome === "no_match" ? { operation: "list" } : {}) };
   await showResult(result, (h, view) => {
-    assert.ok(textOf(view.rows).includes(outcome === "cancelled" ? "취소됨" : "대상 없음")); assert.doesNotMatch(textOf(view.rows), /완료/); assert.equal(cards(view).length, 0);
+    assert.ok(textOf(view.rows).includes(result.text));
+    if (outcome === "cancelled") assert.doesNotMatch(textOf(view.rows), /취소됨/); else assert.ok(textOf(view.rows).includes("대상 없음"));
+    assert.doesNotMatch(textOf(view.rows), /완료/); assert.equal(cards(view).length, 0);
     const mapped = view.components.find(item => item.name === "AssistantMessage").props.apiResult; assert.equal(mapped.outcome, outcome); assert.equal(mapped.schedulesChanged, false); assert.equal(Object.hasOwn(mapped, "operation"), outcome === "no_match");
   });
 });
@@ -554,9 +621,9 @@ test("API 메시지에 Mock 필드를 섞어도 목록이 Mock 카드·interacti
   });
 });
 
-test("취소 결과에 operation이 있으면 해당 작업만 표시하고 없던 작업을 생성하지 않음", async () => {
+test("취소 결과의 operation은 보존하고 원문 외 중복 상태를 생성하지 않음", async () => {
   await showResult({ kind: "outcome", text: "취소 문구", outcome: "cancelled", operation: "delete", schedulesChanged: false }, (h, view) => {
-    assert.match(textOf(view.rows), /삭제 취소됨/); assert.equal(cards(view).length, 0);
+    assert.match(textOf(view.rows), /취소 문구/); assert.doesNotMatch(textOf(view.rows), /취소됨/); assert.equal(cards(view).length, 0);
     assert.equal(view.components.find(item => item.name === "AssistantMessage").props.apiResult.operation, "delete");
   });
 });
@@ -1351,7 +1418,7 @@ for (const approved of [true, false]) test(`6-C 실제 ${approved ? "예" : "아
     assert.equal(confirmationButtons(h, message.id)[approved ? 1 : 0].props.accessibilityState.selected, true);
     assert.ok(confirmationButtons(h, message.id).every(button => button.props.disabled));
     assert.deepEqual(h.messages().at(-1).apiExecution.response.data.result, confirmationOutcome(approved));
-    assert.ok(textOf(h.renderConversation().rows).includes(approved ? confirmationOutcome(true).text : "수정 취소됨"));
+    assert.ok(textOf(h.renderConversation().rows).includes(confirmationOutcome(approved).text));
     assert.equal(h.find("MessageInput").value, "사용자 초안 유지"); assert.equal(h.state.uuidCalls, 2);
     assert.ok(h.state.calls.every(call => call.url.startsWith(`${origin}/api/v1/assistant/requests`)));
     assert.strictEqual(h.mock.getState().schedules, before); assert.equal(h.state.mockRuns, 0); assert.equal(h.state.cleanup, 0);
@@ -3588,7 +3655,8 @@ for (const kind of Object.keys(results)) test(`3 screen voice ${kind}: transcrip
     await recordVoice(h); assert.equal(voiceCalls(h).length,1);
     assert.equal(h.messages().filter(m=>m.role==="user").length,1); assert.equal(h.messages().find(m=>m.role==="user").text,"일정 보여줘");
     assert.equal(h.messages().at(-1).apiExecution.response.data.result.kind,kind); assert.equal(h.state.nativeVoice.entries.size,0);
-    assert.ok(h.state.calls.every(c=>!c.url.endsWith("/speech"))); assert.equal(h.state.mockRuns,0); assert.equal(h.find("MessageInput").disabled,false);
+    // Stage 4 deliberately activates speech; the earlier no-TTS expectation is superseded.
+    await h.settle(); assert.equal(h.state.speechCalls.length,1); assert.equal(h.state.mockRuns,0); assert.equal(h.find("MessageInput").disabled,false);
     h.render(); await h.settle(); assert.equal(voiceCalls(h).length,1);assert.equal(h.messages().filter(m=>m.role==="user").length,1);
   } finally { h.close(); }
 });
@@ -4316,4 +4384,417 @@ for (const [label, text, covered] of [
     assert.deepEqual(h.messages().at(-1).apiExecution.response.data.result, result);
     assert.equal(postedBodies(h).length, 1);
   } finally { h.close(); }
+});
+
+// Stage 4 uses the actual screen -> speech service -> Voice API -> PCM parser ->
+// file owner -> playback controller. Only native files/player and HTTP are synthetic.
+for (const kind of Object.keys(results)) test(`stage4 screen ${kind}: render first, speech GET once, actual EOF cleanup`, async () => {
+  const h = harness({ nativeVoice: true });
+  try {
+    h.state.handle = voiceResponse(h, { ...results[kind], ...(results[kind].expiresAt ? { expiresAt: new Date(h.wall + 600000).toISOString() } : {}) });
+    h.state.speechHandle = async (url, init) => {
+      assert.equal(h.messages().at(-1).apiExecution.response.data.result.kind, kind, "result is committed before speech download");
+      assert.equal(init.redirect, "error"); assert.equal(init.method, "GET");
+      return new Response(require("./helpers/speech.cjs").speechWav({ ancillary: 3 }), { headers: { "Content-Type": "audio/wav", "X-Request-ID": id(900) } });
+    };
+    await recordVoice(h); await h.settle();
+    const requestId = new URL(voiceCalls(h)[0].url).searchParams.get("requestId");
+    assert.equal(h.state.speechCalls.length, 1); assert.equal(h.state.speechCalls[0].url, `${origin}/api/v1/voice/requests/${requestId}/speech`);
+    assert.equal(h.state.speechPlayback.state.starts, 1); assert.equal(h.speechFiles.entries.size, 1);
+    assert.equal(h.find("MessageInput").disabled, false); assert.equal(h.state.allCalls.filter(c => c.init.method === "POST").length, 1);
+    h.render(); await h.settle(); assert.equal(h.state.speechCalls.length, 1);
+    h.state.speechPlayback.emit({ didJustFinish: true }); await h.settle(); assert.equal(h.speechFiles.entries.size, 0);
+    assert.equal(h.messages().at(-1).apiExecution.response.data.result.kind, kind);
+  } finally { h.close(); }
+});
+
+for (const kind of ["need_more_info", "candidate_selection", "confirmation"]) test(`stage4 screen voice-origin ${kind} text/button follow-up`, async () => {
+  const h = harness({ nativeVoice: true });
+  try {
+    h.state.handle = voiceResponse(h, { ...results[kind], ...(results[kind].expiresAt ? { expiresAt: new Date(h.wall + 600000).toISOString() } : {}) });
+    await recordVoice(h); await h.settle(); assert.equal(h.state.speechCalls.length, 1);
+    const message = h.messages().at(-1); h.state.handle = responseWith(results.outcome);
+    if (kind === "need_more_info") h.send("오후 3시");
+    else if (kind === "candidate_selection") h.find("ConversationList").onApiCandidateSelection(message.id, results[kind].candidates[0].candidateId);
+    else h.find("ConversationList").onApiConfirmation(message.id, false);
+    await h.settle(); await h.settle();
+    assert.equal(h.state.speechCalls.length, 2); assert.equal(h.state.speechPlayback.state.starts, 2);
+    assert.equal(h.state.allCalls.filter(c => c.init.method === "POST").length, 2);
+    assert.equal(h.messages().filter(m => m.role === "user").length, 2);
+  } finally { h.close(); }
+});
+
+test("stage4 screen text-origin voice follow-up stays silent", async () => {
+  const h = harness({ nativeVoice: true });
+  try { await historyQuestion(h, "need_more_info"); h.state.handle = voiceResponse(h); await recordVoice(h); await h.settle();
+    assert.equal(h.state.speechCalls?.length ?? 0, 0); assert.equal(h.state.speechPlayback.state.starts, 0);
+    assert.equal(voiceCalls(h).length, 1); assert.equal(h.messages().at(-1).apiExecution.response.data.result.kind, "outcome");
+  } finally { h.close(); }
+});
+
+for (const exit of ["blur", "background", "inactive", "server", "unmount", "text", "voice"]) test(`stage4 screen pending TTS ${exit} invalidates bytes and preserves result`, async () => {
+  const h = harness({ nativeVoice: true }), gate = deferred();
+  try {
+    h.state.handle = voiceResponse(h); h.state.speechHandle = () => gate.promise;
+    await recordVoice(h); await h.settle(); const call = h.state.speechCalls[0]; assert.ok(call);
+    if (exit === "blur") { h.blurVoice(); h.focusVoice(); }
+    else if (["background", "inactive"].includes(exit)) { h.app(exit); h.app("active"); }
+    else if (exit === "server") { h.switchMode("mock"); h.switchMode("server"); }
+    else if (exit === "unmount") h.close();
+    else if (exit === "text") { h.state.handle = responseWith(results.outcome); h.send("다음 조회"); }
+    else { h.find("MessageInput").onStartVoice(); await h.settle(); }
+    assert.equal(call.init.signal.aborted, true);
+    gate.resolve(new Response(require("./helpers/speech.cjs").speechWav(), { headers: { "Content-Type": "audio/wav", "X-Request-ID": id(900) } }));
+    await h.settle(); assert.equal(h.speechFiles.entries.size, 0); assert.equal(h.state.speechPlayback.state.starts, 0);
+    assert.equal(h.state.speechCalls.length, 1);
+  } finally { h.close(); }
+});
+
+test("stage4 screen new recording safely stops playing TTS before recording", async () => {
+  const h = harness({ nativeVoice: true });
+  try { h.state.handle = voiceResponse(h); await recordVoice(h); await h.settle(); assert.equal(h.speechFiles.entries.size, 1);
+    h.find("MessageInput").onStartVoice(); await h.settle(); assert.equal(h.find("VoiceInputStatus").input.phase, "recording");
+    assert.equal(h.state.speechPlayback.controller.isBusy(), false); assert.equal(h.speechFiles.entries.size, 0);
+    assert.deepEqual(h.state.speechPlayback.state.operations.slice(-3), ["pause", "reset", "release"]);
+  } finally { h.close(); }
+});
+
+for (const issue of ["network", "TTS_UNAVAILABLE", "SPEECH_NOT_READY", "VOICE_BUSY", "bad-wav"]) test(`stage4 screen ${issue}: no Assistant replay, result and question preserved`, async () => {
+  const h = harness({ nativeVoice: true });
+  try {
+    h.state.handle = voiceResponse(h, results.need_more_info);
+    h.state.speechHandle = () => issue === "network" ? Promise.reject(Error("synthetic network")) : issue === "bad-wav" ?
+      Promise.resolve(new Response(new Uint8Array(50), { headers: { "Content-Type": "audio/wav", "X-Request-ID": id(900) } })) :
+      Promise.resolve(voiceProblemResponse(issue === "TTS_UNAVAILABLE" ? 503 : 409, issue, new URL(h.state.speechCalls[0].url).pathname.split("/").at(-2)));
+    await recordVoice(h); await h.settle(); await h.advance(2000); await h.settle();
+    assert.equal(h.state.speechCalls.length, issue === "VOICE_BUSY" ? 2 : 1);
+    assert.equal(voiceCalls(h).length, 1); assert.equal(h.messages().at(-1).apiExecution.response.data.result.kind, "need_more_info");
+    assert.equal(h.find("MessageInput").disabled, false); assert.equal(h.speechFiles.entries.size, 0);
+    assert.equal(h.state.allCalls.filter(c => c.init.method === "POST").length, 1);
+  } finally { h.close(); }
+});
+
+for (const boundary of ["headers", "body"]) test(`stage4 screen real Voice API ${boundary} deadline includes body and aborts at 35 seconds`, async () => {
+  const h = harness({ nativeVoice: true }), gate = deferred(); let response, cancelled = 0;
+  try {
+    h.state.handle = voiceResponse(h);
+    h.state.speechHandle = () => {
+      response = new Response(new ReadableStream({ cancel() { cancelled++; } }), { headers: { "Content-Type": "audio/wav", "X-Request-ID": id(900) } });
+      return boundary === "headers" ? gate.promise : Promise.resolve(response);
+    };
+    await recordVoice(h); await h.settle(); await h.advance(34999); assert.equal(h.state.speechCalls[0].init.signal.aborted, false);
+    await h.advance(1); assert.equal(h.state.speechCalls[0].init.signal.aborted, true);
+    if (boundary === "headers") { gate.resolve(response); await h.settle(); }
+    assert.equal(cancelled, 1); assert.equal(response.body.locked, false); assert.equal(h.speechFiles.entries.size, 0);
+    assert.equal(h.messages().at(-1).apiExecution.response.data.result.kind, "outcome"); assert.equal(voiceCalls(h).length, 1);
+  } finally { h.close(); }
+});
+
+test("stage4 screen real Voice API busy at 35s + 2s wait + 35s second body never resets 72s total deadline", async () => {
+  const h = harness({ nativeVoice: true }); let cancelled = 0, controller;
+  try {
+    h.state.handle = voiceResponse(h);
+    h.state.speechHandle = () => h.state.speechCalls.length === 1 ? Promise.resolve(new Response(new ReadableStream({ start(c) { controller = c; } }), {
+      status: 409, headers: { "Content-Type": "application/problem+json", "X-Request-ID": id(900) } })) :
+      Promise.resolve(new Response(new ReadableStream({ cancel() { cancelled++; } }), { headers: { "Content-Type": "audio/wav", "X-Request-ID": id(900) } }));
+    await recordVoice(h); await h.settle(); await h.advance(34999);
+    const requestId = new URL(voiceCalls(h)[0].url).searchParams.get("requestId");
+    const problem = voiceProblemResponse(409, "VOICE_BUSY", requestId); controller.enqueue(new TextEncoder().encode(await problem.text())); controller.close(); await h.settle();
+    await h.advance(1999); assert.equal(h.state.speechCalls.length, 1); await h.advance(1); assert.equal(h.state.speechCalls.length, 2);
+    await h.advance(35000); assert.equal(h.state.speechCalls[1].init.signal.aborted, true); assert.equal(cancelled, 1);
+    assert.equal(h.speechFiles.entries.size, 0); assert.equal(voiceCalls(h).length, 1);
+  } finally { h.close(); }
+});
+
+for (const mode of ["no-length", "false-length", "above-limit", "exact-limit"]) test(`stage4 screen bounded stream ${mode} and actual PCM validation`, async () => {
+  const h = harness({ nativeVoice: true }); let cancelled = 0;
+  try {
+    h.state.handle = voiceResponse(h);
+    const wav = require("./helpers/speech.cjs").speechWav(mode === "exact-limit" ? { frames: (8388608 - 44) / 2 } : {});
+    h.state.speechHandle = async () => ({ status: 200, headers: new Headers({ "Content-Type": "audio/wav", "X-Request-ID": id(900),
+      ...(mode === "false-length" ? { "Content-Length": "1" } : mode === "above-limit" ? { "Content-Length": "8388609" } : {}) }),
+      body: { getReader() { let n = 0; return { read: async () => n++ ? { done: true } : { done: false, value: wav }, cancel() { cancelled++; }, releaseLock() {} }; } },
+      arrayBuffer() { assert.fail("unbounded fallback forbidden"); } });
+    await recordVoice(h); await h.settle(); const success = ["no-length", "exact-limit"].includes(mode);
+    assert.equal(h.state.speechPlayback.state.starts, success ? 1 : 0); assert.equal(h.speechFiles.entries.size, success ? 1 : 0);
+    assert.equal(cancelled, 1); assert.equal(voiceCalls(h).length, 1);
+  } finally { h.close(); }
+});
+
+for (const keepMetadata of [true, false]) test(`review01 prior text acceptance across screen recreation metadata=${keepMetadata}: same ID cannot become voice origin`, async () => {
+  const h = harness({ nativeVoice: true });
+  try {
+    h.state.handle = responseWith(results.outcome); h.send("기존 텍스트 조회"); await h.settle();
+    const old = h.messages().at(-1).apiExecution, reference = old.reference;
+    assert.equal(h.source("src/services/api/assistant.ts").assistantHttpClient.hasAcceptanceEvidence(reference), true);
+    if (!keepMetadata) await h.storage.cleanup(reference, { type: "result-displayed" });
+    h.remount(); await h.settle(); h.state.uuidValue = reference.requestId;
+    h.state.handle = async () => json(old.response.data);
+    await recordVoice(h); await h.settle();
+    assert.equal(h.state.starts.at(-1)[0].getTransmission().postCount, 0, "this voice payload never dispatched");
+    assert.equal(voiceCalls(h).length, 0); assert.equal(h.state.allCalls.filter(c => c.init.method === "POST").length, 1);
+    const checked = await h.delegate.queryRequestOnce(reference).completion;
+    assert.equal(checked.kind, "completed"); h.publishSnapshot(snapshotOf([checked])); await h.settle();
+    assert.equal(h.messages().at(-1).apiExecution.response.data.conversationId, old.response.data.conversationId);
+    assert.equal(h.state.speechCalls?.length ?? 0, 0, "prior text acceptance must not promote a new voice attempt");
+    assert.equal(h.state.speechPlayback.state.starts, 0);
+  } finally { h.close(); }
+});
+
+test("review01 initial orchestration busy has no transmission fields: later old GET stays silent", async () => {
+  const h = harness({ nativeVoice: true }), reference = recoveryRef(id(640)); let lease;
+  try {
+    h.state.uuidValue = reference.requestId;
+    lease = h.source("src/services/api/assistant-request-recovery.ts").acquireAssistantRequestLease(reference);
+    assert.ok(lease); const start = h.delegate.startVoiceRequest; let result;
+    h.delegate.startVoiceRequest = (...args) => { const task = start(...args); void task.completion.then(value => { result = value; }); return task; };
+    await recordVoice(h); await h.settle();
+    assert.equal(result.reason, "busy"); assert.equal(result.inputSource, undefined); assert.equal(result.voiceTransmission, undefined);
+    assert.equal(h.state.starts.at(-1)[0].getTransmission().postCount, 0); assert.equal(voiceCalls(h).length, 0);
+    lease.release(); lease = null; h.state.handle = async () => json(done(reference.requestId));
+    const checked = await h.delegate.queryRequestOnce(reference).completion; assert.equal(checked.kind, "completed");
+    h.publishSnapshot(snapshotOf([checked])); await h.settle();
+    assert.equal(h.state.allCalls.filter(c => c.init.method === "POST").length, 0);
+    assert.equal(h.state.speechCalls?.length ?? 0, 0, "a rejected admission cannot leave a promotable voice origin");
+  } finally { lease?.release(); h.close(); }
+});
+
+for (const path of ["202", "lost-GET", "200-replay"]) test(`review01 current voice dispatch ${path} retains automatic speech`, async () => {
+  const h = harness({ nativeVoice: true });
+  try {
+    h.state.handle = path === "lost-GET" ? async (url, init) => { if (init.method === "POST") throw Error("synthetic response loss"); return json(done(url.split("/").pop())); } :
+      voiceResponse(h, results.outcome, { replay: path === "200-replay" });
+    await recordVoice(h); await h.settle();
+    assert.equal(h.state.starts.at(-1)[0].getTransmission().postCount, 1); assert.equal(voiceCalls(h).length, 1);
+    assert.equal(h.state.speechCalls.length, 1); assert.equal(h.state.speechPlayback.state.starts, 1);
+    assert.equal(h.messages().filter(m => m.role === "assistant" && m.apiExecution?.kind === "completed").length, 1);
+    if (path !== "202") assert.equal(h.messages().filter(m => m.role === "user").length, 0);
+  } finally { h.close(); }
+});
+
+for (const kind of ["need_more_info", "candidate_selection", "confirmation"]) test(`review01 tab return then explicit ${kind} follow-up keeps voice conversation origin`, async () => {
+  const h = harness({ nativeVoice: true });
+  try {
+    h.state.handle = voiceResponse(h, { ...results[kind], ...(results[kind].expiresAt ? { expiresAt: new Date(h.wall + 600000).toISOString() } : {}) });
+    await recordVoice(h); await h.settle(); const question = h.messages().at(-1);
+    assert.equal(h.state.speechCalls.length, 1); h.blurVoice(); h.focusVoice(); await h.settle();
+    assert.equal(h.state.speechCalls.length, 1, "return cannot replay the old request");
+    h.state.handle = responseWith(results.outcome); historyAnswer(h, kind, question); await h.settle(); await h.settle();
+    assert.equal(h.state.speechCalls.length, 2); assert.equal(h.state.allCalls.filter(c => c.init.method === "POST").length, 2);
+    const body = JSON.parse(h.state.calls.filter(call => call.init.method === "POST" && typeof call.init.body === "string").at(-1).init.body);
+    assert.equal(body.conversationId, question.apiExecution.response.data.conversationId);
+    assert.equal(body.input.questionId, question.apiExecution.response.data.result.questionId);
+  } finally { h.close(); }
+});
+
+for (const kind of ["need_more_info", "candidate_selection", "confirmation"]) test(`review01 accepted text question ${kind} ID collision is not promoted`, async () => {
+  const h = harness({ nativeVoice: true });
+  try {
+    const old = await historyQuestion(h, kind); h.state.uuidValue = old.apiExecution.reference.requestId;
+    h.state.handle = async () => json(old.apiExecution.response.data);
+    await recordVoice(h); await h.settle();
+    const checked = await h.delegate.queryRequestOnce(old.apiExecution.reference).completion;
+    assert.equal(checked.kind, "completed"); h.publishSnapshot(snapshotOf([checked])); await h.settle();
+    assert.equal(checked.response.data.conversationId, old.apiExecution.response.data.conversationId);
+    assert.equal(checked.response.data.result.questionId, old.apiExecution.response.data.result.questionId);
+    assert.equal(voiceCalls(h).length, 0); assert.equal(h.state.speechCalls?.length ?? 0, 0);
+  } finally { h.close(); }
+});
+
+test("review01 policy not-sent admission discards provisional origin before later GET", async () => {
+  const h = harness({ nativeVoice: true, readOnly: true });
+  try {
+    h.state.uuidValue = id(641); await recordVoice(h); await h.settle();
+    const payload = h.state.starts.at(-1)[0]; assert.equal(payload.getTransmission().postCount, 0); assert.equal(voiceCalls(h).length, 0);
+    h.state.handle = async () => json(done(payload.requestId)); const checked = await h.delegate.queryRequestOnce(recoveryRef(payload.requestId)).completion;
+    assert.equal(checked.kind, "completed"); h.publishSnapshot(snapshotOf([checked])); await h.settle();
+    assert.equal(h.state.speechCalls?.length ?? 0, 0);
+  } finally { h.close(); }
+});
+
+test("review01 actual lifecycle recovers delayed voice result silently, explicit new follow-up speaks", async () => {
+  const h = harness({ nativeVoice: true, actualLifecycle: true }), detach = h.attachLifecycle();
+  try {
+    await h.settle();
+    h.state.handle = (url, init) => init.method === "POST" ? voiceResponse(h)(url, init) : json(status(url.split("/").pop(), "processing"));
+    await recordVoice(h); await h.settle(); assert.equal(h.state.speechCalls?.length ?? 0, 0);
+    const requestId = new URL(voiceCalls(h)[0].url).searchParams.get("requestId");
+    h.blurVoice(); h.state.handle = voiceResponse(h, results.need_more_info); h.focusVoice(); await h.settle(); await h.settle();
+    assert.equal(h.messages().at(-1).apiExecution.reference.requestId, requestId);
+    assert.equal(h.messages().at(-1).apiExecution.response.data.result.kind, "need_more_info");
+    assert.equal(h.state.speechCalls?.length ?? 0, 0); assert.equal(voiceCalls(h).length, 1);
+    h.state.handle = responseWith(results.outcome); h.send("오후 세 시"); await h.settle(); await h.settle();
+    assert.equal(h.state.speechCalls.length, 1); assert.equal(h.state.speechPlayback.state.starts, 1);
+    assert.equal(h.state.allCalls.filter(c => c.init.method === "POST").length, 2);
+  } finally { h.close(); detach(); }
+});
+
+for (const interrupt of [false, true]) test(`review speech-not-ready single common GET interrupt=${interrupt}`, async () => {
+  const h = harness({ nativeVoice: true }), gate = deferred(); let checking, before;
+  try {
+    h.state.handle = voiceResponse(h, results.need_more_info);
+    h.state.speechHandle = async url => {
+      before = h.state.calls.length;
+      h.state.handle = (target, init) => { assert.equal(init.method, "GET"); checking = { target, init }; return gate.promise; };
+      return voiceProblemResponse(409, "SPEECH_NOT_READY", new URL(url).pathname.split("/").at(-2));
+    };
+    await recordVoice(h); await h.settle(); assert.ok(checking);
+    const requestId = new URL(voiceCalls(h)[0].url).searchParams.get("requestId");
+    assert.equal(checking.target, `${origin}/api/v1/assistant/requests/${requestId}`);
+    assert.equal(h.state.calls.length, before + 1); assert.equal(h.state.speechCalls.length, 1);
+    const question = h.messages().at(-1).apiExecution.response.data, oldCheck = checking;
+    if (interrupt) {
+      h.state.speechHandle = async () => new Response(require("./helpers/speech.cjs").speechWav(), { headers: { "Content-Type": "audio/wav", "X-Request-ID": id(900) } });
+      h.state.handle = responseWith(results.outcome); h.send("오후 세 시"); await h.settle();
+      assert.equal(oldCheck.init.signal.aborted, true);
+    }
+    gate.resolve(json(question)); await h.settle(); await h.advance(4000);
+    assert.equal(h.state.speechCalls.length, 1 + (interrupt ? 1 : 0));
+    assert.equal(h.state.calls.filter(call => call.init.method === "GET" && call.url === oldCheck.target).length, 2, "one normal result GET plus exactly one speech-not-ready check");
+    assert.equal(voiceCalls(h).length, 1); assert.equal(h.state.allCalls.filter(c => c.init.method === "POST").length, interrupt ? 2 : 1);
+    if (!interrupt) assert.deepEqual(h.messages().at(-1).apiExecution.response.data, question);
+  } finally { gate.resolve(json(done(id(1)))); h.close(); }
+});
+
+for (const stage of ["visibility-dwell", "storage"]) test(`UX05 measured failure automatic cleanup ${stage} does not flash manual actions`, async () => {
+  const h = harness({ nativeVoice: true }), gate = deferred();
+  const failure = { kind: "failure", text: "입력을 이해하지 못했어요. 내용을 확인해 다시 말씀해 주세요.", code: "MODEL_OUTPUT_INVALID", nextAction: "revise_input" };
+  try {
+    h.state.handle = voiceResponse(h, results.need_more_info); await recordVoice(h); await readyCleanup(h);
+    h.state.handle = responseWith({ ...results.need_more_info, questionId: id(301) }); h.send("입고 수량 확인"); await readyCleanup(h);
+    h.state.handle = responseWith(failure); h.send("제목을 입고 수량 확인으로 바꿔 줘."); await readyCleanup(h);
+    const message = h.messages().at(-1), reference = message.apiExecution.reference;
+    const exposure = nativeResultExposure(h, item => ({ x: 20, y: item.id === message.id ? 120 : 900, width: 300, height: 40 }));
+    exposure.layout(); await h.settle();
+    if (stage === "storage") { h.state.beforeRead = () => gate.promise; await h.advance(1000); assert.ok(h.state.cleanup > 0); }
+    else await h.advance(999);
+    const view = h.peekConversation();
+    assert.equal(nodes([view.rows, view.footer], "Pressable").filter(n => n.props.testID?.startsWith("assistant-recovery-")).length, 0,
+      "an active measured automatic cleanup must not advertise manual cleanup");
+    assert.deepEqual(h.messages().at(-1).apiExecution.response.data.result, failure);
+    assert.equal(h.state.allCalls.filter(c => c.init.method === "POST").length, 3);
+    assert.equal(h.state.speechCalls.length, 3);
+    h.state.beforeRead = null; gate.resolve(); if (stage === "visibility-dwell") await h.advance(1); await readyCleanup(h);
+    assert.equal(await h.storage.read(reference), null);
+  } finally { h.state.beforeRead = null; gate.resolve(); h.close(); }
+});
+
+for (const operation of [undefined, "create", "list", "update", "delete"]) test(`UX06 cancelled ${operation ?? "unspecified"} renders server text without generated status`, async () => {
+  const result = { kind: "outcome", text: "요청한 변경을 취소했어요.", outcome: "cancelled", schedulesChanged: false, ...(operation ? { operation } : {}) };
+  await showResult(result, (h, view) => {
+    const rendered = textOf(view.rows); assert.equal(rendered.split(result.text).length - 1, 1);
+    assert.doesNotMatch(rendered, /취소됨/); assert.equal(cards(view).length, 0);
+    assert.deepEqual(h.messages().at(-1).apiExecution.response.data.result, result);
+  });
+});
+
+test("UX05 stale native measurement cannot clear a newer automatic display wait", async () => {
+  const h = harness(), old = deferred(), current = deferred(), changes = []; let reads = 0;
+  const visibility = h.source("src/utils/assistant-result-visibility.ts").createAssistantResultVisibility({
+    isActive: () => true, measure: () => (++reads === 1 ? old.promise : current.promise),
+    onPending: (result, pending) => changes.push(pending), onDisplayed: async () => true,
+  });
+  try {
+    const result = { messageId: "test", reference: recoveryRef(), executionToken: "same", contentToken: "same" };
+    visibility.update([result]); visibility.laidOut(result); visibility.refresh();
+    current.resolve(true); await h.settle(); assert.equal(changes.at(-1), true);
+    old.resolve(false); await h.settle(); assert.equal(changes.at(-1), true);
+  } finally { visibility.invalidate(); old.resolve(false); current.resolve(false); h.close(); }
+});
+
+test("UX05 interrupted automatic cleanup relinquishes UI ownership and keeps manual recovery available", async () => {
+  const h = harness(), gate = deferred();
+  try {
+    h.state.handle = responseWith(results.failure); h.send("조회"); await readyCleanup(h);
+    const reference = h.messages().at(-1).apiExecution.reference;
+    nativeResultExposure(h).layout(); await h.settle(); h.state.beforeRead = () => gate.promise;
+    await h.advance(1000); h.blurResults(); h.state.beforeRead = null; gate.resolve(); await readyCleanup(h);
+    assert.ok(await h.storage.read(reference));
+    const control = h.find("ConversationList").recoveryControls.find(c => c.reference.requestId === reference.requestId);
+    assert.ok(control, "an interrupted attempt cannot leave an automatic-working UI tombstone");
+    assert.equal(control.phase, "retained"); assert.ok(nodes(h.peekConversation().rows, "Pressable").some(n => n.props.testID === "assistant-recovery-manual"));
+  } finally { h.state.beforeRead = null; gate.resolve(); h.close(); }
+});
+
+test("UX05 blur after committed automatic deletion does not recreate a phantom recovery control", async () => {
+  const h = harness();
+  try {
+    h.state.handle = responseWith(results.failure); h.send("조회"); await readyCleanup(h);
+    const reference = h.messages().at(-1).apiExecution.reference, cleanup = h.storage.cleanup;
+    h.storage.cleanup = async (...args) => { const result = await cleanup(...args); h.blurResults(); return result; };
+    nativeResultExposure(h).layout(); await h.settle(); await h.advance(1000); await readyCleanup(h);
+    assert.equal(await h.storage.read(reference), null);
+    assert.equal(h.find("ConversationList").recoveryControls.some(c => c.reference.requestId === reference.requestId), false);
+  } finally { h.close(); }
+});
+
+for (const condition of ["not-visible", "lost-visibility", "storage-failed"]) test(`UX05 legitimate recovery remains available when ${condition}`, async () => {
+  const h = harness(); let visible = condition !== "not-visible";
+  try {
+    h.state.handle = responseWith(results.failure); h.send("조회"); await readyCleanup(h);
+    const reference = h.messages().at(-1).apiExecution.reference;
+    const exposure = nativeResultExposure(h, () => ({ x: 20, y: visible ? 120 : 900, width: 300, height: 40 }));
+    exposure.layout(); await h.settle();
+    if (condition === "lost-visibility") visible = false;
+    if (condition === "storage-failed") h.state.failStorage = true;
+    await h.advance(1000); h.state.failStorage = false; await readyCleanup(h);
+    assert.ok(await h.storage.read(reference)); const view = h.peekConversation();
+    assert.ok(nodes(view.rows, "Pressable").some(n => n.props.testID === "assistant-recovery-manual"));
+    if (condition === "storage-failed") assert.match(textOf(view.rows), /복구 기록을 정리하지 못했어요/);
+    else assert.equal(h.state.cleanup, 0);
+    assert.equal(h.messages().at(-1).apiExecution.response.data.result.kind, "failure");
+    clickCleanup(h, reference.requestId, "manual"); await readyCleanup(h);
+    const risk = h.peekConversation(); assert.match(textOf(risk.rows), /서버 작업은 취소되지/);
+    assert.ok(nodes(risk.rows, "Pressable").some(n => n.props.testID === "assistant-recovery-confirm-manual"));
+    clickCleanup(h, reference.requestId, "keep"); await readyCleanup(h); assert.ok(await h.storage.read(reference));
+  } finally { h.state.failStorage = false; h.close(); }
+});
+
+test("UX05 stale manual callback cannot take ownership from an active automatic write", async () => {
+  const h = harness(), gate = deferred();
+  try {
+    h.state.handle = responseWith(results.failure); h.send("조회"); await readyCleanup(h);
+    const manual = nodes(h.renderConversation().rows, "Pressable").find(n => n.props.testID === "assistant-recovery-manual").props.onPress;
+    const reference = h.messages().at(-1).apiExecution.reference;
+    nativeResultExposure(h).layout(); await h.settle(); h.state.beforeRead = () => gate.promise; await h.advance(1000);
+    manual(); h.render(); assert.equal(h.state.manualCleanupCalls.length, 0);
+    assert.equal(h.find("ConversationList").recoveryControls.some(c => c.reference.requestId === reference.requestId), false);
+    h.state.beforeRead = null; gate.resolve(); await readyCleanup(h);
+    assert.equal(await h.storage.read(reference), null); assert.equal(h.state.manualCleanupCalls.length, 0);
+  } finally { h.state.beforeRead = null; gate.resolve(); h.close(); }
+});
+
+test("UX05 pending UI observation is not evidence or permission to delete", async () => {
+  const h = harness(); let displayed = 0;
+  const visibility = h.source("src/utils/assistant-result-visibility.ts").createAssistantResultVisibility({
+    measure: async () => true, isActive: () => true, onPending() { throw Error("observer"); },
+    onDisplayed: async () => { displayed++; return true; },
+  });
+  try {
+    const result = { messageId: "test", reference: recoveryRef(), executionToken: "same", contentToken: "same" };
+    visibility.update([result]); visibility.laidOut(result); await h.settle(); await h.advance(999); assert.equal(displayed, 0);
+    await h.advance(1); assert.equal(displayed, 1);
+  } finally { visibility.invalidate(); h.close(); }
+});
+
+test("UX05 active remeasurement keeps pending UI stable until visibility actually fails", async () => {
+  const h = harness(), measure = deferred(), changes = []; let reads = 0, displayed = 0;
+  const visibility = h.source("src/utils/assistant-result-visibility.ts").createAssistantResultVisibility({
+    isActive: () => true, measure: () => ++reads === 1 ? Promise.resolve(true) : measure.promise,
+    onPending: (result, pending) => changes.push(pending), onDisplayed: async () => { displayed++; return true; },
+  });
+  try {
+    const result = { messageId: "test", reference: recoveryRef(), executionToken: "same", contentToken: "same" };
+    visibility.update([result]); visibility.laidOut(result); await h.settle(); assert.equal(changes.at(-1), true);
+    visibility.refresh(); assert.equal(changes.at(-1), true, "layout refresh must not itself flash manual actions");
+    measure.resolve(false); await h.settle(); assert.equal(changes.at(-1), false); assert.equal(displayed, 0);
+  } finally { visibility.invalidate(); measure.resolve(false); h.close(); }
+});
+
+test("UX06 cancellation wording inside server text remains verbatim", async () => {
+  const result = { kind: "outcome", text: "취소됨으로 확인된 요청이에요.", outcome: "cancelled", operation: "update", schedulesChanged: false };
+  await showResult(result, (h, view) => {
+    assert.equal(textOf(view.rows).split(result.text).length - 1, 1); assert.doesNotMatch(textOf(view.rows), /수정 취소됨/);
+    assert.deepEqual(h.messages().at(-1).apiExecution.response.data.result, result);
+  });
 });

@@ -41,6 +41,8 @@ function harness(initialMode = "mock") {
       compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX }, fileName: file,
     }).outputText;
     const resolve = (name) => {
+      // Native TTS is exercised by the real screen/service integration suites.
+      if (name === "@/hooks/use-assistant-speech") return { useAssistantSpeech: () => ({ current: null }) };
       // native 녹음은 별도 controller/Assistant 화면 통합 테스트에서 검증한다.
       if (name === "@/hooks/use-local-voice-recording") return { useLocalVoiceRecording: () => ({
         busy: false, supported: true, isBusy: () => false, start: async () => {}, stop: async () => {}, discard() {},

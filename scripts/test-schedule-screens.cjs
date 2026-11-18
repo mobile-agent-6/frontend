@@ -7,6 +7,59 @@ const ts = require("typescript");
 const { randomUUID } = require("node:crypto");
 const root = path.resolve(__dirname, "..");
 
+for (const kind of ["index", "calendar"]) for (const final of ["ready", "missing", "health-error", "storage-error"]) test(`UX08 ${kind}: actual saved Pi restore pending then ${final}`, async () => {
+  let release; const gate = new Promise(resolve => { release = resolve; }); let connection;
+  const h = harness("server", { connectionProfile: true, settingsConnection: { restore: () => connection.restore() } });
+  const profile = h.source("src/development/connection-profile.ts").createConnectionProfile(final === "health-error" ? "health-error" : "normal");
+  const sent = [], transport = { ...profile.transport, fetchImpl: (...args) => { sent.push(args); return profile.transport.fetchImpl(...args); } };
+  connection = h.source("src/services/settings-connection.ts").createSettingsConnection({ transport, clock: profile.clock,
+    storage: { read: async () => { await gate; if (final === "storage-error") throw Error("synthetic saved connection storage error"); return final === "missing" ? null : { ip: "192.0.2.10" }; }, save: async () => {} }, legacy: async () => null });
+  const startup = h.source("src/services/connection-initialization.ts"), restoring = startup.initializeSavedConnection();
+  const screen = h.mount(kind);
+  try {
+    await h.settle(); assert.equal(connection.store.getState().phase, "restoring");
+    assert.equal(screen.all("ScheduleListState").some(p => p.state === "error"), false, "pending connection restore must not render a query error");
+    assert.ok(screen.all("ScheduleListState").some(p => p.state === "loading")); assert.equal(sent.length, 0);
+    assert.equal(startup.initializeSavedConnection(), restoring, "startup has one restoration owner");
+    release(); await restoring; await h.settle();
+    if (final === "ready") {
+      assert.equal(screen.all("ScheduleListState").some(p => p.state === "error" || p.state === "loading"), false);
+      assert.equal(connection.store.getState().phase, "consent");
+      assert.equal(sent.filter(([url]) => String(url).endsWith("/health")).length, 1);
+      assert.ok(sent.some(([url]) => String(url).includes("/schedules")));
+    } else {
+      assert.ok(screen.all("ScheduleListState").some(p => p.state === "error"));
+      assert.equal(sent.some(([url]) => String(url).includes("/schedules")), false);
+      assert.equal(connection.store.getState().phase, final === "missing" ? "idle" : "error");
+    }
+    assert.ok(sent.every(([, options]) => (options?.method ?? "GET") === "GET")); assert.equal(h.calls.length, 0);
+  } finally { release(); connection.dispose(); h.close(); }
+});
+
+for (const kind of ["index", "calendar"]) test(`UX08 ${kind}: ready authority queries and real failures remain visible while startup settles`, async () => {
+  let release, failed = true; const gate = new Promise(resolve => { release = resolve; });
+  const h = harness("server", { connectionProfile: true, settingsConnection: { restore: () => gate } });
+  const startup = h.source("src/services/connection-initialization.ts"), restoring = startup.initializeSavedConnection();
+  const profile = h.source("src/development/connection-profile.ts").createConnectionProfile("normal"), sent = [];
+  const transport = { ...profile.transport, fetchImpl: (url, options) => {
+    sent.push([url, options]);
+    if (failed) return Promise.resolve(new Response("service error", { status: 503 }));
+    return profile.transport.fetchImpl(url, options);
+  } };
+  const cfg = h.source("src/services/api/config.ts"), authority = h.source("src/stores/scheduleDataModeStore.ts");
+  authority.commitVerifiedConnection(cfg.createPiCandidate("192.0.2.10", "mock"), transport);
+  const screen = h.mount(kind);
+  try {
+    await h.settle();
+    const errors = screen.all("ScheduleListState").filter(p => p.state === "error"); assert.ok(errors.length);
+    const before = sent.length; await h.settle(); assert.equal(sent.length, before, "no automatic retries");
+    failed = false; errors[0].onRetry(); await h.settle();
+    assert.ok(sent.length > before); assert.equal(screen.all("ScheduleListState").some(p => p.state === "error"), false);
+    const after = sent.length; release(); await restoring; await h.settle(); assert.equal(sent.length, after, "startup completion must not repeat a valid query");
+    assert.ok(sent.every(([, options]) => options.method === "GET")); assert.equal(h.calls.length, 0);
+  } finally { release(); h.close(); }
+});
+
 // 실제 화면·Hook·서비스를 실행하되 native 컴포넌트와 React 실행기만 메모리 대역으로 둔다.
 // native 렌더링·레이아웃·아이폰 통신을 검증하는 테스트는 아니다.
 function harness(initialMode, { readOnly = false, assistantSyncUi = false, assistantDetails = false, compileEditScreen = false, compileSettingsScreen = false, compileNavigation = false, connectionProfile = false, clockState, renderSettingsModal = false, platform = "ios", renderListState = false, colorScheme = "light", bottomInset = 0, settingsConnection } = {}) {
@@ -77,6 +130,8 @@ function harness(initialMode, { readOnly = false, assistantSyncUi = false, assis
       module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX,
     }, fileName: filename }).outputText;
     const resolve = (name) => {
+      // Native TTS is covered by the real Assistant speech integration suite.
+      if (name === "@/hooks/use-assistant-speech") return { useAssistantSpeech: () => ({ current: null }) };
       if (name === "@/services/settings-runtime" && settingsConnection) return { settingsConnection };
       // native 녹음은 별도 controller/Assistant 화면 통합 테스트에서 검증한다.
       if (name === "@/hooks/use-local-voice-recording") return { useLocalVoiceRecording: () => ({

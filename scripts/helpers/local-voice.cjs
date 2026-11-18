@@ -18,7 +18,7 @@ function voiceSource(entry, external = {}) {
       throw Error(`허용하지 않은 의존성: ${name}`);
     }
     new Function("require", "module", "exports", "__DEV__", "console", "setTimeout", "clearTimeout", code)(resolve, module, module.exports,
-      true, external.console ?? { info() {} }, () => { throw Error("실제 타이머 금지"); }, () => {});
+      external.__DEV__ ?? true, external.console ?? { info() {} }, () => { throw Error("실제 타이머 금지"); }, () => {});
     return module.exports;
   }
   return load(entry);

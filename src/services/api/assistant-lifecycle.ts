@@ -9,6 +9,7 @@ import {
   type AssistantRecoveryInitialization,
 } from "@/services/api/assistant-orchestrator";
 import { scheduleDataModeStore } from "@/stores/scheduleDataModeStore";
+import { connectionInitialization } from "@/services/connection-initialization";
 import type { AssistantRecoveryReference } from "@/types/assistant-recovery";
 
 export type AssistantLifecycleEntry = Readonly<{
@@ -58,10 +59,11 @@ export function createAssistantLifecycle({
   const entries = new Map<string, AssistantLifecycleEntry>();
   const owners = new Set<symbol>(), subscribers = new Set<() => void>();
   let initialCheck: AssistantLifecycleSnapshot["initialCheck"] = "pending";
-  let snapshot: AssistantLifecycleSnapshot = freeze({ phase: "idle", serverId: null, initialCheck, results: [] });
+  let snapshot: AssistantLifecycleSnapshot = freeze({ phase: connectionInitialization.getState().pending ? "recovering" : "idle", serverId: null, initialCheck, results: [] });
   let epoch = 0, active = false, listening = false;
   let controller: AbortController | null = null;
   let unsubscribeApp: (() => void) | undefined, unsubscribeMode: (() => void) | undefined;
+  let unsubscribeInitialization: (() => void) | undefined, waitingInitialization = false;
   let tail: Promise<void> = Promise.resolve();
   let tailGeneration: number | undefined;
 
@@ -87,6 +89,12 @@ export function createAssistantLifecycle({
     scheduledHandoff = handoff;
     focusCycle = focusOnly;
     if (!owners.size || !active) return;
+    if (!scope.serverId && scope.mode === "server" && connectionInitialization.getState().pending) {
+      stopCycle(); waitingInitialization = true;
+      publish({ phase: "recovering", serverId: null });
+      return;
+    }
+    waitingInitialization = false;
     if (!scope.serverId || scope.mode !== "server") {
       initialCheck = "failed";
       publish({ phase: "unavailable", serverId: scope.serverId, issue: scope.mode === "mock" ? "policy" : "server-not-ready" });
@@ -196,6 +204,7 @@ export function createAssistantLifecycle({
   }
   function detachRuntime() {
     handoff = undefined; focusCycle = false; stopCycle(); active = false; listening = false;
+    waitingInitialization = false; unsubscribeInitialization?.(); unsubscribeInitialization = undefined;
     unsubscribeApp?.(); unsubscribeMode?.(); unsubscribeApp = undefined; unsubscribeMode = undefined;
     publish({ phase: "stopped", serverId: snapshot.serverId, initialization: snapshot.initialization });
   }
@@ -206,6 +215,9 @@ export function createAssistantLifecycle({
       listening = true;
       try {
         unsubscribeApp = lifecycle.subscribe(onAppState);
+        unsubscribeInitialization = connectionInitialization.subscribe(({ pending }) => {
+          if (!pending && waitingInitialization && owners.size && active) scheduleRecovery();
+        });
         unsubscribeMode = mode.subscribe(() => {
           if (!owners.size) return;
           handoff = undefined; stopCycle(); entries.clear();

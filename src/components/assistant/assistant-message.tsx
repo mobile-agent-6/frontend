@@ -277,11 +277,11 @@ function ApiResultDetails({ result, onCandidateSelection, selectedCandidateId, o
       </>
     );
     case "outcome": {
+      if (result.outcome === "cancelled") return null;
       const operation = result.operation === undefined ? undefined : {
         create: "등록", list: "조회", update: "수정", delete: "삭제",
       }[result.operation];
-      const label = result.outcome === "success" ? "완료"
-        : result.outcome === "cancelled" ? "취소됨" : "대상 없음";
+      const label = result.outcome === "success" ? "완료" : "대상 없음";
       return (
         <>
           {result.outcome !== "success" &&
