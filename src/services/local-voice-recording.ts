@@ -1,3 +1,4 @@
+import type { VoiceRequestFile } from "@/services/voice-request-file";
 import { LOCAL_VOICE_LIMITS } from "@/constants/voice-recording";
 import type { AssistantInputUi } from "@/utils/assistant-voice-ui";
 import type { LocalVoiceFileInfo } from "@/utils/voice-recording-metadata";
@@ -25,9 +26,9 @@ export type LocalVoiceDependencies = {
   activate(): Promise<void>;
   configure(): Promise<void>;
   reset(): Promise<void>;
-  create(name: string, listener: (event: { isFinished: boolean; hasError: boolean }) => void): LocalRecorder;
+  create(name: string, listener: (event: { isFinished: boolean; hasError: boolean }) => void, reservation?: object): LocalRecorder;
   newName(): string;
-  files: { sweep(): void; inspect(name: string, uri: string | null): Promise<LocalVoiceFileInfo>; remove(name: string): void | LocalVoiceFileCleanup };
+  files: { reserve?(name: string): object; hasCompletedCleanup?(name: string, reservation: object): boolean; handoff?(name: string, info: LocalVoiceFileInfo): VoiceRequestFile; sweep(): void; inspect(name: string, uri: string | null, reservation?: object): Promise<LocalVoiceFileInfo>; remove(name: string, reservation?: object): void | LocalVoiceFileCleanup };
   setTimer(callback: () => void, ms: number): unknown;
   clearTimer(timer: unknown): void;
   observe?(event: string, detail?: LocalVoiceFileInfo | { issue: LocalVoiceIssue } | LocalVoiceDiagnostic): void;
@@ -36,14 +37,14 @@ export type LocalVoiceDependencies = {
 type Job = {
   phase: "permission" | "preparing" | "recording" | "stopping";
   cancelled: boolean; permissionDialog: boolean; session: boolean; stopAttempted: boolean;
-  name?: string; recorder?: LocalRecorder; timer?: unknown; monitor?: unknown; nativeIssue?: boolean;
+  name?: string; fileClaim?: object; ownsFile?: boolean; recorder?: LocalRecorder; timer?: unknown; monitor?: unknown; nativeIssue?: boolean;
   startTask?: Promise<void>; stopTask?: Promise<void>; waitActive?: (active: boolean) => void;
 };
 const cancelled = Symbol("cancelled-local-recording");
 
 // 서버·Assistant 상태와 독립적인 화면 세션 한 건. 비동기 작업 전에 job을 확보한다.
 export function createLocalVoiceRecording(deps: LocalVoiceDependencies) {
-  let job: Job | null = null, retained: string | null = null, focused = false, appState = deps.readAppState();
+  let job: Job | null = null, retained: { name: string; info: LocalVoiceFileInfo; fileClaim?: object } | null = null, focused = false, appState = deps.readAppState();
   let snapshot: LocalVoiceSnapshot = { busy: false, input: { source: "text" } };
   const listeners = new Set<(value: LocalVoiceSnapshot) => void>();
   const observe: NonNullable<LocalVoiceDependencies["observe"]> = (event, detail) => {
@@ -59,9 +60,14 @@ export function createLocalVoiceRecording(deps: LocalVoiceDependencies) {
     if (!current(active)) throw cancelled;
     if (active.nativeIssue) throw new Error("native-recording-error");
   };
-  function remove(name: string) {
+  function remove(name: string, reservation?: object) {
     try {
-      const result = deps.files.remove(name);
+      if (reservation && deps.files.hasCompletedCleanup?.(name, reservation)) {
+        // Only release this controller's old responsibility. A new file may now occupy the path.
+        observe("file-cleanup-confirmed", { previousClaimRemoved: true });
+        return true;
+      }
+      const result = deps.files.remove(name, reservation);
       observe(result?.deletedCount ? "file-deleted" : "file-cleanup", result ?? { existsAfterDelete: false });
       return true;
     }
@@ -69,7 +75,7 @@ export function createLocalVoiceRecording(deps: LocalVoiceDependencies) {
   }
   function discard() {
     if (job) return;
-    if (retained && remove(retained)) retained = null;
+    if (retained && remove(retained.name, retained.fileClaim)) retained = null;
     publish({ source: "text" });
   }
   async function cleanup(active: Job) {
@@ -96,7 +102,7 @@ export function createLocalVoiceRecording(deps: LocalVoiceDependencies) {
     deps.afterEnd?.(cleaned);
     if (!cleaned) issue = "cleanup";
     if (!cleaned || !current(active) || issue || !info) {
-      if (active.name && !remove(active.name)) issue = "cleanup";
+      if (active.name && active.ownsFile && !remove(active.name, active.fileClaim)) issue = "cleanup";
       info = undefined;
     }
     if (job !== active) return;
@@ -104,7 +110,8 @@ export function createLocalVoiceRecording(deps: LocalVoiceDependencies) {
     if (issue) observe("recording-error", { issue });
     if (active.cancelled || !available()) publish({ source: "text" }, issue);
     else if (info && active.name) {
-      retained = active.name;
+      info = Object.freeze(info);
+      retained = { name: active.name, info, fileClaim: active.fileClaim };
       observe("file-validated", info);
       publish({ source: "voice", phase: "recorded" }, undefined, info);
     } else publish({ source: "voice", phase: issue?.startsWith("permission") ? "permission-error" : "recording-error" }, issue);
@@ -128,7 +135,7 @@ export function createLocalVoiceRecording(deps: LocalVoiceDependencies) {
         check(active);
         if (issue || active.nativeIssue) throw new Error("native-recording-error");
         observe("file-validation-started", { stopCompleted: true });
-        try { info = await deps.files.inspect(active.name!, recorder.uri()); }
+        try { info = await deps.files.inspect(active.name!, recorder.uri(), active.fileClaim); }
         catch (error) {
           const code = error instanceof Error ? error.message : "invalid-file";
           issue = code === "missing-file" ? "missing-file" : code === "file-too-large" ? "file-too-large" :
@@ -149,7 +156,7 @@ export function createLocalVoiceRecording(deps: LocalVoiceDependencies) {
       if (deps.beforeStart) { issue = "prepare"; await deps.beforeStart(); check(active); }
       issue = "permission-request";
       if (retained) {
-        if (!remove(retained)) { issue = "cleanup"; throw new Error("cleanup"); }
+        if (!remove(retained.name, retained.fileClaim)) { issue = "cleanup"; throw new Error("cleanup"); }
         retained = null;
       }
       let permission = await deps.permission();
@@ -170,11 +177,13 @@ export function createLocalVoiceRecording(deps: LocalVoiceDependencies) {
       // 세션 소유권 확보 후에만 이전 앱 실행의 파일을 정리한다. 다른 recorder의 활성 파일은 건드리지 않는다.
       try { deps.files.sweep(); } catch { issue = "cleanup"; throw new Error("cleanup"); }
       active.name = deps.newName();
+      active.fileClaim = deps.files.reserve?.(active.name);
+      active.ownsFile = true;
       active.recorder = deps.create(active.name, event => {
         if (job !== active || active.cancelled) return;
         if (event.hasError) active.nativeIssue = true;
         if (active.phase === "recording" && (event.isFinished || event.hasError)) void finish(active, event.hasError ? "native" : undefined);
-      });
+      }, active.fileClaim);
       await active.recorder.prepare(); check(active);
       issue = "start";
       active.recorder.record(); check(active);
@@ -217,6 +226,14 @@ export function createLocalVoiceRecording(deps: LocalVoiceDependencies) {
     return active.phase === "recording" || active.phase === "stopping" ? finish(active) : active.startTask ?? Promise.resolve();
   }
   return {
+    handoff(expected: LocalVoiceFileInfo): VoiceRequestFile | null {
+      if (job || !available() || !retained || expected !== retained.info || !deps.files.handoff) return null;
+      const owner = deps.files.handoff(retained.name, retained.info);
+      retained = null; // Synchronous transfer: the file store protects the request before recorder ownership ends.
+      // Notification failure cannot strand a file that has already changed owners.
+      try { publish({ source: "text" }); } catch { observe("handoff-notification-failed", { hasError: true }); }
+      return owner;
+    },
     start, stop: () => job?.phase === "recording" || job?.phase === "stopping" ? finish(job) : Promise.resolve(), cancel, discard,
     isBusy: () => job !== null,
     getSnapshot: () => snapshot,

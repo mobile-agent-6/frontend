@@ -187,38 +187,41 @@ test("녹음 파일: 확장자와 무관하게 잘린 헤더·data 초과·비 W
 
 function fileAdapter(platform = "ios") {
   const entries = new Map(), deleted = [], native = { options: [], starts: [], listeners: new Set(), released: 0, active: [], modes: [], diagnostics: [], operations: [] };
-  const join = parts => parts.map(part => typeof part === "string" ? part.replace(/\/$/, "") : part.uri).join("/");
+  const join = parts => {
+    const uri=parts.map(part => typeof part === "string" ? part.replace(/\/$/, "") : part.uri).join("/");
+    return native.physicalAliases ? decodeURIComponent(uri).replace(/^file:\/\/\/private\/var\//,"file:///var/") : uri;
+  };
   class File {
     constructor(...parts) { this.uri = join(parts); }
     get name() { return this.uri.split("/").at(-1); }
     get exists() { return entries.has(this.uri); }
     get size() { return entries.get(this.uri)?.size ?? entries.get(this.uri)?.bytes.length ?? 0; }
-    async bytes() { native.reads = (native.reads ?? 0) + 1; if (native.readFails) throw Error("read"); return entries.get(this.uri).bytes; }
+    async bytes() { native.reads = (native.reads ?? 0) + 1; if (native.readGate) await native.readGate; if (native.readFails) throw Error("read"); return entries.get(this.uri).bytes; }
     async move(destination) {
       native.operations.push("move"); if (native.moveGate) await native.moveGate;
       if (native.moveFails) { if (native.partialMove) entries.set(destination.uri, entries.get(this.uri)); throw Error("move"); }
       if (!native.moveDropsFile) entries.set(destination.uri, entries.get(this.uri));
       entries.delete(this.uri); this.uri = destination.uri;
     }
-    delete() { deleted.push(this.uri); entries.delete(this.uri); }
+    delete() { deleted.push(this.uri); if (native.deleteFails) throw Error("delete"); if (!native.deleteNoop) entries.delete(this.uri); }
   }
   class Directory {
     constructor(...parts) { this.uri = join(parts); }
     get exists() { return true; }
     create() { native.operations.push("create-directory"); }
-    list() { return [...entries.keys()].filter(uri => uri.startsWith(this.uri + "/")).map(uri => new File(uri)); }
+    list() { const result = [...entries.keys()].filter(uri => uri.startsWith(this.uri + "/")).map(uri => new File(uri)); native.onList?.(); return result; }
   }
   class Recorder {
-    constructor(options) { native.options.push(options); this.id = "native-recorder"; this.uri = Object.hasOwn(native, "createdUri") ? native.createdUri : "file:///cache/owned.wav"; native.recorder = this;
-      if (native.initialFile) entries.set(this.uri, { bytes: new Uint8Array(0) }); }
+    constructor(options) { native.stopped = false; native.started = false; native.options.push(options); this.id = "native-recorder"; this.uri = Object.hasOwn(native, "createdUri") ? native.createdUri : "file:///cache/owned.wav"; native.recorder = this;
+      if (native.initialFile) entries.set(join([this.uri]), { bytes: new Uint8Array(0) }); }
     get isRecording() { return native.started === true && !native.stopped && native.actuallyRecording !== false; }
-    addListener(event, listener) { assert.equal(event, "recordingStatusUpdate"); native.listeners.add(listener); return { remove: () => native.listeners.delete(listener) }; }
+    addListener(event, listener) { assert.equal(event, "recordingStatusUpdate"); (native.callbacks ??= []).push(listener); native.listeners.add(listener); if (native.listenFails) throw Error("listener"); return { remove: () => native.listeners.delete(listener) }; }
     async prepareToRecordAsync(options) { native.prepared = options; if (Object.hasOwn(native, "preparedUri")) this.uri = native.preparedUri; }
     record(options) { native.starts.push(options); native.started = true; }
     getStatus() { return { isRecording: !native.stopped, canRecord: !native.stopped, durationMillis: 1000, fileSize: 32044 }; }
     async stop() { native.operations.push("stop-start"); if (native.stopGate) await native.stopGate;
       if (Object.hasOwn(native, "stoppedUri")) this.uri = native.stoppedUri;
-      if (!native.noFile && this.uri) entries.set(this.uri, { bytes: native.recordedBytes ?? wavBytes() });
+      if (!native.noFile && this.uri) entries.set(join([this.uri]), { bytes: native.recordedBytes ?? wavBytes() });
       native.stopped = true; native.operations.push("stop-completed"); }
     release() { native.released++; }
   }
@@ -226,7 +229,7 @@ function fileAdapter(platform = "ios") {
     "expo-audio": { AudioModule: { AudioRecorder: Recorder }, AudioQuality: { HIGH: 96 }, IOSOutputFormat: { LINEARPCM: "lpcm", MPEG4AAC: "aac " },
       getRecordingPermissionsAsync: async () => ({ granted: true }), requestRecordingPermissionsAsync: async () => ({ granted: true }),
       setAudioModeAsync: async mode => { native.modes.push(mode); }, setIsAudioActiveAsync: async value => { native.active.push(value); } },
-    "expo-crypto": { randomUUID: () => "12345678-1234-4123-8123-123456789abc" },
+    "expo-crypto": { randomUUID: () => native.uuid ?? "12345678-1234-4123-8123-123456789abc" },
     "expo-file-system": { Directory, File, Paths: { cache: new Directory("file:///cache") } },
     "react-native": { AppState: { currentState: "active" }, Platform: { OS: platform } },
     console: { info(prefix, event, detail) { native.diagnostics.push({ event, detail }); } },
@@ -350,7 +353,7 @@ function nativeRecordingFixture(setup = () => {}) {
   deps.setTimer = clock.deps.setTimer; deps.clearTimer = clock.deps.clearTimer;
   const controller = voiceSource("src/services/local-voice-recording.ts").createLocalVoiceRecording(deps), snapshots = [];
   controller.focus(true); controller.subscribe(value => snapshots.push(value));
-  return { ...f, controller, snapshots, settle: clock.settle, timers: clock.timers,
+  return { ...f, deps, controller, snapshots, settle: clock.settle, advance: clock.advance, timers: clock.timers,
     emit(event) { for (const listener of [...f.native.listeners]) listener({ id: "native-recorder", ...event }); } };
 }
 
@@ -478,4 +481,321 @@ test("실제 adapter 진단: 경로·파일명·원본을 출력하지 않고 �
     if (event !== "file-validated" && event !== "recording-error") assert.ok(Object.values(detail).every(v => typeof v === "number" || typeof v === "boolean" || v === null));
   }
   assert.equal(f.native.diagnostics.find(d => d.event === "file-deleted").detail.existedBeforeDelete, true);
+});
+
+// Phase 11 step 2: real controller, file store, owner and parser; native boundaries only are synthetic.
+const ownerFactory = () => voiceSource("src/services/voice-request-file.ts").createVoiceRequestFile;
+async function recorded() { const f=nativeRecordingFixture();await f.controller.start();await f.controller.stop();return f; }
+async function ownedStore(platform="ios") {
+  const f=fileAdapter(platform),store=f.api.createVoiceFileStore(f.profile,platform);f.entries.set(f.uri,{bytes:wavBytes()});store.captureNativeFile(f.name,f.uri);
+  const info=await store.inspect(f.name,f.uri);return {...f,store,info};
+}
+test("step2 handoff: exact retained identity, single transfer, discard/late callback protected",async()=>{
+  const f=await recorded(),info=f.controller.getSnapshot().file;assert.equal(f.controller.handoff({...info}),null);
+  const owner=f.controller.handoff(info);assert.ok(owner);assert.equal(f.controller.handoff(info),null);
+  f.controller.discard();f.controller.focus(false);f.emit({isFinished:true,hasError:false});await f.settle();
+  assert.ok(f.entries.has(f.managedUri));const use=owner.acquire();assert.deepEqual(await use.readBytes(),wavBytes());await use.release();assert.equal(await owner.dispose(),"deleted");assert.equal(f.entries.size,0);
+});
+test("step2 handoff: second simultaneous caller cannot obtain same owner",async()=>{
+  const f=await recorded(),info=f.controller.getSnapshot().file;const [a,b]=await Promise.all([Promise.resolve().then(()=>f.controller.handoff(info)),Promise.resolve().then(()=>f.controller.handoff(info))]);assert.ok(a);assert.equal(b,null);await a.dispose();
+});
+test("step2 handoff: new recorder and orphan sweep cannot delete transferred file",async()=>{
+  const f=await recorded(),owner=f.controller.handoff(f.controller.getSnapshot().file);f.native.uuid="22345678-1234-4123-8123-123456789abc";
+  await f.controller.start();assert.equal(f.controller.getSnapshot().input.phase,"recording");assert.ok(f.entries.has(f.managedUri));await f.controller.cancel();assert.ok(f.entries.has(f.managedUri));await owner.dispose();
+});
+test("step2 handoff: before completion and after cancellation rejected",async()=>{
+  const f=nativeRecordingFixture();assert.equal(f.controller.handoff({}),null);await f.controller.start();assert.equal(f.controller.handoff({}),null);await f.controller.cancel();assert.equal(f.controller.handoff({}),null);assert.equal(f.entries.size,0);
+});
+test("step2 handoff: failure keeps retained responsibility",async()=>{
+  const f=await recorded(),info=f.controller.getSnapshot().file;f.entries.delete(f.managedUri);assert.throws(()=>f.controller.handoff(info));f.entries.set(f.managedUri,{bytes:wavBytes()});const owner=f.controller.handoff(info);assert.ok(owner);await owner.dispose();
+});
+test("step2 handoff: inspection pending and blur cannot transfer a late file",async()=>{
+  const gate=deferred(),f=nativeRecordingFixture(({native})=>{native.readGate=gate.promise;});await f.controller.start();const p=f.controller.stop();await f.settle();assert.equal(f.controller.handoff({}),null);f.controller.focus(false);gate.resolve();await p;assert.equal(f.controller.handoff({}),null);assert.equal(f.entries.size,0);
+});
+test("step2 store: transferred file immune to store remove, recapture and other stores",async()=>{
+  const f=await ownedStore(),b=f.api.createVoiceFileStore(f.profile,"ios"),owner=f.store.handoff(f.name,f.info);
+  assert.throws(()=>f.store.handoff(f.name,f.info));assert.throws(()=>f.store.remove(f.name));assert.throws(()=>b.remove(f.name));assert.throws(()=>b.captureNativeFile(f.name,f.uri));assert.equal(f.store.captureNativeFile(f.name,f.uri),false);
+  b.sweep();f.store.sweep();assert.ok(f.entries.has(f.managedUri));await owner.dispose();
+});
+test("step2 store: active recorder and inspecting file protected from another sweep",async()=>{
+  const f=fileAdapter(),a=f.api.createVoiceFileStore(f.profile,"ios"),b=f.api.createVoiceFileStore(f.profile,"ios");a.captureNativeFile(f.name,f.uri);f.entries.set(f.uri,{bytes:wavBytes()});b.sweep();assert.ok(f.entries.has(f.uri));
+  const gate=deferred();f.native.readGate=gate.promise;const p=a.inspect(f.name,f.uri);await Promise.resolve();await Promise.resolve();b.sweep();assert.throws(()=>a.remove(f.name));gate.resolve();await p;a.remove(f.name);assert.equal(f.entries.size,0);
+});
+test("step2 store: stale sweep list rechecks ownership after handoff",async()=>{
+  const f=await ownedStore(),other=f.api.createVoiceFileStore(f.profile,"ios");let owner;f.native.onList=()=>{owner=f.store.handoff(f.name,f.info);};other.sweep();assert.ok(f.entries.has(f.managedUri));await owner.dispose();
+});
+test("step2 owner: retry eligibility and multiple active uses are independent",async()=>{
+  const f=await ownedStore(),owner=f.store.handoff(f.name,f.info),first=owner.acquire(),second=owner.acquire("retry");
+  assert.equal(await owner.requestCleanup(),"retained");assert.equal(await owner.revokeRetry(),"pending");assert.throws(()=>owner.acquire("retry"));assert.ok(f.entries.has(f.managedUri));
+  assert.equal(await first.release(),"pending");await first.release();assert.ok(f.entries.has(f.managedUri));assert.deepEqual(await second.readBytes(),wavBytes());assert.equal(await second.release(),"deleted");await owner.dispose();assert.equal(f.deleted.filter(x=>x===f.managedUri).length,1);
+});
+test("step2 owner: cleanup retains eligible retry until revoked",async()=>{
+  const f=await ownedStore(),owner=f.store.handoff(f.name,f.info);assert.equal(await owner.requestCleanup(),"retained");const retry=owner.acquire("retry");assert.deepEqual(await retry.readBytes(),wavBytes());await retry.release();assert.ok(f.entries.has(f.managedUri));assert.equal(await owner.revokeRetry(),"deleted");assert.throws(()=>owner.acquire("retry"));
+});
+test("step2 owner: read lease early release still prevents deletion until read settles",async()=>{
+  const f=await ownedStore(),owner=f.store.handoff(f.name,f.info),use=owner.acquire(),gate=deferred();f.native.readGate=gate.promise;const p=use.readBytes();const rejected=assert.rejects(p);await use.release();assert.equal(await owner.dispose(),"pending");assert.ok(f.entries.has(f.managedUri));gate.resolve();await rejected;await owner.dispose();assert.equal(f.entries.size,0);
+});
+test("step2 owner: dispose during read rejects late bytes and waits for use release",async()=>{
+  const f=await ownedStore(),owner=f.store.handoff(f.name,f.info),use=owner.acquire(),gate=deferred();f.native.readGate=gate.promise;const p=use.readBytes();const rejected=assert.rejects(p);assert.equal(await owner.dispose(),"pending");gate.resolve();await rejected;assert.ok(f.entries.has(f.managedUri));assert.equal(await use.release(),"deleted");
+});
+for(const mode of ["missing","oversized","size mismatch","mutated","read fails"])test(`step2 owner: ${mode} never produces valid original`,async()=>{
+  const f=await ownedStore(),owner=f.store.handoff(f.name,f.info),use=owner.acquire(),reads=f.native.reads;
+  if(mode==="missing")f.entries.delete(f.managedUri);if(mode==="oversized")f.entries.get(f.managedUri).size=1048577;if(mode==="size mismatch")f.entries.get(f.managedUri).size=100;if(mode==="mutated")f.entries.get(f.managedUri).bytes[50]=1;if(mode==="read fails")f.native.readFails=true;
+  await assert.rejects(use.readBytes());if(["missing","oversized","size mismatch"].includes(mode))assert.equal(f.native.reads,reads);await use.release();await owner.dispose();
+});
+test("step2 owner: caller bytes cannot mutate snapshot or future retry",async()=>{
+  const f=await ownedStore(),owner=f.store.handoff(f.name,f.info),a=owner.acquire();const first=await a.readBytes();first.fill(255);await a.release();const b=owner.acquire("retry");assert.deepEqual(await b.readBytes(),wavBytes());await b.release();await owner.dispose();
+});
+for(const fail of ["throw","noop"])test(`step2 owner: delete ${fail} keeps cleanup owner and sweep protection`,async()=>{
+  const f=await ownedStore(),owner=f.store.handoff(f.name,f.info);f.native[fail==="throw"?"deleteFails":"deleteNoop"]=true;assert.equal(await owner.dispose(),"failed");assert.equal(owner.getState().deleted,false);assert.throws(()=>owner.acquire());assert.throws(()=>f.store.remove(f.name));f.api.createVoiceFileStore(f.profile,"ios").sweep();assert.ok(f.entries.has(f.managedUri));f.native.deleteFails=false;f.native.deleteNoop=false;assert.equal(await owner.dispose(),"deleted");
+});
+test("step2 owner: delete in progress denies acquisitions and duplicate dispose",async()=>{
+  const gate=deferred();let deletes=0;const owner=ownerFactory()({read:async()=>wavBytes(),remove:async()=>{deletes++;await gate.promise;}});const a=owner.dispose(),b=owner.dispose();assert.throws(()=>owner.acquire());gate.resolve();assert.equal(await a,"deleted");assert.equal(await b,"deleted");assert.equal(deletes,1);
+});
+test("step2 owner: old released lease never releases a new lease",async()=>{
+  const f=await ownedStore(),owner=f.store.handoff(f.name,f.info),a=owner.acquire();await a.release();const b=owner.acquire();await owner.revokeRetry();assert.equal(await owner.requestCleanup(),"pending");await a.release();assert.equal(owner.getState().activeUses,1);assert.ok(f.entries.has(f.managedUri));assert.equal(await b.release(),"deleted");
+});
+test("step2 owner: old owner cleanup cannot delete later same-name recorder file",async()=>{
+  const f=await ownedStore(),owner=f.store.handoff(f.name,f.info);await owner.dispose();f.store.captureNativeFile(f.name,f.uri);f.entries.set(f.uri,{bytes:wavBytes()});await owner.dispose();assert.ok(f.entries.has(f.uri));f.store.remove(f.name);
+});
+test("step2 store: failed recorder delete keeps responsibility and permits cleanup retry",async()=>{
+  const f=await ownedStore();f.native.deleteFails=true;assert.throws(()=>f.store.remove(f.name));assert.throws(()=>f.api.createVoiceFileStore(f.profile,"ios").remove(f.name));f.native.deleteFails=false;f.store.sweep();assert.equal(f.entries.size,0);
+});
+test("step2 store: forged metadata, other job and Android handoff rejected",async()=>{
+  const f=await ownedStore();assert.throws(()=>f.store.handoff(f.name,{...f.info}));assert.throws(()=>f.store.handoff("assistant-voice-22345678-1234-4123-8123-123456789abc",f.info));f.store.remove(f.name);
+  const android=fileAdapter("android"),store=android.api.createVoiceFileStore(android.profile,"android");assert.throws(()=>store.handoff(android.name,{}));
+});
+
+function riffChunks(chunks) {
+  const length=12+chunks.reduce((sum,[,data])=>sum+8+data.length+(data.length%2),0),bytes=new Uint8Array(length),view=new DataView(bytes.buffer);
+  const tag=(at,text)=>[...text].forEach((c,i)=>{bytes[at+i]=c.charCodeAt(0);});tag(0,"RIFF");tag(8,"WAVE");view.setUint32(4,length-8,true);let offset=12;
+  for(const [name,data]of chunks){tag(offset,name);view.setUint32(offset+4,data.length,true);bytes.set(data,offset+8);offset+=8+data.length+(data.length%2);}return bytes;
+}
+function inputWav({frames=160,ext=false,extra=[],formatSize=ext?40:16}={}){
+  const base=wavBytes({frames}),fmt=new Uint8Array(formatSize);fmt.set(base.slice(20,36));const view=new DataView(fmt.buffer);
+  if(formatSize>=18)view.setUint16(16,formatSize-18,true);
+  if(ext){view.setUint16(0,65534,true);view.setUint16(18,16,true);view.setUint32(20,4,true);fmt.set([1,0,0,0,0,0,16,0,128,0,0,170,0,56,155,113],24);}
+  return riffChunks([["fmt ",fmt],...extra,["data",base.slice(44)]]);
+}
+const checkWav=bytes=>metadata.inspectVoiceBytes(bytes,config.VOICE_RECORDING_PROFILES.wav);
+for(const ext of [false,true])test(`step2 WAV valid PCM/extensible=${ext} with optional chunks and odd padding`,()=>{
+  const bytes=inputWav({ext,extra:[["JUNK",new Uint8Array(3)],["LIST",new Uint8Array(10)],["fact",new Uint8Array(0)]]});const info=checkWav(bytes);assert.equal(info.codec,"PCM_S16LE");assert.equal(info.durationMillis,10);
+});
+for(const size of [18,20])test(`step2 WAV PCM bounded fmt extension ${size}`,()=>{assert.equal(checkWav(inputWav({formatSize:size})).sampleRate,16000);});
+for(const frames of [1,239999,240000])test(`step2 WAV duration frame boundary ${frames}`,()=>{assert.equal(checkWav(inputWav({frames})).durationMillis,frames/16000*1000);});
+test("step2 WAV one sample frame above 15 seconds is rejected",()=>{assert.throws(()=>checkWav(inputWav({frames:240001})),/file-too-long/);});
+for(const target of [1048574,1048576,1048578])test(`step2 WAV size boundary ${target} uses valid 15-second PCM and ancillary data`,()=>{
+  const base=wavBytes({frames:240000}),filler=target-base.length-8,bytes=inputWav({frames:240000,extra:[["JUNK",new Uint8Array(filler)]]});assert.equal(bytes.length,target);
+  if(target<=1048576){assert.equal(checkWav(bytes).durationMillis,15000);assert.equal(checkWav(bytes).size,target);}else assert.throws(()=>checkWav(bytes),/file-too-large/);
+});
+for(const mutate of [
+  bytes=>{bytes[0]=0;},bytes=>{bytes[8]=0;},bytes=>{new DataView(bytes.buffer).setUint32(4,bytes.length-9,true);},
+  bytes=>{new DataView(bytes.buffer).setUint32(16,0xffffffff,true);},bytes=>{new DataView(bytes.buffer).setUint32(40,1000000,true);},
+  bytes=>{new DataView(bytes.buffer).setUint16(20,3,true);},bytes=>{new DataView(bytes.buffer).setUint32(24,22050,true);},
+  bytes=>{new DataView(bytes.buffer).setUint16(22,2,true);},bytes=>{new DataView(bytes.buffer).setUint16(34,8,true);},
+  bytes=>{new DataView(bytes.buffer).setUint16(32,4,true);},bytes=>{new DataView(bytes.buffer).setUint32(28,16000,true);},
+])test(`step2 WAV rejects malformed PCM field ${String(mutate)}`,()=>{const bytes=wavBytes();mutate(bytes);assert.throws(()=>checkWav(bytes));});
+for(const [offset,value]of [[36,0],[36,21],[36,23],[38,0],[38,15],[38,17],[44,3],[59,0]])test(`step2 WAV extensible field ${offset}=${value}`,()=>{
+  const bytes=inputWav({ext:true});bytes[offset]=value;assert.throws(()=>checkWav(bytes));
+});
+for(const size of [16,17,18,39])test(`step2 WAV truncated extensible fmt size ${size}`,()=>{
+  const fmt=inputWav({ext:true}).slice(20,20+size);assert.throws(()=>checkWav(riffChunks([["fmt ",fmt],["data",new Uint8Array(320)]])));
+});
+test("step2 WAV duplicate fmt/data, absent data/fmt and incomplete frames rejected",()=>{
+  const fmt=wavBytes().slice(20,36),data=new Uint8Array(320);
+  for(const chunks of [[["fmt ",fmt],["fmt ",fmt],["data",data]],[["fmt ",fmt],["data",data],["data",data]],[["data",data]],[["fmt ",fmt]],[["fmt ",fmt],["data",new Uint8Array()]],[["fmt ",fmt],["data",new Uint8Array(3)]]])assert.throws(()=>checkWav(riffChunks(chunks)));
+});
+test("step2 WAV chunk order does not assume fixed 44-byte header",()=>{
+  const base=wavBytes(),bytes=riffChunks([["JUNK",new Uint8Array(1)],["data",base.slice(44)],["fmt ",base.slice(20,36)]]);assert.equal(checkWav(bytes).durationMillis,10);
+});
+for(const trailing of [1,2,7])test(`step2 WAV truncated trailing chunk header ${trailing}`,()=>{
+  const base=wavBytes(),bytes=new Uint8Array(base.length+trailing);bytes.set(base);new DataView(bytes.buffer).setUint32(4,bytes.length-8,true);assert.throws(()=>checkWav(bytes));
+});
+test("step2 WAV missing final odd-chunk padding rejected even with matching RIFF size",()=>{
+  const base=riffChunks([["fmt ",wavBytes().slice(20,36)],["data",new Uint8Array(320)],["JUNK",new Uint8Array(1)]]),bytes=base.slice(0,-1);new DataView(bytes.buffer).setUint32(4,bytes.length-8,true);assert.throws(()=>checkWav(bytes));
+});
+test("step2 WAV malformed lengths never escape as DataView bounds errors",()=>{
+  for(let size=0;size<120;size++){const bytes=inputWav({ext:true}).slice(0,size);if(size>=8)new DataView(bytes.buffer).setUint32(4,size-8,true);try{checkWav(bytes);}catch(error){assert.ok(!(error instanceof RangeError));}}
+});
+test("step2 WAV declared odd fmt extension, non-PCM GUID bytes and invalid frame length rejected",()=>{
+  const bytes=inputWav({formatSize:18});new DataView(bytes.buffer).setUint16(36,1,true);assert.throws(()=>checkWav(bytes));
+  for(let i=0;i<16;i++){const ext=inputWav({ext:true});ext[44+i]^=255;assert.throws(()=>checkWav(ext));}
+});
+test("step2 recorder: owner cleanup cannot delete next recorder reusing native source URI",async()=>{
+  const f=await recorded(),owner=f.controller.handoff(f.controller.getSnapshot().file);f.native.uuid="22345678-1234-4123-8123-123456789abc";
+  await f.controller.start();f.entries.set("file:///cache/owned.wav",{bytes:wavBytes()});await owner.dispose();assert.ok(f.entries.has("file:///cache/owned.wav"));await f.controller.cancel();assert.equal(f.entries.size,0);
+});
+test("step2 recorder: file modification after inspect rejects transfer bytes without touching new job",async()=>{
+  const f=await recorded(),owner=f.controller.handoff(f.controller.getSnapshot().file),use=owner.acquire();f.entries.get(f.managedUri).bytes=wavBytes({frames:161});await assert.rejects(use.readBytes());await use.release();await owner.dispose();
+});
+
+test("step2 store: name collision blocked before creating another native recorder",async()=>{
+  const f=await recorded(),owner=f.controller.handoff(f.controller.getSnapshot().file),count=f.native.options.length;
+  await f.controller.start();assert.equal(f.native.options.length,count);assert.ok(f.entries.has(f.managedUri));await owner.dispose();
+});
+test("step2 owner: unsupported use kind is rejected",async()=>{
+  const f=await ownedStore(),owner=f.store.handoff(f.name,f.info);assert.throws(()=>owner.acquire("unknown"));await owner.dispose();
+});
+
+test("step2 handoff: subscriber exception cannot strand transferred ownership",async()=>{
+  const f=await recorded(),info=f.controller.getSnapshot().file;const off=f.controller.subscribe(()=>{throw Error("subscriber");});const owner=f.controller.handoff(info);assert.ok(owner);off();assert.equal(f.controller.handoff(info),null);await owner.dispose();assert.equal(f.entries.size,0);
+});
+test("step2 owner: deferred automatic cleanup failure remains observable and retryable",async()=>{
+  const gate=deferred();let fail=true;const owner=ownerFactory()({read:()=>gate.promise,remove:()=>{if(fail)throw Error("delete");}}),use=owner.acquire();
+  const p=use.readBytes(),rejected=assert.rejects(p);await use.release();assert.equal(await owner.dispose(),"pending");gate.resolve(wavBytes());await rejected;for(let i=0;i<12;i++)await Promise.resolve();
+  assert.equal(owner.getState().cleanupFailed,true);assert.equal(owner.getState().deleted,false);fail=false;assert.equal(await owner.dispose(),"deleted");assert.equal(owner.getState().cleanupFailed,false);
+});
+
+
+test("step2 Android: existing local AAC completes but cannot hand off as server WAV",async()=>{
+  const f=fileAdapter("android"),bytes=new Uint8Array(40),view=new DataView(bytes.buffer);
+  for(const [at,size,type]of [[0,16,"ftyp"],[16,12,"moov"],[28,12,"mdat"]]){view.setUint32(at,size);[...type].forEach((c,i)=>{bytes[at+4+i]=c.charCodeAt(0);});}
+  f.native.recordedBytes=bytes;const clock=fixture(),deps=f.api.createExpoVoiceDependencies(()=>true);deps.setTimer=clock.deps.setTimer;deps.clearTimer=clock.deps.clearTimer;
+  const controller=voiceSource("src/services/local-voice-recording.ts").createLocalVoiceRecording(deps);controller.focus(true);await controller.start();await controller.stop();
+  assert.equal(controller.getSnapshot().input.phase,"recorded");assert.equal(controller.getSnapshot().file.container,"m4a");assert.equal(controller.getSnapshot().file.codec,"unverified");
+  assert.throws(()=>controller.handoff(controller.getSnapshot().file));assert.ok(f.entries.has(f.managedUri));controller.discard();assert.equal(f.entries.size,0);
+});
+
+
+// Review reproducers invoke retained callbacks directly, even after listener removal.
+test("review2 BLOCKER1 callback after source cleanup must not regain deletion rights",async()=>{
+  const gate=deferred(),f=nativeRecordingFixture(({native})=>{native.readGate=gate.promise;});
+  await f.controller.start();const callback=f.native.callbacks[0],stop=f.controller.stop();await f.settle();assert.equal(f.native.reads,1);
+  callback({id:"native-recorder",isFinished:true,hasError:false,url:"file:///cache/owned.wav"});
+  gate.resolve();await stop;const owner=f.controller.handoff(f.controller.getSnapshot().file);assert.ok(owner);
+  f.native.uuid="22345678-1234-4123-8123-123456789abc";await f.controller.start();f.entries.set("file:///cache/owned.wav",{bytes:wavBytes()});
+  await owner.dispose();assert.ok(f.entries.has("file:///cache/owned.wav"),"A must not delete B source");
+  await f.controller.stop();assert.equal(f.controller.getSnapshot().input.phase,"recorded");f.controller.discard();
+});
+for(const noop of [false,true])test(`review2 BLOCKER2 recreated store can retry recorder cleanup noop=${noop}`,async()=>{
+  const f=await ownedStore();f.native[noop?"deleteNoop":"deleteFails"]=true;assert.throws(()=>f.store.remove(f.name));
+  const next=f.api.createVoiceFileStore(f.profile,"ios");try{next.sweep();}catch{}assert.ok(f.entries.has(f.managedUri));
+  f.native.deleteNoop=false;f.native.deleteFails=false;next.sweep();assert.equal(f.entries.has(f.managedUri),false);
+  const again=f.api.createVoiceFileStore(f.profile,"ios");assert.equal(again.captureNativeFile(f.name,f.uri),true);again.remove(f.name);
+});
+
+
+for(const stage of ["before-move","during-move"])test(`review2 callback registration remains open ${stage}`,async()=>{
+  const gate=deferred(),f=nativeRecordingFixture(({native})=>{native[stage==="before-move"?"stopGate":"moveGate"]=gate.promise;});
+  await f.controller.start();const callback=f.native.callbacks[0],stop=f.controller.stop();await f.settle();
+  const extra="file:///cache/late-normal-native.wav";f.entries.set(extra,{bytes:wavBytes()});callback({id:"native-recorder",isFinished:true,hasError:false,url:extra});
+  gate.resolve();await stop;assert.equal(f.controller.getSnapshot().input.phase,"recorded");assert.ok(!f.entries.has(extra));f.controller.discard();assert.equal(f.entries.size,0);
+});
+test("review2 callback may report managed destination during move without deleting result",async()=>{
+  const gate=deferred(),f=nativeRecordingFixture(({native})=>{native.moveGate=gate.promise;});await f.controller.start();const callback=f.native.callbacks[0],stop=f.controller.stop();await f.settle();callback({id:"native-recorder",isFinished:true,hasError:false,url:f.managedUri});gate.resolve();await stop;assert.equal(f.controller.getSnapshot().input.phase,"recorded");assert.ok(f.entries.has(f.managedUri));f.controller.discard();
+});
+for(const reuseName of [false,true])test(`review2 retained callback after release/deletion cannot claim new job reuseName=${reuseName}`,async()=>{
+  const f=await recorded(),callback=f.native.callbacks[0],info=f.controller.getSnapshot().file;
+  callback({id:"native-recorder",isFinished:true,hasError:false,url:"file:///cache/poison.wav"});const owner=f.controller.handoff(info);assert.ok(owner);
+  callback({id:"native-recorder",isFinished:true,hasError:false,url:"file:///cache/poison.wav"});await owner.dispose();
+  if(!reuseName)f.native.uuid="22345678-1234-4123-8123-123456789abc";await f.controller.start();const count=f.snapshots.length;f.entries.set("file:///cache/owned.wav",{bytes:wavBytes()});
+  callback({id:"native-recorder",isFinished:true,hasError:false,url:"file:///cache/owned.wav"});callback({id:"native-recorder",isFinished:true,hasError:true,url:"file:///cache/poison.wav"});
+  assert.equal(f.snapshots.length,count);assert.ok(f.entries.has("file:///cache/owned.wav"));await f.controller.stop();assert.equal(f.controller.getSnapshot().input.phase,"recorded");f.controller.discard();assert.equal(f.entries.size,0);
+});
+test("review2 stale callback after deletion cannot allocate a claim at all",async()=>{
+  const f=await recorded(),callback=f.native.callbacks[0];f.controller.discard();callback({id:"native-recorder",isFinished:true,hasError:false,url:"file:///cache/poison.wav"});
+  const store=f.api.createVoiceFileStore(f.profile,"ios"),token=store.reserve(f.name);assert.ok(token);store.remove(f.name,token);assert.equal(f.entries.size,0);
+});
+test("review2 duplicate reserve in same store is rejected without revoking first token",()=>{
+  const f=fileAdapter(),store=f.api.createVoiceFileStore(f.profile,"ios"),token=store.reserve(f.name);
+  assert.throws(()=>store.reserve(f.name));assert.equal(store.captureNativeFile(f.name,f.uri,token),true);store.remove(f.name,token);
+});
+test("review2 old reservation cannot capture/remove new same-name claim",()=>{
+  const f=fileAdapter(),store=f.api.createVoiceFileStore(f.profile,"ios"),old=store.reserve(f.name);store.remove(f.name,old);const fresh=store.reserve(f.name);f.entries.set(f.uri,{bytes:wavBytes()});
+  assert.notEqual(fresh,old);assert.equal(store.captureNativeFile(f.name,f.uri,old),false);assert.throws(()=>store.remove(f.name,old));assert.ok(f.entries.has(f.uri));assert.equal(store.captureNativeFile(f.name,f.uri,fresh),true);store.remove(f.name,fresh);
+});
+test("review2 duplicate native create cannot let failed controller settle delete existing recorder",async()=>{
+  const f=fileAdapter(),deps=f.api.createExpoVoiceDependencies(()=>true),clock=fixture();deps.setTimer=clock.deps.setTimer;deps.clearTimer=clock.deps.clearTimer;
+  const first=deps.create(f.name,()=>{});f.entries.set("file:///cache/owned.wav",{bytes:wavBytes()});const c=voiceSource("src/services/local-voice-recording.ts").createLocalVoiceRecording(deps);c.focus(true);await c.start();
+  assert.equal(f.native.options.length,1);assert.ok(f.entries.has("file:///cache/owned.wav"));first.release();deps.files.remove(f.name);
+});
+for(const noop of [false,true])test(`review2 controller unmount and recreation retries safe recorder cleanup noop=${noop}`,async()=>{
+  const f=await recorded(),callback=f.native.callbacks[0];f.native[noop?"deleteNoop":"deleteFails"]=true;f.controller.focus(false);await f.settle();assert.ok(f.entries.has(f.managedUri));
+  f.native.deleteNoop=false;f.native.deleteFails=false;const clock=fixture(),deps=f.api.createExpoVoiceDependencies(()=>true);deps.setTimer=clock.deps.setTimer;deps.clearTimer=clock.deps.clearTimer;
+  const next=voiceSource("src/services/local-voice-recording.ts").createLocalVoiceRecording(deps);next.focus(true);await next.start();assert.equal(next.getSnapshot().input.phase,"recording");assert.ok(!f.entries.has(f.managedUri));
+  callback({id:"native-recorder",isFinished:true,hasError:false,url:"file:///cache/owned.wav"});f.controller.discard();await next.stop();assert.equal(next.getSnapshot().input.phase,"recorded");f.controller.discard();assert.ok(f.entries.has(f.managedUri));next.discard();assert.equal(f.entries.size,0);
+});
+test("review2 new-store sweep cannot clean active request owner even when dispose failed",async()=>{
+  const f=await ownedStore(),owner=f.store.handoff(f.name,f.info),lease=owner.acquire(),gate=deferred();f.native.readGate=gate.promise;const pending=lease.readBytes(),reject=assert.rejects(pending);assert.equal(await owner.dispose(),"pending");
+  const store=f.api.createVoiceFileStore(f.profile,"ios");store.sweep();assert.ok(f.entries.has(f.managedUri));gate.resolve();await reject;f.native.deleteFails=true;assert.equal(await lease.release(),"failed");f.native.deleteFails=false;store.sweep();assert.ok(f.entries.has(f.managedUri));assert.equal(await owner.dispose(),"deleted");
+});
+test("review2 repeated cleanup failures remain retryable across stores",async()=>{
+  const f=await ownedStore();f.native.deleteFails=true;assert.throws(()=>f.store.remove(f.name));
+  for(let i=0;i<3;i++){assert.throws(()=>f.api.createVoiceFileStore(f.profile,"ios").sweep());assert.ok(f.entries.has(f.managedUri));}
+  f.native.deleteFails=false;f.api.createVoiceFileStore(f.profile,"ios").sweep();assert.equal(f.entries.size,0);f.store.sweep();assert.equal(f.entries.size,0);
+});
+for(const alias of ["file:///private/var/mobile/App/Library/Caches/voice.wav","file:///var/mobile/App/Library/Caches/%76oice.wav"])test(`review2 URI alias collision ${alias}`,()=>{
+  const f=fileAdapter(),a=f.api.createVoiceFileStore(f.profile,"ios"),b=f.api.createVoiceFileStore(f.profile,"ios"),other="assistant-voice-22345678-1234-4123-8123-123456789abc",ta=a.reserve(f.name),tb=b.reserve(other);
+  assert.equal(a.captureNativeFile(f.name,"file:///var/mobile/App/Library/Caches/voice.wav",ta),true);assert.throws(()=>b.captureNativeFile(other,alias,tb));b.remove(other,tb);a.remove(f.name,ta);
+});
+test("review2 native URI aliases and percent encoding preserve normal stop validation",async()=>{
+  const f=nativeRecordingFixture(({native})=>{native.physicalAliases=true;native.createdUri="file:///private/var/mobile/App/Library/Caches/initial.wav";native.preparedUri="file:///var/mobile/App/Library/Caches/prepare%20file.wav";native.stoppedUri="file:///private/var/mobile/App/Library/Caches/final%20file.wav";});
+  await f.controller.start();const callback=f.native.callbacks[0];callback({id:"native-recorder",isFinished:true,hasError:false,url:"file:///var/mobile/App/Library/Caches/final file.wav"});await f.controller.stop();assert.equal(f.controller.getSnapshot().input.phase,"recorded");assert.deepEqual([...f.entries.keys()],[f.managedUri]);f.controller.discard();
+});
+test("review2 reserved expected native path blocks another claim before native allocation",()=>{
+  const f=fileAdapter(),a=f.api.createVoiceFileStore(f.profile,"ios"),token=a.reserve(f.name),deps=f.api.createExpoVoiceDependencies(()=>true);
+  assert.throws(()=>deps.create(f.name,()=>{}));assert.equal(f.native.options.length,0);a.remove(f.name,token);
+});
+test("review2 known native source collision prevents prepare and record",()=>{
+  const f=fileAdapter(),a=f.api.createVoiceFileStore(f.profile,"ios"),token=a.reserve(f.name);a.captureNativeFile(f.name,"file:///cache/owned.wav",token);f.entries.set("file:///cache/owned.wav",{bytes:wavBytes()});
+  const deps=f.api.createExpoVoiceDependencies(()=>true);assert.throws(()=>deps.create("assistant-voice-22345678-1234-4123-8123-123456789abc",()=>{}));assert.equal(f.native.starts.length,0);assert.ok(f.entries.has("file:///cache/owned.wav"));a.remove(f.name,token);
+});
+test("review2 external URI, encoded traversal and bundle asset rejected",()=>{
+  const f=fileAdapter(),store=f.api.createVoiceFileStore(f.profile,"ios"),token=store.reserve(f.name);
+  for(const uri of ["file:///cache-other/foreign.wav","file:///cache/%2e%2e/foreign.wav","asset:///bundle.wav","file:///other.wav"])assert.equal(store.captureNativeFile(f.name,uri,token),false);store.remove(f.name,token);
+});
+test("review2 repeated release reflects pending/failed/deleted without extra deletion",async()=>{
+  const gate=deferred();let attempts=0,fail=true;const owner=ownerFactory()({read:async()=>wavBytes(),remove:async()=>{attempts++;await gate.promise;if(fail)throw Error("delete");}}),lease=owner.acquire();await owner.dispose();const first=lease.release();assert.equal(await lease.release(),"pending");gate.resolve();assert.equal(await first,"failed");assert.equal(await lease.release(),"failed");assert.equal(attempts,1);fail=false;await owner.dispose();assert.equal(await lease.release(),"deleted");assert.equal(attempts,2);
+});
+
+
+test("review2 released recorder methods cannot operate on a reused claim",async()=>{
+  const f=fileAdapter(),deps=f.api.createExpoVoiceDependencies(()=>true),old=deps.create(f.name,()=>{});await old.prepare();old.release();deps.files.remove(f.name);
+  const fresh=deps.create(f.name,()=>{}),operations=f.native.operations.length;await assert.rejects(old.prepare());await assert.rejects(old.stop());assert.throws(()=>old.record());assert.equal(f.native.operations.length,operations);assert.equal(f.native.starts.length,0);fresh.release();deps.files.remove(f.name);
+});
+
+
+test("review2 listener registration failure revokes saved callback before native release",()=>{
+  const f=fileAdapter(),deps=f.api.createExpoVoiceDependencies(()=>true);let delivered=0;f.native.listenFails=true;assert.throws(()=>deps.create(f.name,()=>{delivered++;}));
+  f.native.callbacks[0]({id:"native-recorder",isFinished:true,hasError:false,url:"file:///cache/poison.wav"});assert.equal(delivered,0);assert.equal(f.native.released,1);deps.files.remove(f.name);
+});
+
+
+for(const noop of [false,true])test(`review3 RED shared cleanup lets original controller restart noop=${noop}`,async()=>{
+  const f=await recorded();f.native[noop?"deleteNoop":"deleteFails"]=true;f.controller.focus(false);await f.settle();assert.ok(f.entries.has(f.managedUri));
+  f.native.deleteNoop=false;f.native.deleteFails=false;f.api.createVoiceFileStore(f.profile,"ios").sweep();assert.equal(f.entries.has(f.managedUri),false);
+  f.controller.focus(true);await f.controller.start();assert.equal(f.controller.getSnapshot().input.phase,"recording");await f.controller.stop();assert.equal(f.controller.getSnapshot().input.phase,"recorded");f.controller.discard();assert.equal(f.entries.size,0);
+});
+
+
+async function failedRetainedController(noop=false){
+  const f=nativeRecordingFixture();let token;const reserve=f.deps.files.reserve;f.deps.files.reserve=name=>(token=reserve(name));
+  await f.controller.start();await f.controller.stop();f.native[noop?"deleteNoop":"deleteFails"]=true;f.controller.focus(false);await f.settle();return {...f,oldToken:token};
+}
+for(const noop of [false,true])test(`review3 incomplete shared cleanup keeps original controller safely blocked noop=${noop}`,async()=>{
+  const f=await failedRetainedController(noop),store=f.api.createVoiceFileStore(f.profile,"ios");assert.equal(f.deps.files.hasCompletedCleanup(f.name,f.oldToken),false);assert.throws(()=>store.sweep());f.controller.focus(true);
+  await f.controller.start();assert.equal(f.controller.getSnapshot().issue,"cleanup");assert.equal(f.native.options.length,1);assert.ok(f.entries.has(f.managedUri));assert.equal(f.deps.files.hasCompletedCleanup(f.name,f.oldToken),false);
+  f.native.deleteFails=false;f.native.deleteNoop=false;store.sweep();await f.controller.start();assert.equal(f.controller.getSnapshot().input.phase,"recording");await f.controller.cancel();
+});
+test("review3 old completion receipt cannot delete or change same-name new recorder claim",async()=>{
+  const f=await failedRetainedController(),store=f.api.createVoiceFileStore(f.profile,"ios");f.native.deleteFails=false;store.sweep();const token=store.reserve(f.name);store.captureNativeFile(f.name,f.uri,token);f.entries.set(f.uri,{bytes:wavBytes()});const deletions=f.deleted.length;
+  assert.equal(store.hasCompletedCleanup(f.name,f.oldToken),true);assert.equal(store.hasCompletedCleanup(f.name,token),false);assert.throws(()=>f.deps.files.remove(f.name,f.oldToken));f.controller.discard();f.controller.discard();assert.equal(f.deleted.length,deletions);assert.ok(store.isRecorderClaim(f.name,token));assert.ok(f.entries.has(f.uri));
+  f.native.uuid="22345678-1234-4123-8123-123456789abc";f.controller.focus(true);await f.controller.start();assert.equal(f.controller.getSnapshot().input.phase,"recording");await f.controller.cancel();assert.ok(f.entries.has(f.uri));assert.ok(store.isRecorderClaim(f.name,token));store.remove(f.name,token);
+});
+test("review3 completed old recorder cannot affect same-name request owner/lease/retry",async()=>{
+  const f=await failedRetainedController(),store=f.api.createVoiceFileStore(f.profile,"ios");f.native.deleteFails=false;store.sweep();const token=store.reserve(f.name);store.captureNativeFile(f.name,f.uri,token);f.entries.set(f.uri,{bytes:wavBytes()});const info=await store.inspect(f.name,f.uri,token),owner=store.handoff(f.name,info),lease=owner.acquire("retry");
+  const deletions=f.deleted.length;f.controller.discard();f.controller.discard();assert.equal(f.deleted.length,deletions);assert.deepEqual(await lease.readBytes(),wavBytes());assert.equal(await owner.requestCleanup(),"retained");assert.equal(await owner.revokeRetry(),"pending");assert.throws(()=>owner.acquire("retry"));store.sweep();assert.ok(f.entries.has(f.managedUri));
+  f.native.uuid="22345678-1234-4123-8123-123456789abc";f.controller.focus(true);await f.controller.start();assert.equal(f.controller.getSnapshot().input.phase,"recording");await f.controller.cancel();assert.ok(f.entries.has(f.managedUri));assert.equal(await lease.release(),"deleted");
+});
+test("review3 completion lookup is exact-token/name read-only evidence",async()=>{
+  const f=await failedRetainedController(true),store=f.api.createVoiceFileStore(f.profile,"ios"),other="assistant-voice-22345678-1234-4123-8123-123456789abc";
+  assert.equal(store.hasCompletedCleanup(f.name,f.oldToken),false);assert.equal(store.hasCompletedCleanup(f.name,{}),false);assert.equal(store.hasCompletedCleanup(other,f.oldToken),false);
+  // Missing files alone must not create a receipt: only successful owned cleanup does.
+  f.entries.delete(f.managedUri);assert.equal(store.hasCompletedCleanup(f.name,f.oldToken),false);f.native.deleteNoop=false;store.sweep();const deletes=f.deleted.length;
+  assert.equal(store.hasCompletedCleanup(f.name,f.oldToken),true);assert.equal(store.hasCompletedCleanup(other,f.oldToken),false);assert.equal(store.hasCompletedCleanup(f.name,{}),false);assert.equal(f.deleted.length,deletes);
+  assert.throws(()=>f.deps.files.remove(f.name,f.oldToken));f.controller.discard();assert.equal(f.deleted.length,deletes);
+});
+test("review3 repeated discard and restart after shared cleanup stay usable",async()=>{
+  const f=await failedRetainedController();f.native.deleteFails=false;f.api.createVoiceFileStore(f.profile,"ios").sweep();f.controller.discard();f.controller.discard();f.controller.focus(true);
+  for(let i=0;i<3;i++){await f.controller.start();assert.equal(f.controller.getSnapshot().input.phase,"recording");await f.controller.stop();assert.equal(f.controller.getSnapshot().input.phase,"recorded");f.controller.discard();f.controller.discard();assert.equal(f.entries.size,0);}
 });
