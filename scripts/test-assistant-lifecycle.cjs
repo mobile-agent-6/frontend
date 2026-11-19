@@ -68,6 +68,63 @@ function harness({initialMode="server",baseUrl=origin,readOnly=false}={}){
   };
 }
 
+test("39-P2-02 observation order distinguishes republish, identical fresh GET, and cleared scope",()=>{
+  const h=harness(),order=h.api.createAssistantObservationOrder(),entry={reference:ref(),latestResult:{kind:"needs-attention",reference:ref(),reason:"unconfirmed"}};
+  order.observe(entry,0);const token=order.begin(ref(),0),success={reference:ref(),latestResult:{kind:"completed"}};
+  assert.equal(order.commit(token,success),true);assert.equal(order.isCurrent(entry,0),false);
+  order.observe(entry,0);assert.equal(order.isCurrent(success,0),true);
+  const newError=JSON.parse(JSON.stringify(entry));order.observe(newError,0);
+  assert.equal(order.isCurrent(newError,0),true);assert.equal(order.isCurrent(success,0),false);
+  const outdated=order.begin(ref(),0);order.observe({...newError},0);assert.equal(order.commit(outdated,{...success}),false);
+  const cleared=order.begin(ref(2),0);order.clear();assert.equal(order.commit(cleared,{reference:ref(2)}),false);
+  assert.equal(h.state.calls.length,0);assert.equal(h.state.writes,0);
+});
+
+test("39-P2-02 real manual observation sync survives pause and still accepts a genuinely new error",async()=>{
+  const h=harness();await h.seed();h.state.handle=()=>Promise.reject(Error("offline"));const detach=h.service.attach();
+  try{
+    await until(()=>h.service.getSnapshot().phase==="needs-attention");const old=h.service.getSnapshot().results[0];
+    const token=h.service.beginObservation(ref(),0);assert.ok(token);
+    h.state.handle=async()=>json(done());const result=await h.orchestrator.queryRequestOnce(ref()).completion;
+    assert.equal(h.service.recordObservation(token,result),true);assert.equal(h.service.isCurrentObservation(old,0),false);
+    h.app("background");assert.equal(h.service.getSnapshot().results[0].latestResult.kind,"completed");
+    h.state.handle=()=>Promise.reject(Error("offline"));h.app("active");
+    await until(()=>h.service.getSnapshot().phase==="needs-attention");
+    assert.equal(h.service.getSnapshot().results[0].latestResult.kind,"needs-attention");
+    assert.equal(h.service.isCurrentObservation(h.service.getSnapshot().results[0],0),true);
+    assert.ok(h.state.calls.every(call=>call.init.method==="GET"));assert.equal((await h.storage.read(ref())).firstPostAttemptAt,1000);
+  }finally{detach();await settle();}
+});
+
+test("39-P2-02 old automatic completion cannot overwrite a newer committed manual observation",async()=>{
+  const h=harness(),gate=deferred();await h.seed();
+  const old={kind:"needs-attention",reference:ref(),reason:"unconfirmed",recoveryResult:{kind:"unconfirmed",reference:ref(),reason:"http-error",retransmitted:false,
+    getResult:{ok:false,error:{kind:"network",operation:"get",requestState:"may-have-been-sent",serverId}}}};
+  const service=h.api.createAssistantLifecycle({http:h.http,mode:h.mode,orchestrator:{initializeRecovery:async()=>({kind:"initialized",serverId,requests:[{
+    reference:ref(),initial:old,task:{initial:Promise.resolve(old),completion:gate.promise,cancel(){gate.resolve(old);}}}]})}});
+  const detach=service.attach();
+  try{
+    await until(()=>service.getSnapshot().initialCheck==="checked");const token=service.beginObservation(ref(),0);
+    const result=await h.orchestrator.queryRequestOnce(ref()).completion;assert.equal(result.kind,"completed");
+    assert.equal(service.recordObservation(token,result),true);gate.resolve(old);await settle();
+    assert.equal(service.getSnapshot().results[0].latestResult.kind,"completed");assert.equal(service.getSnapshot().results[0].latestResult.response.data.result.kind,"outcome");
+    assert.deepEqual(h.state.calls.map(call=>call.init.method),["GET"]);
+  }finally{gate.resolve(old);detach();await settle();}
+});
+
+test("39-P2-02 manual observation rejects wrong IDs, generation changes, background and detached owners",async()=>{
+  const h=harness();await h.seed();const detach=h.service.attach();await until(()=>h.service.getSnapshot().phase==="settled");
+  const token=h.service.beginObservation(ref(),0),result=h.service.getSnapshot().results[0].latestResult;
+  assert.equal(h.service.beginObservation(ref(1,`development:${otherOrigin}`),0),null);
+  assert.equal(h.service.recordObservation(token,{...result,reference:ref(2)}),false);
+  assert.equal(h.service.recordObservation({...token,generation:1},result),false);
+  h.app("background");assert.equal(h.service.recordObservation(token,result),false);
+  h.app("active");await until(()=>h.service.getSnapshot().phase==="settled");
+  h.mode.getState().setMode("mock");h.mode.getState().setMode("server");await settle();assert.equal(h.service.recordObservation(token,result),false);
+  const current=h.service.beginObservation(ref(),h.mode.getState().generation);detach();await settle();
+  assert.equal(h.service.recordObservation(current,result),false);
+});
+
 test("실제 root mount effect: cold start GET-only·결과 보관·기존 초기 경로 유지",async()=>{
   const h=harness();assert.equal(h.state.reads,0);await h.seed();assert.equal(h.listeners.size,0);
   const tree=h.renderRoot();

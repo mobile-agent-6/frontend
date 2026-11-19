@@ -12,6 +12,7 @@ import type { AssistantLifecycleSnapshot } from "@/services/api/assistant-lifecy
 import type { AssistantInteraction } from "@/types/assistant";
 import type { Schedule } from "@/types/schedule";
 import { assistantResultToDisplay } from "@/utils/assistant-mapper";
+import { canRecheckAssistantMessage } from "@/utils/assistant-recovery-messages";
 import type { AssistantCandidateQuestion, AssistantConfirmationQuestion } from "@/utils/assistant-text-question";
 import { assistantErrorRecoveryNotice, assistantHttpErrorNotice, getAssistantExecutionError, type AssistantErrorRecoveryNotice } from "@/utils/assistant-errors";
 import type { AssistantUncertainView } from "@/utils/assistant-uncertain";
@@ -66,6 +67,9 @@ type ConversationListProps = {
   uncertainViews?: readonly AssistantUncertainView[];
   onUncertainCheck?: (requestId: string) => void;
   onUncertainAcknowledge?: (requestId: string) => void;
+  onResultRecheck?: (reference: AssistantRecoveryReference) => void;
+  recheckingRequest?: string | null;
+  resultRecheckDisabled?: boolean;
   recoveryControls?: readonly AssistantRecoveryControl[];
   recoveryStorageError?: boolean;
   onRecoveryAction?: (control: AssistantRecoveryControl, action: AssistantRecoveryControlAction) => void;
@@ -93,6 +97,9 @@ export function ConversationList({
   uncertainViews,
   onUncertainCheck,
   onUncertainAcknowledge,
+  onResultRecheck,
+  recheckingRequest,
+  resultRecheckDisabled = false,
   recoveryControls,
   recoveryStorageError,
   onRecoveryAction,
@@ -103,7 +110,8 @@ export function ConversationList({
 }: ConversationListProps) {
   const listRef = useRef<FlatList<ConversationMessage>>(null);
   const renderedMessages = messages.filter(message => !(isProcessing && message.role === "assistant" &&
-    message.apiExecution?.kind === "observed" && !message.apiUncertain && !message.apiErrorRecovery));
+    message.apiExecution?.kind === "observed" && !message.apiUncertain && !message.apiErrorRecovery &&
+    recheckingRequest !== assistantRecoveryKey(message.apiExecution.reference)));
   const messageCount = renderedMessages.length;
   const processingMessage = isProcessing ? [...messages].reverse().find(message => message.role === "user") : undefined;
   const previousMessageCountRef = useRef(messageCount);
@@ -333,8 +341,8 @@ export function ConversationList({
           {footerControls.map((control, index) => (
             <View key={assistantRecoveryKey(control.reference)}>
               {(index > 0 || showProgress) && <MessageSeparator />}
-              <AssistantMessage text="이전 요청의 로컬 복구 기록이 남아 있어요."
-              recoveryIssue
+              <AssistantMessage text="결과를 확인하지 못한 이전 요청이 있어요."
+              recoveryIssue recoveryNotice
               recoveryControl={control} onRecoveryAction={onRecoveryAction ? action => onRecoveryAction(control, action) : undefined} />
             </View>
           ))}
@@ -358,6 +366,11 @@ export function ConversationList({
             } : undefined}
             onResultTextLayout={visibleResults.has(item.id) ? () => visibilityRef.current?.laidOut(visibleResults.get(item.id)!) : undefined}
             text={item.text}
+            onResultRecheck={item.apiExecution && canRecheckAssistantMessage(item) &&
+              !uncertainViews?.some(view => view.requestId.toLowerCase() === item.apiExecution!.reference.requestId.toLowerCase()) &&
+              onResultRecheck ? () => onResultRecheck(item.apiExecution!.reference) : undefined}
+            resultRechecking={Boolean(item.apiExecution && recheckingRequest === assistantRecoveryKey(item.apiExecution.reference))}
+            resultRecheckDisabled={resultRecheckDisabled || interactionsDisabled || isProcessing}
             scheduleSyncEntry={scheduleSyncForMessage(item, scheduleSyncEntries)}
             scheduleSyncRetrying={Boolean(item.apiExecution && retryingScheduleSync?.includes(assistantRecoveryKey(item.apiExecution.reference)))}
             onScheduleSyncRetry={item.apiExecution && onScheduleSyncRetry ? () => onScheduleSyncRetry(item.apiExecution!.reference) : undefined}

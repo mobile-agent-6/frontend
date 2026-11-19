@@ -22,6 +22,7 @@ import { useAssistantSpeech } from "@/hooks/use-assistant-speech";
 import { assistantHttpClient } from "@/services/api/assistant";
 import {
   assistantLifecycle,
+  type AssistantLifecycleEntry,
   type AssistantLifecycleSnapshot,
 } from "@/services/api/assistant-lifecycle";
 import {
@@ -63,7 +64,7 @@ import {
   type AssistantRecoveryControl,
   type AssistantRecoveryControlAction,
 } from "@/utils/assistant-recovery-cleanup";
-import { upsertAssistantExecutionMessage } from "@/utils/assistant-recovery-messages";
+import { canRecheckAssistantMessage, upsertAssistantExecutionMessage } from "@/utils/assistant-recovery-messages";
 import {
   createAssistantTextQuestionContext,
   type AssistantCandidateQuestion,
@@ -128,10 +129,16 @@ export default function AssistantScreen() {
     previouslyAccepted: boolean;
   } | null>(null);
   const activeVoiceRef = useRef(false);
+  const resultCheckFocusedRef = useRef(false);
+  const resultCheckFocusRef = useRef<(focused: boolean) => void>(() => {});
   const localVoice = useLocalVoiceRecording(() => voiceStartAllowedRef.current(), (input) => {
     inputUiRef.current = input;
     setInputUi(input);
-  }, () => voiceSubmissionRef.current?.(), value => assistantLifecycle.focus?.(value));
+  }, () => voiceSubmissionRef.current?.(), value => {
+    assistantLifecycle.focus?.(value);
+    resultCheckFocusedRef.current = value;
+    resultCheckFocusRef.current(value);
+  });
   const voiceInputBusy = isVoiceInputBusy(inputUi) || localVoice.busy;
   const [isBusy, setIsBusy] = useState(false);
   const [questionUi, setQuestionUi] = useState<{
@@ -187,6 +194,7 @@ export default function AssistantScreen() {
     new Map<string, { serverId: string | null; generation: number; snapshot: typeof recoverySnapshot; metadata: Promise<AssistantRecoveryMetadata | null> }>(),
   );
   const committedMessagesRef = useRef(messages);
+  const consumedObservationsRef = useRef(new WeakSet<AssistantLifecycleEntry>());
   const uncertainRef = useRef<ReturnType<
     typeof createAssistantUncertainContext
   > | null>(null);
@@ -194,6 +202,8 @@ export default function AssistantScreen() {
   const inputTextRef = useRef("");
   const inputRevisionRef = useRef(0);
   const serverTaskRef = useRef<AssistantRequestTask | null>(null);
+  const resultCheckRef = useRef<{ task: AssistantRequestTask; version: number } | null>(null);
+  const [recheckingRequest, setRecheckingRequest] = useState<string | null>(null);
   const textQuestionRef = useRef<ReturnType<
     typeof createAssistantTextQuestionContext
   > | null>(null);
@@ -203,7 +213,7 @@ export default function AssistantScreen() {
   const lastServerIdRef = useRef(viewServerId);
   const errorIdRef = useRef(0);
   const pendingInputRef = useRef("");
-  const mockTextPendingRef = useRef(false);
+  const mockTextPendingRef = useRef<false | { revision: number }>(false);
   const pendingMockRef = useRef<MockAssistantPending>(null);
   const activeInteractionIdRef = useRef<string | null>(null);
   const resolvedInteractionIdsRef = useRef(new Set<string>());
@@ -428,8 +438,8 @@ export default function AssistantScreen() {
     [],
   );
 
-  const restoreInput = useCallback((text: string) => {
-    if (inputTextRef.current.length > 0) return;
+  const restoreInput = useCallback((text: string, revision: number) => {
+    if (inputRevisionRef.current !== revision || inputTextRef.current.length > 0) return;
     inputTextRef.current = text;
     setInputText(text);
   }, []);
@@ -451,11 +461,14 @@ export default function AssistantScreen() {
       connectionRef.current = { generation: scheduleDataModeStore.getState().generation, serverId: assistantHttpClient.getServerId() };
       operationVersionRef.current += 1;
       committedMessagesRef.current = []; setMessages([]);
+      consumedObservationsRef.current = new WeakSet();
       inputTextRef.current = ""; inputRevisionRef.current += 1; setInputText("");
       setRecoveryRecords([]); setRecoveryReadError(false);
       scheduleSyncRetryLocksRef.current.clear(); setRetryingScheduleSync([]);
       serverTaskRef.current?.cancel();
       serverTaskRef.current = null;
+      resultCheckRef.current = null;
+      setRecheckingRequest(null);
       voiceExecutionRef.current = null;
       textQuestionRef.current = null;
       setQuestionUi(null);
@@ -537,10 +550,16 @@ export default function AssistantScreen() {
           );
         return;
       }
+      // Select once, before mutating any of the three UI contexts. Re-publishing an immutable
+      // lifecycle entry must not replay it after a newer explicit GET observation.
+      const observations = snapshot.results.filter(entry =>
+        !consumedObservationsRef.current.has(entry) &&
+        assistantLifecycle.isCurrentObservation(entry, scheduleDataModeStore.getState().generation));
+      observations.forEach(entry => consumedObservationsRef.current.add(entry));
       if (serverId) {
         const context = getTextQuestionContext(serverId);
         const uncertain = getUncertainContext(serverId);
-        for (const entry of snapshot.results) {
+        for (const entry of observations) {
           if (entry.reference.serverId !== serverId) continue;
           if (
             entry.latestResult &&
@@ -591,7 +610,7 @@ export default function AssistantScreen() {
               )
             : current;
         if (next.length === current.length) next = current;
-        for (const entry of snapshot.results) {
+        for (const entry of observations) {
           if (entry.reference.serverId !== serverId) continue;
           let execution = entry.latestResult;
           if (!execution && entry.phase === "status" && entry.lastResponse) {
@@ -659,6 +678,7 @@ export default function AssistantScreen() {
 
     const version = operationVersionRef.current;
     const submittedText = pendingInputRef.current;
+    const submittedRevision = mockTextPendingRef.current.revision;
     const generation = scheduleDataModeStore.getState().generation;
     let cancelled = false;
     const timer = setTimeout(() => {
@@ -704,7 +724,7 @@ export default function AssistantScreen() {
         const changed = useScheduleStore.getState().schedules !== before;
         if (changed || handled) invalidateActiveInteraction();
         if (changed) pendingMockRef.current = null;
-        else restoreInput(submittedText);
+        else restoreInput(submittedText, submittedRevision);
         reportError(
           changed
             ? "일정 데이터가 변경되었지만 응답을 표시하지 못했어요. 목록에서 확인해 주세요."
@@ -757,6 +777,7 @@ export default function AssistantScreen() {
     const text = inputTextRef.current,
       revision = inputRevisionRef.current;
     let completed = false;
+    let inputDefinitelyUnsent = true;
     let voicePayload: ReturnType<typeof createAssistantVoicePayload> | undefined;
     let voiceExecution: typeof voiceExecutionRef.current = null;
     let speechExecution: object | undefined;
@@ -1055,6 +1076,8 @@ export default function AssistantScreen() {
       const transmission = voicePayload?.getTransmission;
       speechExecution = speech.current?.begin(speechReference, generation, !!voice, question?.conversationId,
         voice ? () => !priorAcceptance && (transmission?.().postCount ?? 0) > 0 && assistantHttpClient.hasAcceptanceEvidence(speechReference) : undefined);
+      // Once handed off, absence of a result is never proof that the POST was not sent.
+      inputDefinitelyUnsent = false;
       const task = voicePayload ? assistantOrchestrator.startVoiceRequest(voicePayload, executionOptions) :
         assistantOrchestrator.startRequest(body!, executionOptions);
       if (!isCurrent()) {
@@ -1069,6 +1092,17 @@ export default function AssistantScreen() {
         if (voice) context.observeVoiceInterruption(execution, voice.token, question);
         return;
       }
+      // GET/resend failures cannot prove the original POST was unsent. A first metadata read
+      // failure has no POST/GET result; later storage failures retain that earlier evidence.
+      const recovery = execution.kind === "needs-attention" ? execution.recoveryResult : undefined;
+      const post = recovery?.kind === "unconfirmed" ? recovery.postResult : undefined;
+      inputDefinitelyUnsent = Boolean(!action && !postAccepted &&
+        !assistantHttpClient.hasAcceptanceEvidence({ serverId, requestId }) &&
+        execution.kind === "needs-attention" && !execution.lastResponse &&
+        recovery?.kind === "unconfirmed" && !recovery.retransmitted && !recovery.getResult &&
+        ((post && !post.ok && post.error.operation === "post" && post.error.requestState === "not-sent" &&
+          ["storage", "post-unconfirmed"].includes(recovery.reason)) ||
+          (!post && recovery.reason === "storage" && recovery.storageCode === "read")));
       context.observeExecution(execution, "request", question);
       if (
         acknowledgedId &&
@@ -1142,6 +1176,8 @@ export default function AssistantScreen() {
             );
           };
           updateRecovery("checking");
+          const observation = assistantLifecycle.beginObservation({ serverId, requestId: target.requestId }, generation);
+          if (!observation) return;
           // 단발 GET은 기존 서버 경계·공유 요청 잠금을 사용하며 새 polling·POST를 만들지 않는다.
           const recoveryTask = assistantOrchestrator.queryRequestOnce({
             serverId,
@@ -1159,38 +1195,42 @@ export default function AssistantScreen() {
           ) {
             updateRecovery("busy", recovered);
           } else {
-            setMessages((current) =>
-              upsertAssistantExecutionMessage(current, recovered, "recovery"),
-            );
-            if (target.kind === "uncertain")
-              uncertain.observe(recovered, "manual");
-            else uncertain.observe(recovered, "recovery");
-            syncUncertainUi(uncertain);
-            const restored =
-              target.kind === "question" &&
-              target.questionId &&
-              (body?.conversationId ?? question?.conversationId) &&
-              context.restoreActiveQuestion(
-                recovered,
-                {
-                  requestId: target.requestId,
-                  questionId: target.questionId,
-                  conversationId: (body?.conversationId ?? question?.conversationId)!,
-                },
-                token,
-                Date.now(),
+            const recorded = assistantLifecycle.recordObservation(observation, recovered, entry => {
+              setMessages((current) =>
+                upsertAssistantExecutionMessage(current, recovered, "recovery"),
               );
-            syncQuestionUi(context);
-            updateRecovery(
-              recovered.kind === "needs-attention"
-                ? "unconfirmed"
-                : target.kind === "question"
-                  ? restored
-                    ? "restored"
-                    : "mismatch"
-                  : "observed",
-              recovered,
-            );
+              if (target.kind === "uncertain")
+                uncertain.observe(recovered, "manual");
+              else uncertain.observe(recovered, "recovery");
+              syncUncertainUi(uncertain);
+              const restored =
+                target.kind === "question" &&
+                target.questionId &&
+                (body?.conversationId ?? question?.conversationId) &&
+                context.restoreActiveQuestion(
+                  recovered,
+                  {
+                    requestId: target.requestId,
+                    questionId: target.questionId,
+                    conversationId: (body?.conversationId ?? question?.conversationId)!,
+                  },
+                  token,
+                  Date.now(),
+                );
+              syncQuestionUi(context);
+              updateRecovery(
+                recovered.kind === "needs-attention"
+                  ? "unconfirmed"
+                  : target.kind === "question"
+                    ? restored
+                      ? "restored"
+                      : "mismatch"
+                    : "observed",
+                recovered,
+              );
+              consumedObservationsRef.current.add(entry);
+            });
+            if (!recorded) updateRecovery("context-changed", recovered);
           }
         }
       }
@@ -1219,10 +1259,11 @@ export default function AssistantScreen() {
         if (
           !action &&
           !completed &&
+          inputDefinitelyUnsent &&
           (!acknowledgmentAttempt || !postAccepted) &&
           inputRevisionRef.current === revision
         )
-          restoreInput(text);
+          restoreInput(text, revision);
         serverTaskRef.current = null;
         if (voice) {
           activeVoiceRef.current = false;
@@ -1282,6 +1323,69 @@ export default function AssistantScreen() {
     };
   });
 
+  // Only the explicit general result check is owned here; existing voice/text lifecycles stay intact.
+  useLayoutEffect(() => {
+    resultCheckFocusRef.current = focused => {
+      if (focused) return;
+      const check = resultCheckRef.current;
+      if (!check) return;
+      check.task.cancel();
+      resultCheckRef.current = null;
+      if (mountedRef.current && operationVersionRef.current === check.version) {
+        operationVersionRef.current++;
+        serverTaskRef.current = null;
+        setRecheckingRequest(null);
+        finishOperation();
+      }
+    };
+  }, [finishOperation]);
+
+  const recheckResult = async (reference: AssistantRecoveryReference, generation: number) => {
+    const ref = { ...reference }, key = assistantRecoveryKey(ref);
+    const displayed = () => committedMessagesRef.current.find(message => message.role === "assistant" &&
+      message.apiExecution && assistantRecoveryKey(message.apiExecution.reference) === key);
+    const message = displayed();
+    if (!mountedRef.current || !resultCheckFocusedRef.current || sendLockedRef.current ||
+      isVoiceInputBusy(inputUiRef.current) || localVoice.isBusy() || isMockScheduleMode() ||
+      assistantHttpClient.getServerId() !== ref.serverId || scheduleDataModeStore.getState().generation !== generation ||
+      !message || !canRecheckAssistantMessage(message) || getUncertainContext(ref.serverId).getCheckTarget(ref.requestId) ||
+      cleanupLocksRef.current.has(key)) return;
+    const snapshot = assistantLifecycle.getSnapshot();
+    if (snapshot.serverId !== ref.serverId || snapshot.initialCheck === "pending" || snapshot.handoff || recoveringRecord(snapshot, key)) return;
+    const executionToken = message.role === "assistant" ? JSON.stringify(message.apiExecution) : "";
+    const observation = assistantLifecycle.beginObservation(ref, generation);
+    if (!observation) return;
+    const version = ++operationVersionRef.current;
+    const current = () => mountedRef.current && resultCheckFocusedRef.current && operationVersionRef.current === version &&
+      !isMockScheduleMode() && assistantHttpClient.getServerId() === ref.serverId &&
+      scheduleDataModeStore.getState().generation === generation;
+    sendLockedRef.current = true;
+    setIsBusy(true);
+    setStatus("processing");
+    setRecheckingRequest(key);
+    let check: { task: AssistantRequestTask; version: number } | undefined;
+    try {
+      const task = assistantOrchestrator.queryRequestOnce(ref);
+      check = { task, version };
+      resultCheckRef.current = check;
+      serverTaskRef.current = task;
+      const result = await task.completion;
+      const latest = displayed();
+      if (!current() || latest?.role !== "assistant" || JSON.stringify(latest.apiExecution) !== executionToken) return;
+      if (result.kind === "needs-attention" && ["busy", "paused", "aborted"].includes(result.reason)) return;
+      assistantLifecycle.recordObservation(observation, result);
+    } catch {
+      if (current()) reportError("원래 요청의 결과를 확인하지 못했어요. 기존 요청을 다시 보내지 않고 결과 확인이 필요해요.");
+    } finally {
+      if (resultCheckRef.current === check) resultCheckRef.current = null;
+      if (current()) {
+        serverTaskRef.current = null;
+        setRecheckingRequest(null);
+        finishOperation();
+      }
+    }
+  };
+
   const checkUncertain = async (
     requestId: string,
     expectedServerId?: string,
@@ -1307,6 +1411,8 @@ export default function AssistantScreen() {
     const uncertain = getUncertainContext(expectedServerId),
       targetId = uncertain.getCheckTarget(requestId);
     if (!targetId) return;
+    const observation = assistantLifecycle.beginObservation({ serverId: expectedServerId, requestId: targetId }, expectedGeneration!);
+    if (!observation) return;
     sendLockedRef.current = true;
     setIsBusy(true);
     setStatus("processing");
@@ -1332,16 +1438,15 @@ export default function AssistantScreen() {
         );
         return;
       }
-      uncertain.observe(result, "manual");
-      const context = getTextQuestionContext(expectedServerId);
-      context.observeExecution(result, "recovery");
-      syncQuestionUi(context);
-      syncUncertainUi(uncertain);
-      setMessages((messages) =>
-        upsertAssistantExecutionMessage(messages, result, "recovery", {
-          uncertainRecheck: true,
-        }),
-      );
+      assistantLifecycle.recordObservation(observation, result, entry => {
+        uncertain.observe(result, "manual");
+        const context = getTextQuestionContext(expectedServerId);
+        context.observeExecution(result, "recovery");
+        syncQuestionUi(context);
+        syncUncertainUi(uncertain);
+        setMessages(messages => upsertAssistantExecutionMessage(messages, result, "recovery", { uncertainRecheck: true }));
+        consumedObservationsRef.current.add(entry);
+      });
     } catch {
       if (current())
         reportError(
@@ -1580,6 +1685,7 @@ export default function AssistantScreen() {
       return;
     }
     const text = inputTextRef.current.trim();
+    const revision = inputRevisionRef.current;
     if (
       !mountedRef.current ||
       !text ||
@@ -1607,10 +1713,10 @@ export default function AssistantScreen() {
         return;
       }
       setInputUi({ source: "text" });
-      mockTextPendingRef.current = true;
+      mockTextPendingRef.current = { revision };
       setStatus("processing");
     } catch {
-      restoreInput(text);
+      restoreInput(text, revision);
       reportError("메시지를 전송하지 못했어요. 다시 시도해 주세요.");
       finishOperation();
     }
@@ -1972,6 +2078,9 @@ export default function AssistantScreen() {
               uncertainView?.generation,
             );
           }}
+          recheckingRequest={recheckingRequest}
+          resultRecheckDisabled={recoveryPending || voiceInputBusy}
+          onResultRecheck={reference => { if (viewCurrent()) void recheckResult(reference, viewGeneration); }}
           onUncertainAcknowledge={(requestId) =>
             acknowledgeUncertain(
               requestId,

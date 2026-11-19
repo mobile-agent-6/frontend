@@ -38,6 +38,42 @@ function freeze<T>(value: T): T {
 const copy = <T,>(value: T): T => freeze(JSON.parse(JSON.stringify(value)));
 const keyOf = (ref: AssistantRecoveryReference) => JSON.stringify([ref.serverId, ref.requestId.toLowerCase()]);
 
+export type AssistantObservationToken = Readonly<{ reference: AssistantRecoveryReference; generation: number; version: number; epoch: number }>;
+
+// Runtime observation order only: identical content from another GET is a new observation;
+// publishing the same immutable entry again is not. Nothing is persisted or sent over HTTP.
+export function createAssistantObservationOrder() {
+  let version = 0, epoch = 0;
+  const seen = new WeakMap<AssistantLifecycleEntry, { key: string; version: number }>();
+  const latest = new Map<string, number>(), manual = new Map<string, number>();
+  const scopeKey = (ref: AssistantRecoveryReference, generation: number) => JSON.stringify([keyOf(ref), generation]);
+  function observe(entry: AssistantLifecycleEntry, generation: number) {
+    if (seen.has(entry)) return;
+    const key = scopeKey(entry.reference, generation), next = ++version;
+    seen.set(entry, { key, version: next }); latest.set(key, next);
+  }
+  return {
+    observe,
+    getVersion: () => version,
+    begin(reference: AssistantRecoveryReference, generation: number): AssistantObservationToken {
+      return freeze({ reference: { ...reference }, generation, version: latest.get(scopeKey(reference, generation)) ?? 0, epoch });
+    },
+    commit(token: AssistantObservationToken, entry: AssistantLifecycleEntry) {
+      const key = scopeKey(token.reference, token.generation);
+      if (token.epoch !== epoch || key !== scopeKey(entry.reference, token.generation) || (latest.get(key) ?? 0) !== token.version) return false;
+      observe(entry, token.generation); manual.set(key, latest.get(key)!); return true;
+    },
+    isCurrent(entry: AssistantLifecycleEntry, generation: number) {
+      const observation = seen.get(entry), key = scopeKey(entry.reference, generation);
+      return observation?.key === key && observation.version === latest.get(key);
+    },
+    superseded(ref: AssistantRecoveryReference, generation: number, startedAt: number) {
+      return (manual.get(scopeKey(ref, generation)) ?? 0) > startedAt;
+    },
+    clear() { epoch++; latest.clear(); manual.clear(); },
+  };
+}
+
 export function createAssistantLifecycle({
   orchestrator = assistantOrchestrator,
   http = assistantHttpClient,
@@ -57,6 +93,7 @@ export function createAssistantLifecycle({
 } = {}) {
   // 기존 복구 metadata와 구분되는 실행 세션 내 최신 결과만 보관하며 영속 저장하지 않는다.
   const entries = new Map<string, AssistantLifecycleEntry>();
+  const observations = createAssistantObservationOrder();
   const owners = new Set<symbol>(), subscribers = new Set<() => void>();
   let initialCheck: AssistantLifecycleSnapshot["initialCheck"] = "pending";
   let snapshot: AssistantLifecycleSnapshot = freeze({ phase: connectionInitialization.getState().pending ? "recovering" : "idle", serverId: null, initialCheck, results: [] });
@@ -100,9 +137,10 @@ export function createAssistantLifecycle({
       publish({ phase: "unavailable", serverId: scope.serverId, issue: scope.mode === "mock" ? "policy" : "server-not-ready" });
       return;
     }
-    if (snapshot.serverId !== scope.serverId) entries.clear();
+    if (snapshot.serverId !== scope.serverId) { entries.clear(); observations.clear(); }
     if (handoff && (handoff.generation !== scope.generation || handoff.ref.serverId !== scope.serverId)) handoff = undefined;
     const serverId = scope.serverId, current = ++epoch, signalController = new AbortController();
+    const startedObservation = observations.getVersion();
     initialCheck = "pending";
     controller = signalController;
     publish({ phase: "recovering", serverId });
@@ -110,15 +148,16 @@ export function createAssistantLifecycle({
       if (!owners.size || !active || current !== epoch || signalController.signal.aborted) return false;
       const next = context();
       if (next.serverId === serverId && next.generation === scope.generation && next.mode === "server") return true;
-      stopCycle(); entries.clear();
+      stopCycle(); entries.clear(); observations.clear();
       publish({ phase: "unavailable", serverId: next.serverId, issue: next.mode === "mock" ? "policy" : "server-mismatch" });
       return false;
     }
     function capture(result: AssistantExecutionResult) {
-      if (!valid() || result.reference.serverId !== serverId) return;
+      if (!valid() || result.reference.serverId !== serverId || observations.superseded(result.reference, scope.generation, startedObservation)) return;
       const key = keyOf(result.reference), previous = entries.get(key);
-      entries.set(key, copy({ ...previous, reference: result.reference, latestResult: result,
-        lastResponse: result.kind === "needs-attention" ? result.lastResponse ?? previous?.lastResponse : result.response }));
+      const entry = copy({ ...previous, reference: result.reference, latestResult: result,
+        lastResponse: result.kind === "needs-attention" ? result.lastResponse ?? previous?.lastResponse : result.response });
+      observations.observe(entry, scope.generation); entries.set(key, entry);
     }
     const previous = tailGeneration === scope.generation ? tail : Promise.resolve();
     tailGeneration = scope.generation;
@@ -129,10 +168,11 @@ export function createAssistantLifecycle({
       try {
         const reservation = handoff;
         const onUpdate = (event: AssistantExecutionEvent) => {
-          if (!valid() || event.reference.serverId !== serverId) return;
+          if (!valid() || event.reference.serverId !== serverId || observations.superseded(event.reference, scope.generation, startedObservation)) return;
           const key = keyOf(event.reference), previous = entries.get(key);
-          entries.set(key, copy({ ...previous, reference: event.reference, phase: event.phase,
-            latestResult: undefined, lastResponse: event.phase === "status" ? event.response : previous?.lastResponse }));
+          const entry = copy({ ...previous, reference: event.reference, phase: event.phase,
+            latestResult: undefined, lastResponse: event.phase === "status" ? event.response : previous?.lastResponse });
+          observations.observe(entry, scope.generation); entries.set(key, entry);
           publish({ phase: "observing", serverId });
         };
         const options = { signal: signalController.signal, onUpdate };
@@ -166,7 +206,7 @@ export function createAssistantLifecycle({
           return;
         }
         const keys = new Set(tasks.map(item => keyOf(item.reference)));
-        for (const key of entries.keys()) if (!keys.has(key)) entries.delete(key);
+        for (const [key, entry] of entries) if (!keys.has(key) && !observations.superseded(entry.reference, scope.generation, startedObservation)) entries.delete(key);
         tasks.forEach(item => capture(item.initial));
         // 예약 충돌·저장소 실패 등으로 GET 자체를 시작하지 못한 항목은 확인 완료로 취급하지 않는다.
         initialCheck = tasks.some(({ initial }) => initial.kind === "needs-attention" &&
@@ -220,7 +260,7 @@ export function createAssistantLifecycle({
         });
         unsubscribeMode = mode.subscribe(() => {
           if (!owners.size) return;
-          handoff = undefined; stopCycle(); entries.clear();
+          handoff = undefined; stopCycle(); entries.clear(); observations.clear();
           if (active) scheduleRecovery();
           else publish({ phase: "paused", serverId: context().serverId });
         });
@@ -239,6 +279,27 @@ export function createAssistantLifecycle({
     return detach;
   }
   return {
+    beginObservation(ref: AssistantRecoveryReference, generation: number) {
+      const scope = context();
+      return owners.size && active && scope.mode === "server" && scope.serverId === ref.serverId && scope.generation === generation && lifecycle.getState() === "active"
+        ? observations.begin(ref, generation) : null;
+    },
+    isCurrentObservation(entry: AssistantLifecycleEntry, generation: number) {
+      const scope = context();
+      return scope.mode === "server" && scope.serverId === entry.reference.serverId && scope.generation === generation && observations.isCurrent(entry, generation);
+    },
+    recordObservation(token: AssistantObservationToken, result: AssistantExecutionResult, onCommit?: (entry: AssistantLifecycleEntry) => void) {
+      const scope = context(), ref = token.reference;
+      if (!owners.size || !active || scope.mode !== "server" || scope.serverId !== ref.serverId || scope.generation !== token.generation || lifecycle.getState() !== "active" ||
+        keyOf(result.reference) !== keyOf(ref) || result.kind !== "needs-attention" &&
+        (result.response.serverId !== ref.serverId || result.response.data.requestId.toLowerCase() !== ref.requestId.toLowerCase())) return false;
+      const entry = copy({ reference: result.reference, latestResult: result,
+        ...(result.kind === "needs-attention" ? result.lastResponse ? { lastResponse: result.lastResponse } : {} : { lastResponse: result.response }) });
+      if (!observations.commit(token, entry)) return false;
+      entries.set(keyOf(ref), entry);
+      try { onCommit?.(entry); } finally { publish(snapshot); }
+      return true;
+    },
     deferRecovery(ref: AssistantRecoveryReference, generation: number) {
       if (!owners.size || context().generation !== generation || context().serverId !== ref.serverId) return;
       handoff = { ref: { ...ref }, generation };
