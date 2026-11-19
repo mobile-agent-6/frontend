@@ -14,6 +14,7 @@ import type {
 import type { Schedule } from "@/types/schedule";
 import type { AssistantResultDisplay } from "@/utils/assistant-mapper";
 import { assistantFailureAdvice } from "@/utils/assistant-errors";
+import { ASSISTANT_CONNECTION_ERROR_NOTICE } from "@/utils/assistant-recovery-messages";
 import type { AssistantUncertainView } from "@/utils/assistant-uncertain";
 import type { AssistantRecoveryControl, AssistantRecoveryControlAction } from "@/utils/assistant-recovery-cleanup";
 import type { AssistantScheduleSyncEntry } from "@/services/api/assistant-schedule-sync";
@@ -40,8 +41,12 @@ type AssistantMessageProps = {
   uncertainActionsDisabled?: boolean;
   onUncertainCheck?: () => void;
   onUncertainAcknowledge?: () => void;
+  onResultRecheck?: () => void;
+  resultRechecking?: boolean;
+  resultRecheckDisabled?: boolean;
   recoveryControl?: AssistantRecoveryControl;
   recoveryIssue?: boolean;
+  recoveryNotice?: boolean;
   onRecoveryAction?: (action: AssistantRecoveryControlAction) => void;
   scheduleSyncEntry?: AssistantScheduleSyncEntry;
   scheduleSyncRetrying?: boolean;
@@ -70,8 +75,12 @@ export function AssistantMessage({
   uncertainActionsDisabled = false,
   onUncertainCheck,
   onUncertainAcknowledge,
+  onResultRecheck,
+  resultRechecking = false,
+  resultRecheckDisabled = false,
   recoveryControl,
   recoveryIssue = false,
+  recoveryNotice = false,
   onRecoveryAction,
   scheduleSyncEntry,
   scheduleSyncRetrying = false,
@@ -80,8 +89,32 @@ export function AssistantMessage({
   const theme = useTheme();
   const confirmationDisabled = interactionsDisabled || interaction?.resolved || !onDeleteConfirmation;
   const hasConfirmation = apiResult?.kind === "confirmation" || interaction?.type === "delete-confirmation";
+  const isConnectionNotice = Boolean(onResultRecheck && text === ASSISTANT_CONNECTION_ERROR_NOTICE);
+  const paragraphs = isConnectionNotice ? text.split("\n\n") : [text];
+  const showRecoveryActions = Boolean(recoveryControl &&
+    (recoveryIssue || apiResult?.kind === "failure" || apiResult?.kind === "uncertain" || recoveryControl.phase === "failed"));
+  const compactRecoveryButtons = Boolean(onResultRecheck && showRecoveryActions && !recoveryControl?.phase &&
+    !recoveryControl?.resultConfirmable && !recoveryControl?.expiryConfirmable &&
+    !apiResult && !scheduleSyncEntry && !uncertainView && !schedules?.length && !interaction);
+  const compactRecoveryNotice = recoveryNotice && showRecoveryActions &&
+    recoveryControl?.phase !== "removed" && recoveryControl?.phase !== "not-found";
+  const recoveryActions = showRecoveryActions && recoveryControl
+    ? <RecoveryActions value={recoveryControl} onAction={onRecoveryAction}
+        balancedManagementSpacing={isConnectionNotice && compactRecoveryButtons} centerButtonText={isConnectionNotice || recoveryNotice} /> : null;
+  const resultRecheckButton = onResultRecheck && <Pressable testID="assistant-result-recheck" accessibilityRole="button"
+    accessibilityState={{ disabled: resultRecheckDisabled || resultRechecking, busy: resultRechecking }}
+    disabled={resultRecheckDisabled || resultRechecking}
+    onPress={resultRecheckDisabled || resultRechecking ? undefined : onResultRecheck}
+    style={[styles.buttonBase, { backgroundColor: theme.primaryForeground },
+      (resultRecheckDisabled || resultRechecking) && styles.disabled]}>
+    <ThemedText themeColor="primary" style={isConnectionNotice ? styles.centeredButtonText : undefined}>
+      {resultRechecking ? "결과를 확인하고 있어요…" : "결과 다시 확인"}
+    </ThemedText>
+  </Pressable>;
   return (
-    <ThemedView type="primary" style={[styles.bubble, hasConfirmation && styles.confirmationBubble]}>
+    <ThemedView type="primary" style={[styles.bubble, hasConfirmation && styles.confirmationBubble,
+      (isConnectionNotice || recoveryNotice) && styles.connectionNoticeBubble,
+      (compactRecoveryButtons || compactRecoveryNotice || (showRecoveryActions && recoveryControl?.phase === "confirming")) && styles.compactRecoveryBubble]}>
       <Text
         key={resultTextKey}
         ref={resultTextRef}
@@ -91,9 +124,13 @@ export function AssistantMessage({
         selectable
         style={[styles.messageText, { color: theme.primaryForeground }]}
       >
-        {text}
+        {paragraphs[0]}
       </Text>
+      {paragraphs.length > 1 && <Text selectable style={[styles.messageText, { color: theme.primaryForeground }]}>
+        {paragraphs[1]}
+      </Text>}
       {apiRecoveryText && <ThemedText type="small" themeColor="primaryForeground">{apiRecoveryText}</ThemedText>}
+      {compactRecoveryButtons ? <View style={styles.recoveryButtons}>{resultRecheckButton}{recoveryActions}</View> : resultRecheckButton}
       {apiResult && <ApiResultDetails result={apiResult} onCandidateSelection={onApiCandidateSelection} selectedCandidateId={selectedApiCandidateId}
         onConfirmation={onApiConfirmation} selectedApproval={selectedApiApproval} confirmationExpired={apiConfirmationExpired} />}
       {scheduleSyncEntry && <ScheduleSyncStatus entry={scheduleSyncEntry} retrying={scheduleSyncRetrying} onRetry={onScheduleSyncRetry}
@@ -113,8 +150,7 @@ export function AssistantMessage({
           processing={interactionsDisabled}
         />
       )}
-      {recoveryControl && (recoveryIssue || apiResult?.kind === "failure" || apiResult?.kind === "uncertain" || recoveryControl.phase === "failed") &&
-        <RecoveryActions value={recoveryControl} onAction={onRecoveryAction} />}
+      {!compactRecoveryButtons && recoveryActions}
     </ThemedView>
   );
 }
@@ -146,38 +182,66 @@ function ScheduleSyncStatus({ entry, retrying, onRetry, showCompleted }: {
   </View>;
 }
 
-function RecoveryActions({ value, onAction }: { value: AssistantRecoveryControl;
-  onAction?: (action: AssistantRecoveryControlAction) => void }) {
+function RecoveryActions({ value, onAction, balancedManagementSpacing = false, centerButtonText = false }: { value: AssistantRecoveryControl;
+  onAction?: (action: AssistantRecoveryControlAction) => void; balancedManagementSpacing?: boolean; centerButtonText?: boolean }) {
   const theme = useTheme();
   const done = value.phase === "removed" || value.phase === "not-found";
   const disabled = !onAction || value.phase === "working";
-  const button = (action: AssistantRecoveryControlAction, label: string) => (
-    <Pressable key={action} testID={`assistant-recovery-${action}`} accessibilityRole="button" disabled={disabled}
+  const button = (action: AssistantRecoveryControlAction, label: string) => {
+    const secondary = action === "manual" || action === "keep";
+    const centered = (action === "manual" && centerButtonText) || action === "confirm-manual" || action === "keep";
+    return <Pressable key={action} testID={`assistant-recovery-${action}`} accessibilityRole="button" disabled={disabled}
       accessibilityState={{ disabled }} onPress={disabled ? undefined : () => onAction?.(action)}
-      style={[styles.buttonBase, { backgroundColor: theme.primaryForeground }, disabled && styles.disabled]}>
-      <ThemedText themeColor="primary">{label}</ThemedText>
-    </Pressable>
-  );
+      style={[secondary ? styles.managementButton : styles.buttonBase,
+        secondary && (balancedManagementSpacing || action === "keep") && styles.balancedManagementButton,
+        secondary && centered && styles.centeredManagementButton,
+        !secondary && { backgroundColor: theme.primaryForeground }, disabled && styles.disabled]}>
+      <ThemedText themeColor={secondary ? "primaryForeground" : "primary"}
+        style={secondary ? [styles.managementText, centered && styles.centeredButtonText]
+          : centered ? styles.centeredButtonText : undefined}>{label}</ThemedText>
+    </Pressable>;
+  };
   return <View style={styles.candidates} testID={`assistant-recovery-record-${JSON.stringify([value.reference.serverId, value.reference.requestId.toLowerCase()])}`}>
     {value.phase === "confirming" && <>
-    <ThemedText type="small" themeColor="primaryForeground">대상 서버: {value.reference.serverId.replace(/^development:/, "")}</ThemedText>
-    <ThemedText type="small" themeColor="primaryForeground">요청 ID: {value.reference.requestId}</ThemedText>
+      {[
+        "복구 기록을 삭제할까요?",
+        "기록을 삭제해도 서버 작업은 취소되지 않으며, 요청의 성공 여부도 확인되지 않아요.",
+        "이후 요청 결과를 자동으로 확인할 수 없어요. 같은 작업을 다시 보내지 말고 일정 목록을 확인해 주세요.",
+        "기존에 제한된 요청은 계속 제한돼요.",
+      ].map(paragraph => <ThemedText key={paragraph} themeColor="primaryForeground" style={styles.messageText}>{paragraph}</ThemedText>)}
+      <RecoveryDetails key={JSON.stringify([value.reference.serverId, value.reference.requestId.toLowerCase()])} reference={value.reference} />
     </>}
-    {value.phase && <ThemedText type="small" themeColor="primaryForeground">{{
-      confirming: "이 서버의 이 요청에 대한 로컬 복구 기록만 지워요. 서버 작업은 취소되지 않으며 과거 변경이 반영됐을 수 있어요. 성공·실패 판정이나 uncertain 보류 해제가 아니에요. 자동 복구 대상에서 빠지므로 같은 작업을 다시 보내지 마세요.",
+    {value.phase && value.phase !== "confirming" && <ThemedText type="small" themeColor="primaryForeground">{{
       working: "로컬 복구 기록을 정리하고 있어요.",
-      removed: "로컬 복구 기록을 정리했어요. 서버의 작업·결과·보류 상태는 바뀌지 않아요.",
+      removed: "복구 기록을 삭제했어요. 기록을 삭제해도 서버 작업은 취소되지 않으며, 요청 결과와 기존 요청 제한은 바뀌지 않아요.",
       "not-found": "이 요청의 로컬 복구 기록은 이미 없어요. 서버 상태는 바뀌지 않아요.",
       retained: "정리 조건이 확인되지 않아 복구 기록을 유지했어요.",
       failed: "복구 기록을 정리하지 못했어요. 저장 상태를 확인해 주세요. 요청을 다시 실행하지 않았어요.",
     }[value.phase]}</ThemedText>}
-    {!done && (value.phase === "confirming" ? <>
-      {button("confirm-manual", "위험을 확인했고 로컬 기록만 정리")}{button("keep", "복구 기록 유지")}
-    </> : <>
+    {!done && (value.phase === "confirming" ? <View style={styles.recoveryButtons}>
+      {button("confirm-manual", "복구 기록 삭제")}{button("keep", "복구 기록 유지")}
+    </View> : <>
       {value.resultConfirmable && button("result", "결과 확인 및 복구 기록 정리")}
       {value.expiryConfirmable && button("expiry", "상세 보관 종료 안내 확인 및 기록 정리")}
-      {button("manual", "로컬 복구 기록 수동 정리")}
+      {button("manual", "복구 기록 관리")}
     </>)}
+  </View>;
+}
+
+function RecoveryDetails({ reference }: { reference: AssistantRecoveryControl["reference"] }) {
+  const [expanded, setExpanded] = useState(false);
+  return <View style={styles.candidates}>
+    <Pressable testID="assistant-recovery-details-toggle" accessibilityRole="button"
+      accessibilityState={{ expanded }} onPress={() => setExpanded(previous => !previous)}
+      style={[styles.managementButton, styles.centeredManagementButton]}>
+      <ThemedText themeColor="primaryForeground" style={[styles.managementText, styles.centeredButtonText]}>
+        {expanded ? "상세 정보 접기" : "상세 정보"}
+      </ThemedText>
+    </Pressable>
+    {expanded && <View testID="assistant-recovery-details" style={styles.candidates}>
+      <ThemedText type="small" themeColor="primaryForeground">서버 주소: {reference.serverId.replace(/^development:/, "")}</ThemedText>
+      <ThemedText type="small" themeColor="primaryForeground">요청 ID: {reference.requestId}</ThemedText>
+    </View>}
   </View>;
 }
 
@@ -378,6 +442,24 @@ function CandidateCheck() {
 }
 
 const styles = StyleSheet.create({
+  centeredButtonText: { textAlign: "center" },
+  centeredManagementButton: { alignSelf: "center" },
+  managementText: { textDecorationLine: "underline", lineHeight: Spacing.four },
+  // Base touch area: 8 + 24 + 12 = 44dp. Recovery notices add the bubble's 8dp gap above.
+  // Connection notices use 16dp top padding after the primary button; both notices leave 16dp below.
+  managementButton: {
+    minHeight: 44,
+    alignSelf: "flex-start",
+    maxWidth: "100%",
+    justifyContent: "flex-start",
+    paddingHorizontal: Spacing.three,
+    paddingTop: Spacing.two,
+    paddingBottom: Spacing.three - Spacing.one,
+  },
+  balancedManagementButton: { paddingTop: Spacing.three },
+  recoveryButtons: { alignSelf: "stretch" },
+  connectionNoticeBubble: { width: "70%", maxWidth: "70%" },
+  compactRecoveryBubble: { paddingBottom: Spacing.one },
   messageText: {
     fontSize: 16,
     lineHeight: 24,

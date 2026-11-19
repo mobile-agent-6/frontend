@@ -101,7 +101,11 @@ export function createAssistantTextQuestionContext(serverId: string, generation:
         pending.held = false;
       }
       if (source === "recovery" && recovery?.kind === "unconfirmed" && recovery.getResult) {
-        blockedQuestions.add(execution.reference.requestId.toLowerCase());
+        const key = execution.reference.requestId.toLowerCase();
+        // A failed lookup is not evidence of answering a question that this live request has not returned yet.
+        // Keep all existing answer/voice holds; historical or already observed questions still take the guard.
+        const awaitingOwnResult = pending?.requestId === key && startedRequests.has(key) && !observations.get(key)?.questionId;
+        if (!awaitingOwnResult) blockedQuestions.add(key);
       }
       // 거절된 질문을 새 대화로 바꾸거나 오류의 activeQuestionId만으로 답변을 재전송하지 않는다.
       if (answering && code && ["STALE_QUESTION", "QUESTION_EXPIRED", "CONVERSATION_EXPIRED"].includes(code)) {

@@ -144,6 +144,7 @@ function harness(initialMode, { readOnly = false, assistantSyncUi = false, assis
       if (name === "@/services/api/assistant-lifecycle") return { assistantLifecycle: { attach: () => () => {},
         getSnapshot: () => assistantSnapshot ?? { phase: assistantSyncUi ? "settled" : "idle", initialCheck: assistantSyncUi ? "checked" : "pending",
           serverId: assistantSyncUi && config?.status === "ready" ? config.config.serverId : null, results: [] },
+        isCurrentObservation: entry => assistantSnapshot?.results.includes(entry) ?? false,
         subscribe: listener => { assistantListeners.add(listener); return () => assistantListeners.delete(listener); } } };
       if (name === "@/services/storage/assistant-recovery") return connectionProfile ? source("src/services/storage/assistant-recovery.ts") : { assistantRecoveryStorage: { readAll: async () => [] } };
       if (name === "@react-native-async-storage/async-storage" && connectionProfile) return {
